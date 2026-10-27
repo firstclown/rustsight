@@ -96,7 +96,10 @@ impl LlmProvider for OpenAiCompat {
         let status = resp.status();
         let text = resp.text().await.map_err(|e| Error::Llm(e.to_string()))?;
         if !status.is_success() {
-            return Err(Error::Llm(format!("{}: {}", status, truncate(&text, 400))));
+            return Err(Error::LlmStatus {
+                status: status.as_u16(),
+                message: format!("{}: {}", status, truncate(&text, 400)),
+            });
         }
         let v: Value =
             serde_json::from_str(&text).map_err(|e| Error::Llm(format!("bad json: {e}")))?;
@@ -164,11 +167,10 @@ impl EmbedProvider for OpenAiEmbed {
         let status = resp.status();
         let text = resp.text().await.map_err(|e| Error::Embed(e.to_string()))?;
         if !status.is_success() {
-            return Err(Error::Embed(format!(
-                "{}: {}",
-                status,
-                truncate(&text, 400)
-            )));
+            return Err(Error::EmbedStatus {
+                status: status.as_u16(),
+                message: format!("{}: {}", status, truncate(&text, 400)),
+            });
         }
         let v: EmbedResponse =
             serde_json::from_str(&text).map_err(|e| Error::Embed(format!("bad json: {e}")))?;

@@ -1,10 +1,12 @@
-use crate::engine::Engine;
+use crate::engine::chunks::{merge_chunk_facts, split_chunks, split_half, OVERLAP_DEDUP_THRESHOLD};
+use crate::engine::{with_retry, Engine};
 use crate::entity::{combined_score, normalize_name, string_similarity};
 use crate::prompts::extraction::{build_extraction_prompt, parse_extraction};
 use crate::traits::{ChatMessage, LlmRequest};
 use crate::types::*;
 use crate::{cosine, temporal_weight, Error, Result};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 pub(super) async fn retain(e: &Engine, req: RetainRequest) -> Result<RetainResponse> {
     if req.content.trim().is_empty() {
@@ -26,19 +28,17 @@ pub(super) async fn retain(e: &Engine, req: RetainRequest) -> Result<RetainRespo
     };
     let now = req.timestamp_ms.unwrap_or_else(|| e.clock.now_ms());
 
-    let (system, user) =
-        build_extraction_prompt(&e.config.extract, &req.content, req.context.as_deref(), now);
-    let resp = e
-        .llm
-        .complete(&LlmRequest {
-            system: Some(system),
-            messages: vec![ChatMessage::user(user)],
-            json_mode: true,
-            temperature: Some(0.0),
-            ..Default::default()
-        })
-        .await?;
-    let facts = parse_extraction(&resp.content.unwrap_or_default())?;
+    let chunks = split_chunks(
+        &req.content,
+        e.config.chunk_size_tokens,
+        e.config.chunk_overlap_tokens,
+        e.tokens.as_ref(),
+    );
+    let mut per_chunk: Vec<Vec<ExtractedFact>> = Vec::with_capacity(chunks.len());
+    for chunk in &chunks {
+        per_chunk.push(extract_chunk(e, chunk, req.context.as_deref(), now).await?);
+    }
+    let facts = merge_chunk_facts(per_chunk, OVERLAP_DEDUP_THRESHOLD);
     if facts.is_empty() {
         return Ok(RetainResponse {
             memories_stored: 0,
@@ -47,10 +47,9 @@ pub(super) async fn retain(e: &Engine, req: RetainRequest) -> Result<RetainRespo
         });
     }
 
-    let mut embeddings = e
-        .embed
-        .embed(facts.iter().map(|f| f.text.clone()).collect())
-        .await?;
+    let embed = Arc::clone(&e.embed);
+    let texts: Vec<String> = facts.iter().map(|f| f.text.clone()).collect();
+    let mut embeddings = with_retry(e, || embed.embed(texts.clone())).await?;
     if embeddings.len() != facts.len() {
         return Err(Error::Embed("embedding count mismatch".into()));
     }
@@ -249,6 +248,62 @@ pub(super) async fn retain(e: &Engine, req: RetainRequest) -> Result<RetainRespo
         memories_stored: stored.len(),
         entities: touched,
         edges_created: edges.len(),
+    })
+}
+
+/// Extract facts from one retain chunk, retrying transient provider failures.
+/// If the extraction output fails to parse (e.g. JSON truncated by an output
+/// token limit), the chunk is re-asked once at half size — upstream's
+/// auto-split — before the error surfaces.
+async fn extract_chunk(
+    e: &Engine,
+    content: &str,
+    context: Option<&str>,
+    now: i64,
+) -> Result<Vec<ExtractedFact>> {
+    extract_chunk_at(e, content, context, now, 0).await
+}
+
+/// Boxed because it recurses once (re-ask at half size); the depth cap keeps
+/// the recursion at one level.
+fn extract_chunk_at<'a>(
+    e: &'a Engine,
+    content: &'a str,
+    context: Option<&'a str>,
+    now: i64,
+    depth: usize,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<ExtractedFact>>> + Send + 'a>> {
+    Box::pin(async move {
+        let (system, user) = build_extraction_prompt(&e.config.extract, content, context, now);
+        let llm = Arc::clone(&e.llm);
+        let request = LlmRequest {
+            system: Some(system),
+            messages: vec![ChatMessage::user(user)],
+            json_mode: true,
+            temperature: Some(0.0),
+            ..Default::default()
+        };
+        let resp = with_retry(e, || llm.complete(&request)).await?;
+        match parse_extraction(&resp.content.unwrap_or_default()) {
+            Ok(facts) => Ok(facts),
+            Err(err) => {
+                if depth == 0 {
+                    if let Some((head, tail)) = split_half(content, e.tokens.as_ref()) {
+                        let first = extract_chunk_at(e, &head, context, now, depth + 1).await?;
+                        let offset = first.len();
+                        let mut merged = first;
+                        for mut fact in extract_chunk_at(e, &tail, context, now, depth + 1).await? {
+                            for c in &mut fact.causal {
+                                c.fact_index += offset;
+                            }
+                            merged.push(fact);
+                        }
+                        return Ok(merged);
+                    }
+                }
+                Err(err)
+            }
+        }
     })
 }
 

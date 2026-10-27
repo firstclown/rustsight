@@ -46,6 +46,7 @@ pub trait MemoryStore: Send + Sync {
     fn facts_for_entity(&self, entity_id: &str, limit: usize) -> Result<Vec<Memory>>;
 
     fn add_edges(&self, edges: &[Edge]) -> Result<()>;
+    fn edges_for_bank(&self, bank_id: &str, limit: usize) -> Result<Vec<Edge>>;
 
     fn mark_entities_dirty(&self, bank_id: &str, entity_ids: &[String], reason: &str)
         -> Result<()>;

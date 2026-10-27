@@ -15,7 +15,7 @@ for a desktop harness. From-scratch Rust reimplementation of the architecture in
 ```bash
 cargo build                              # debug build (workspace)
 cargo build --release                    # release build (thin LTO); binary at target/release/rustsight
-cargo test                               # all 45 tests; fully offline, mock providers, no API key needed
+cargo test                               # all 63 tests; fully offline, mock providers, no API key needed
 cargo test -p rustsight-storage --test engine_flow   # just the end-to-end integration suite
 cargo fmt --check                        # formatting check (must pass; no rustfmt.toml, defaults only)
 cargo fmt                                # auto-fix formatting
@@ -54,7 +54,7 @@ Every change is complete only when **all** of the following pass locally:
      `crates/rustsight-core/src/fusion.rs`, `temporal.rs`, `prompts/*.rs`).
    - Engine-level/integration tests go in
      `crates/rustsight-storage/tests/engine_flow.rs` (in-memory SQLite +
-     scripted mocks; 10 tests there today).
+     scripted mocks; 16 tests there today).
 4. Docs touched where relevant: README sections for user-facing behavior/env
    vars, `NEXT_STEPS.md` checkboxes if a ticket's scope changed.
 5. No secrets/API keys committed; `.gitignore` already covers `*.db*`.
@@ -81,7 +81,11 @@ Key source map:
   token estimator, and clock. `spawn_worker(interval, max_entities)` runs
   background consolidation.
 - `crates/rustsight-core/src/engine/{retain,recall,reflect,consolidate,mental}.rs`
-  — the five pipelines.
+  — the five pipelines. Retain chunks content (`engine/chunks.rs`: token
+  split with overlap, causal-index remap, overlap-dedup at similarity >= 0.9,
+  half-size re-ask on parse failure) and retries transient provider errors
+  (`with_retry` in `engine/mod.rs`, 429/5xx only — typed `Error::LlmStatus`/
+  `EmbedStatus`).
 - `crates/rustsight-core/src/store.rs` — the `MemoryStore` trait (swap-in point
   for Postgres/ANN backends).
 - `crates/rustsight-core/src/traits.rs` — `LlmProvider`, `EmbedProvider`,

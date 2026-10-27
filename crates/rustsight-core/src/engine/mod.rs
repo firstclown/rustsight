@@ -1,3 +1,4 @@
+mod chunks;
 mod consolidate;
 mod mental;
 mod recall;
@@ -24,6 +25,17 @@ pub struct EngineConfig {
     pub semantic_edge_cap: usize,
     pub extract: ExtractionConfig,
     pub reflect_max_rounds: usize,
+    /// Target size of retain content chunks, measured with the configured
+    /// `TokenEstimator`. Content at or below this size is extracted in one
+    /// request.
+    pub chunk_size_tokens: usize,
+    /// Token overlap between consecutive retain chunks; the overlap usually
+    /// re-extracts boundary facts, which are deduped on merge.
+    pub chunk_overlap_tokens: usize,
+    /// Total attempts for transient (HTTP 429/5xx) provider failures.
+    pub retry_max_attempts: usize,
+    /// Backoff base for retries; attempt N waits `base * 2^(N-1)` ms.
+    pub retry_base_delay_ms: u64,
 }
 
 impl Default for EngineConfig {
@@ -38,6 +50,10 @@ impl Default for EngineConfig {
             semantic_edge_cap: 10,
             extract: ExtractionConfig::default(),
             reflect_max_rounds: 8,
+            chunk_size_tokens: 3000,
+            chunk_overlap_tokens: 200,
+            retry_max_attempts: 3,
+            retry_base_delay_ms: 400,
         }
     }
 }
@@ -167,5 +183,33 @@ impl Engine {
         path: Option<&str>,
     ) -> Result<MentalModel> {
         mental::refresh(self, bank_id, question, path).await
+    }
+}
+
+/// Run a provider call, retrying transient failures (HTTP 429/5xx surfaced as
+/// typed statuses) with exponential backoff: attempt N waits
+/// `retry_base_delay_ms * 2^(N-1)` before firing, up to
+/// `retry_max_attempts` total attempts. Non-transient errors surface
+/// immediately after the first attempt.
+async fn with_retry<T, F, Fut>(e: &Engine, op: F) -> Result<T>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let max_attempts = e.config.retry_max_attempts.max(1);
+    let mut attempt = 1;
+    loop {
+        match op().await {
+            Ok(v) => return Ok(v),
+            Err(err) if err.is_transient() && attempt < max_attempts => {
+                let shift = (attempt - 1).min(5) as u32;
+                tokio::time::sleep(Duration::from_millis(
+                    e.config.retry_base_delay_ms.saturating_mul(1 << shift),
+                ))
+                .await;
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
     }
 }

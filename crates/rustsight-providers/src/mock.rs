@@ -2,10 +2,11 @@ use async_trait::async_trait;
 use rustsight_core::traits::{
     EmbedProvider, LlmProvider, LlmRequest, LlmResponse, RerankProvider, TokenEstimator, ToolCall,
 };
-use rustsight_core::Result;
+use rustsight_core::{Error, Result};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 enum Mode {
     Script(VecDeque<LlmResponse>),
@@ -329,5 +330,76 @@ pub struct SimpleTokenEstimator;
 impl TokenEstimator for SimpleTokenEstimator {
     fn count(&self, text: &str) -> usize {
         text.chars().count() / 4 + 1
+    }
+}
+
+/// Wraps an LLM provider and fails the first `fail_calls` calls with the
+/// given HTTP status (as a typed `Error::LlmStatus`), then delegates. Used to
+/// exercise the engine's retry path against transient 429/5xx failures.
+pub struct FlakyLlm {
+    inner: Arc<dyn LlmProvider>,
+    failures_left: AtomicUsize,
+    status: u16,
+}
+
+impl FlakyLlm {
+    pub fn new(inner: Arc<dyn LlmProvider>, fail_calls: usize, status: u16) -> Self {
+        Self {
+            inner,
+            failures_left: AtomicUsize::new(fail_calls),
+            status,
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for FlakyLlm {
+    async fn complete(&self, req: &LlmRequest) -> Result<LlmResponse> {
+        let left = self.failures_left.load(Ordering::SeqCst);
+        if left > 0 {
+            self.failures_left.store(left - 1, Ordering::SeqCst);
+            return Err(Error::LlmStatus {
+                status: self.status,
+                message: "simulated transient failure".into(),
+            });
+        }
+        self.inner.complete(req).await
+    }
+}
+
+/// Embedding-side twin of [`FlakyLlm`]: fails the first `fail_calls` calls
+/// with `Error::EmbedStatus`, then delegates.
+pub struct FlakyEmbed {
+    inner: Arc<dyn EmbedProvider>,
+    failures_left: AtomicUsize,
+    status: u16,
+}
+
+impl FlakyEmbed {
+    pub fn new(inner: Arc<dyn EmbedProvider>, fail_calls: usize, status: u16) -> Self {
+        Self {
+            inner,
+            failures_left: AtomicUsize::new(fail_calls),
+            status,
+        }
+    }
+}
+
+#[async_trait]
+impl EmbedProvider for FlakyEmbed {
+    async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        let left = self.failures_left.load(Ordering::SeqCst);
+        if left > 0 {
+            self.failures_left.store(left - 1, Ordering::SeqCst);
+            return Err(Error::EmbedStatus {
+                status: self.status,
+                message: "simulated transient failure".into(),
+            });
+        }
+        self.inner.embed(texts).await
+    }
+
+    fn dim(&self) -> usize {
+        self.inner.dim()
     }
 }

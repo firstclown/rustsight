@@ -817,6 +817,33 @@ impl MemoryStore for SqliteStore {
         Ok(())
     }
 
+    fn edges_for_bank(&self, bank_id: &str, limit: usize) -> Result<Vec<Edge>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT bank_id, a_id, b_id, kind, label, weight FROM edges WHERE bank_id = ?1 LIMIT ?2",
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![bank_id, limit], |r| {
+                let label: String = r.get(4)?;
+                Ok(Edge {
+                    bank_id: r.get(0)?,
+                    a_id: r.get(1)?,
+                    b_id: r.get(2)?,
+                    kind: EdgeKind::parse(&r.get::<_, String>(3)?).unwrap_or(EdgeKind::Semantic),
+                    label: if label.is_empty() { None } else { Some(label) },
+                    weight: r.get(5)?,
+                })
+            })
+            .map_err(store_err)?;
+        let mut out = vec![];
+        for r in rows {
+            out.push(r.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
     fn mark_entities_dirty(
         &self,
         bank_id: &str,

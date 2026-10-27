@@ -64,6 +64,21 @@ tick. Library embedders get the same behavior via
 `Engine::spawn_worker(interval, max_entities)` (returns a tokio JoinHandle;
 abort it to stop).
 
+Chunking, retries, and limits
+-----------------------------
+Retain splits long content into token-sized chunks (default ~3000 tokens with a
+200-token overlap, measured with the configured token estimator; tunable via
+`EngineConfig.chunk_size_tokens` / `chunk_overlap_tokens`) and extracts each
+chunk separately. Chunk-local causal fact indexes are remapped to a global
+index before edges are built, and facts re-extracted from the overlap region
+(normalized similarity >= 0.9) are stored once. Transient provider failures
+(HTTP 429 / 5xx, surfaced as typed statuses) are retried with exponential
+backoff — 3 attempts, 400ms base, both configurable via `retry_max_attempts`
+and `retry_base_delay_ms`; other errors (auth, bad requests) fail fast. If a
+chunk's extraction output fails to parse (e.g. JSON truncated by an output
+token limit), the chunk is re-asked once at half size before the error
+surfaces.
+
 Offline demo (no API key)
 -------------------------
     rustsight --mock --db /tmp/demo.db retain --bank demo \

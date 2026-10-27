@@ -1,6 +1,8 @@
 use rustsight_core::Engine;
 use rustsight_core::*;
-use rustsight_providers::{MockEmbed, MockLlm, MockRerank, SimpleTokenEstimator};
+use rustsight_providers::{
+    FlakyEmbed, FlakyLlm, MockEmbed, MockLlm, MockRerank, SimpleTokenEstimator,
+};
 use rustsight_storage::SqliteStore;
 use serde_json::json;
 use std::sync::Arc;
@@ -490,4 +492,217 @@ async fn mental_model_refresh() {
     assert!(model.content.contains("Standing answer"));
     assert!(model.last_refreshed_ms.is_some());
     assert_eq!(e.store.list_mental_models("m").unwrap().len(), 1);
+}
+
+// --- RS-3: chunking, dedup, re-ask, retries ---
+
+struct WordEstimator;
+impl TokenEstimator for WordEstimator {
+    fn count(&self, text: &str) -> usize {
+        text.split_whitespace().count()
+    }
+}
+
+fn chunked_engine(llm: Arc<dyn LlmProvider>, chunk_size: usize, overlap: usize) -> Engine {
+    Engine::new(
+        Arc::new(SqliteStore::open_in_memory().unwrap()),
+        llm,
+        Arc::new(MockEmbed::default()),
+        Arc::new(MockRerank),
+        Arc::new(WordEstimator),
+        Arc::new(FixedClock::new(1_800_000_000_000)),
+    )
+    .with_config(EngineConfig {
+        chunk_size_tokens: chunk_size,
+        chunk_overlap_tokens: overlap,
+        ..Default::default()
+    })
+}
+
+fn causal_facts_resp(facts: &[(&str, &[(usize, &str)])]) -> LlmResponse {
+    let facts: Vec<_> = facts
+        .iter()
+        .map(|(text, causal)| {
+            let causal: Vec<_> = causal
+                .iter()
+                .map(|(i, r)| json!({"fact_index": i, "relation": r}))
+                .collect();
+            json!({"text": text, "fact_type": "world", "entities": [], "occurred_start": null, "occurred_end": null, "causal": causal})
+        })
+        .collect();
+    LlmResponse {
+        content: Some(json!({"facts": facts}).to_string()),
+        tool_calls: vec![],
+    }
+}
+
+fn assert_causal_edge(e: &Engine, bank: &str, a_id: &str, b_id: &str) {
+    let edges = e.store.edges_for_bank(bank, 1000).unwrap();
+    assert!(
+        edges.iter().any(|x| x.kind == EdgeKind::Causal
+            && x.a_id == a_id
+            && x.b_id == b_id
+            && x.label.as_deref() == Some("causes")),
+        "causal edge {a_id}->{b_id} missing: {edges:?}"
+    );
+}
+
+#[tokio::test]
+async fn two_chunk_retain_builds_cross_chunk_causal_edge() {
+    // 6 words, 4-token chunks, 1-token overlap -> exactly two chunks:
+    // ["alpha beta gamma delta", "delta epsilon zeta"]
+    let script = MockLlm::script(vec![
+        causal_facts_resp(&[
+            ("Alice joined Google as an engineer.", &[]),
+            ("Alice works on search infrastructure.", &[]),
+        ]),
+        // overlap re-extracts chunk 1's second fact; the new fact causally
+        // points at it via chunk-local index 0
+        causal_facts_resp(&[
+            ("Alice works on search infrastructure!", &[]),
+            ("Alice chose the SRE team for the growth.", &[(0, "causes")]),
+        ]),
+    ]);
+    let e = chunked_engine(Arc::new(script), 4, 1);
+    let r = retain(&e, "cc", "alpha beta gamma delta epsilon zeta").await;
+    assert_eq!(r.memories_stored, 3, "{r:?}");
+
+    let mems = e.store.list_memories("cc", 100).unwrap();
+    let id = |needle: &str| {
+        mems.iter()
+            .find(|m| m.text.contains(needle))
+            .unwrap_or_else(|| panic!("no memory containing {needle}: {mems:?}"))
+            .id
+            .clone()
+    };
+    let alice_infra = id("search infrastructure");
+    let alice_chose = id("chose the SRE team");
+    // the causal ref declared against the overlap duplicate must land on the
+    // deduped (kept) fact, not the dropped copy
+    assert_causal_edge(&e, "cc", &alice_chose, &alice_infra);
+}
+
+#[tokio::test]
+async fn overlap_duplicate_fact_stored_once() {
+    let script = MockLlm::script(vec![
+        causal_facts_resp(&[
+            ("Cara leads the design team.", &[]),
+            ("Cara uses Figma every day.", &[]),
+        ]),
+        // chunk 2 sees the overlap region and re-extracts chunk 1's fact
+        causal_facts_resp(&[("Cara uses Figma every day!", &[])]),
+    ]);
+    let e = chunked_engine(Arc::new(script), 4, 1);
+    let r = retain(&e, "dup", "alpha beta gamma delta epsilon zeta").await;
+    assert_eq!(r.memories_stored, 2, "{r:?}");
+    let mems = e.store.list_memories("dup", 100).unwrap();
+    assert_eq!(
+        mems.iter().filter(|m| m.text.contains("Figma")).count(),
+        1,
+        "{mems:?}"
+    );
+}
+
+#[tokio::test]
+async fn retain_retries_transient_llm_failure() {
+    let inner = MockLlm::script(vec![causal_facts_resp(&[("Dana moved to Austin.", &[])])]);
+    let e = Engine::new(
+        Arc::new(SqliteStore::open_in_memory().unwrap()),
+        Arc::new(FlakyLlm::new(Arc::new(inner), 1, 429)),
+        Arc::new(MockEmbed::default()),
+        Arc::new(MockRerank),
+        Arc::new(SimpleTokenEstimator),
+        Arc::new(FixedClock::new(1_800_000_000_000)),
+    )
+    .with_config(EngineConfig {
+        retry_max_attempts: 3,
+        retry_base_delay_ms: 1,
+        ..Default::default()
+    });
+    let r = retain(&e, "rt", "Dana moved to Austin for the music scene.").await;
+    assert_eq!(r.memories_stored, 1, "{r:?}");
+}
+
+#[tokio::test]
+async fn retain_retries_transient_embed_failure() {
+    let inner = MockLlm::script(vec![causal_facts_resp(&[("Eli moved to Boston.", &[])])]);
+    let e = Engine::new(
+        Arc::new(SqliteStore::open_in_memory().unwrap()),
+        Arc::new(inner),
+        Arc::new(FlakyEmbed::new(Arc::new(MockEmbed::default()), 2, 503)),
+        Arc::new(MockRerank),
+        Arc::new(SimpleTokenEstimator),
+        Arc::new(FixedClock::new(1_800_000_000_000)),
+    )
+    .with_config(EngineConfig {
+        retry_max_attempts: 3,
+        retry_base_delay_ms: 1,
+        ..Default::default()
+    });
+    let r = retain(&e, "re", "Eli moved to Boston for the universities.").await;
+    assert_eq!(r.memories_stored, 1, "{r:?}");
+}
+
+#[tokio::test]
+async fn retain_fails_fast_on_permanent_llm_error() {
+    let inner = MockLlm::script(vec![causal_facts_resp(&[("Fay moved to Reno.", &[])])]);
+    let e = Engine::new(
+        Arc::new(SqliteStore::open_in_memory().unwrap()),
+        Arc::new(FlakyLlm::new(Arc::new(inner), 1, 400)),
+        Arc::new(MockEmbed::default()),
+        Arc::new(MockRerank),
+        Arc::new(SimpleTokenEstimator),
+        Arc::new(FixedClock::new(1_800_000_000_000)),
+    )
+    .with_config(EngineConfig {
+        retry_max_attempts: 3,
+        retry_base_delay_ms: 1,
+        ..Default::default()
+    });
+    let err = e
+        .retain(RetainRequest {
+            bank_id: "pf".into(),
+            content: "Fay moved to Reno last winter.".into(),
+            context: None,
+            timestamp_ms: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::LlmStatus { status: 400, .. }),
+        "expected typed 400, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn retain_reasks_at_half_size_on_parse_failure() {
+    let script = MockLlm::script(vec![
+        // first attempt: unparseable (truncated JSON-mode output)
+        LlmResponse {
+            content: Some(r#"{"facts":[{"text":"Bob mo"#.into()),
+            tool_calls: vec![],
+        },
+        // re-ask on half 1
+        causal_facts_resp(&[("Bob moved to Austin last month.", &[])]),
+        // re-ask on half 2: local causal index 0 must offset to global 1
+        causal_facts_resp(&[
+            ("Bob bought a house there.", &[]),
+            ("Bob bought it because prices fell.", &[(0, "causes")]),
+        ]),
+    ]);
+    let e = chunked_engine(Arc::new(script), 3000, 200);
+    let r = retain(&e, "rh", "Bob moved recently and bought property.").await;
+    assert_eq!(r.memories_stored, 3, "{r:?}");
+
+    let mems = e.store.list_memories("rh", 100).unwrap();
+    let id = |needle: &str| {
+        mems.iter()
+            .find(|m| m.text.contains(needle))
+            .unwrap_or_else(|| panic!("no memory containing {needle}: {mems:?}"))
+            .id
+            .clone()
+    };
+    let bought = id("bought a house");
+    let because = id("because prices fell");
+    assert_causal_edge(&e, "rh", &because, &bought);
 }

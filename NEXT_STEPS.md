@@ -120,14 +120,14 @@ documents, auto-recurses when output is too long, and retries
   re-ask at half the chunk size before giving up (upstream's auto-split).
 
 ### Definition of done
-- [ ] `EngineConfig` gains chunk size/overlap; retain splits, extracts per
+- [x] `EngineConfig` gains chunk size/overlap; retain splits, extracts per
       chunk, remaps causal indexes, dedupes overlap facts.
-- [ ] Retry-with-backoff on transient LLM/embedding failures.
-- [ ] Re-ask at half size on parse failure (one recursion level).
-- [ ] Tests: two-chunk content with a cross-chunk causal link produces the
+- [x] Retry-with-backoff on transient LLM/embedding failures.
+- [x] Re-ask at half size on parse failure (one recursion level).
+- [x] Tests: two-chunk content with a cross-chunk causal link produces the
       correct edge; duplicate-from-overlap is stored once; a scripted 429 then
       success path succeeds.
-- [ ] README documents limits.
+- [x] README documents limits.
 
 ---
 
