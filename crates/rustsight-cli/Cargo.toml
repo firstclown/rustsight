@@ -1,0 +1,20 @@
+[package]
+name = "rustsight-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "rustsight command line: serve, mcp, retain/recall/reflect, inspect"
+
+[[bin]]
+name = "rustsight"
+path = "src/main.rs"
+
+[dependencies]
+rustsight-core = { workspace = true }
+rustsight-storage = { workspace = true }
+rustsight-providers = { workspace = true }
+rustsight-server = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

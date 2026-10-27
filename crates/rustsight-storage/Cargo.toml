@@ -1,0 +1,18 @@
+[package]
+name = "rustsight-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SQLite-backed storage for rustsight (FTS5 BM25, brute-force vectors, typed edge graph)"
+
+[dependencies]
+rustsight-core = { workspace = true }
+rusqlite = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+rustsight-providers = { workspace = true }
+serde_json = { workspace = true }

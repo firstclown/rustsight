@@ -1,0 +1,13 @@
+[package]
+name = "rustsight-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "HTTP (axum) and MCP (stdio) frontends for rustsight"
+
+[dependencies]
+rustsight-core = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

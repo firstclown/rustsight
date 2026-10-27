@@ -1,0 +1,13 @@
+[package]
+name = "rustsight-providers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LLM, embedding, and rerank providers for rustsight (OpenAI-compatible HTTP + mocks)"
+
+[dependencies]
+rustsight-core = { workspace = true }
+reqwest = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

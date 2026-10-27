@@ -1,0 +1,18 @@
+rustsight
+
+Copyright 2026 Joe Erickson
+
+MIT License. See LICENSE for full text.
+
+Attribution
+-----------
+This project implements the memory architecture described in:
+
+  "Hindsight is 20/20: Building Agent Memory that Retains, Recalls, and
+  Reflects" - Latimer, Boschi, Neeser, Bartholomew, Srivastava, Wang,
+  Ramakrishnan (arXiv:2512.12818).
+
+Its prompt wording and pipeline structure are informed by the open-source
+reference implementation at https://github.com/vectorize-io/hindsight
+(MIT License, Copyright (c) 2025 Vectorize AI, Inc.), which this project is a
+from-scratch Rust reimplementation of, not a derivative code port.
