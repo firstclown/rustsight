@@ -206,6 +206,168 @@ async fn reflect_forms_and_stores_opinions() {
     assert!(ops[0].embedding.is_some());
 }
 
+fn facts_resp(facts: &[(&str, &str)]) -> LlmResponse {
+    let facts: Vec<_> = facts
+        .iter()
+        .map(|(text, entity)| {
+            json!({"text": text, "fact_type": "world", "entities": [{"name": entity, "etype": "person"}], "occurred_start": null, "occurred_end": null, "causal": []})
+        })
+        .collect();
+    LlmResponse {
+        content: Some(json!({"facts": facts}).to_string()),
+        tool_calls: vec![],
+    }
+}
+
+#[tokio::test]
+async fn opinion_linked_to_entity_is_reinforced_by_consolidation() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let script = MockLlm::script(vec![
+        // retain #1: seed Alice + Google facts/entities
+        extraction_resp(),
+        // reflect: recall, finish with an opinion-bearing answer
+        tool_call("1", "recall", json!({"query": "Alice"})),
+        tool_call(
+            "2",
+            "finish",
+            json!({"answer": "I think Alice is meticulous."}),
+        ),
+        // opinion extraction tags the entity the opinion is about
+        LlmResponse {
+            content: Some(
+                r#"{"opinions":[{"text":"I think Alice is meticulous.","confidence":0.6,"entities":[{"name":"Alice","etype":"person"}]}]}"#.into(),
+            ),
+            tool_calls: vec![],
+        },
+        // retain #2 (later timestamp): new Alice facts dirty the entity
+        facts_resp(&[
+            ("Alice delivered the migration ahead of schedule.", "Alice"),
+            ("Alice wrote thorough design docs.", "Alice"),
+        ]),
+        // consolidation: observation synthesis for Alice
+        LlmResponse {
+            content: Some(
+                r#"{"observations":[{"text":"Summary: Alice delivers reliably.","evidence":[{"fact_index":0,"quote":""}]}]}"#.into(),
+            ),
+            tool_calls: vec![],
+        },
+        // consolidation: opinion reinforcement verdict
+        LlmResponse {
+            content: Some(
+                r#"{"changed":true,"text":"I now think Alice is meticulous and reliable.","confidence":0.9}"#.into(),
+            ),
+            tool_calls: vec![],
+        },
+    ]);
+    let e = Engine::new(
+        Arc::new(store),
+        Arc::new(script),
+        Arc::new(MockEmbed::default()),
+        Arc::new(MockRerank),
+        Arc::new(SimpleTokenEstimator),
+        Arc::new(FixedClock::new(1_800_000_000_000)),
+    );
+    retain(&e, "ri", "Alice works at Google as an engineer.").await;
+    let resp = e.reflect("ri", "What do you think of Alice?").await.unwrap();
+    assert_eq!(resp.opinions_formed, 1);
+
+    let alice = e
+        .store
+        .entities_for_bank("ri")
+        .unwrap()
+        .into_iter()
+        .find(|x| x.name == "Alice")
+        .expect("alice entity exists");
+    let ops = e.store.list_opinions("ri").unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0].entity_ids, vec![alice.id.clone()]);
+    assert!((ops[0].confidence - 0.6).abs() < 1e-6);
+    assert!(ops[0].history.is_empty());
+
+    e.retain(RetainRequest {
+        bank_id: "ri".into(),
+        content: "Alice delivered the migration ahead of schedule. Alice wrote thorough design docs.".into(),
+        context: None,
+        timestamp_ms: Some(1_800_003_600_000),
+    })
+    .await
+    .unwrap();
+
+    e.consolidate_once("ri", 10).await.unwrap();
+
+    let ops = e.store.list_opinions("ri").unwrap();
+    assert_eq!(ops.len(), 1, "{ops:?}");
+    assert_eq!(ops[0].text, "I now think Alice is meticulous and reliable.");
+    assert!((ops[0].confidence - 0.9).abs() < 1e-6, "{:?}", ops[0]);
+    assert_eq!(ops[0].history.len(), 1, "{:?}", ops[0]);
+    assert!((ops[0].history[0].confidence - 0.6).abs() < 1e-6);
+    assert_eq!(ops[0].history[0].reason, "reinforced by consolidation");
+    assert_eq!(ops[0].entity_ids, vec![alice.id]);
+    assert!(!e.store.observations_for_bank("ri").unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn opinion_without_entities_is_untouched_by_consolidation() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let script = MockLlm::script(vec![
+        facts_resp(&[
+            ("Bob joined Acme as a designer.", "Bob"),
+            ("Bob redesigned the Acme landing page.", "Bob"),
+        ]),
+        LlmResponse {
+            content: Some(
+                r#"{"observations":[{"text":"Summary: Bob designs at Acme.","evidence":[{"fact_index":0,"quote":""}]}]}"#.into(),
+            ),
+            tool_calls: vec![],
+        },
+    ]);
+    let e = Engine::new(
+        Arc::new(store),
+        Arc::new(script),
+        Arc::new(MockEmbed::default()),
+        Arc::new(MockRerank),
+        Arc::new(SimpleTokenEstimator),
+        Arc::new(FixedClock::new(1_800_000_000_000)),
+    );
+    e.retain(RetainRequest {
+        bank_id: "uo".into(),
+        content: "Bob joined Acme as a designer. Bob redesigned the Acme landing page.".into(),
+        context: None,
+        // later than the opinion so the recency filter alone would not spare it
+        timestamp_ms: Some(1_800_003_600_000),
+    })
+    .await
+    .unwrap();
+
+    let now = e.clock.now_ms();
+    e.store
+        .upsert_opinion(&Opinion {
+            id: "op-unlinked".into(),
+            bank_id: "uo".into(),
+            text: "I think Bob is unreliable.".into(),
+            confidence: 0.7,
+            evidence: vec![],
+            history: vec![],
+            entity_ids: vec![],
+            updated_at_ms: now,
+            created_at_ms: now,
+            embedding: None,
+        })
+        .unwrap();
+
+    let updated = e.consolidate_once("uo", 10).await.unwrap();
+    assert!(updated >= 1, "consolidation ran: {updated}");
+    assert!(!e.store.observations_for_bank("uo").unwrap().is_empty());
+
+    let ops = e.store.list_opinions("uo").unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0].text, "I think Bob is unreliable.");
+    assert!((ops[0].confidence - 0.7).abs() < 1e-6);
+    assert!(ops[0].history.is_empty(), "{:?}", ops[0]);
+    assert_eq!(ops[0].updated_at_ms, now);
+    assert!(ops[0].entity_ids.is_empty());
+}
+
 #[tokio::test]
 async fn mental_model_refresh() {
     let store = SqliteStore::open_in_memory().unwrap();

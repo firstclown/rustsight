@@ -1,5 +1,5 @@
 use crate::traits::ToolDef;
-use crate::types::{Bank, Disposition};
+use crate::types::{Bank, Disposition, EntityType, ExtractedEntity};
 use crate::{Error, Result};
 use serde::Deserialize;
 use serde_json::json;
@@ -97,12 +97,28 @@ pub fn build_opinion_extraction_prompt(question: &str, answer: &str) -> (String,
         2. Always start with first-person phrases: \"I think...\", \"I believe...\", \"In my view...\", \"Previously I thought... but now...\". Never write third person.\n\
         3. Include the reasoning naturally within the statement.\n\
         4. Do NOT extract statements like \"I don't have enough information\" or \"the facts don't contain X\" — only actual opinions about substantive topics.\n\
-        5. Assign a confidence score between 0.0 and 1.0.\n\n\
-        OUTPUT: a single JSON object: {\"opinions\":[{\"text\":\"I think ...\",\"confidence\":0.8}]} — return an empty list if there are no opinions.";
+        5. Assign a confidence score between 0.0 and 1.0.\n\
+        6. ENTITIES: list the canonical surface names of every person, organization, location, product, or concept the opinion is about, with etype one of: person, organization, location, product, concept, other. Use an empty list if the opinion is not about any specific entity.\n\n\
+        OUTPUT: a single JSON object: {\"opinions\":[{\"text\":\"I think ...\",\"confidence\":0.8,\"entities\":[{\"name\":\"...\",\"etype\":\"person\"}]}]} — return an empty list if there are no opinions.";
     let user = format!(
         "ORIGINAL QUESTION: {question}\n\nANSWER PROVIDED:\n{answer}\n\nExtract new opinions as JSON."
     );
     (system.to_string(), user)
+}
+
+#[derive(Debug, Clone)]
+pub struct ParsedOpinion {
+    pub text: String,
+    pub confidence: f32,
+    pub entities: Vec<ExtractedEntity>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawOpinionEntity {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    etype: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -111,6 +127,8 @@ struct RawOpinion {
     text: Option<String>,
     #[serde(default)]
     confidence: Option<f32>,
+    #[serde(default)]
+    entities: Option<Vec<RawOpinionEntity>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -119,7 +137,7 @@ struct RawRoot {
     opinions: Option<Vec<RawOpinion>>,
 }
 
-pub fn parse_opinions(raw: &str) -> Result<Vec<(String, f32)>> {
+pub fn parse_opinions(raw: &str) -> Result<Vec<ParsedOpinion>> {
     let body = match (raw.find('{'), raw.rfind('}')) {
         (Some(s), Some(e)) if e > s => &raw[s..=e],
         _ => raw,
@@ -135,7 +153,26 @@ pub fn parse_opinions(raw: &str) -> Result<Vec<(String, f32)>> {
             if text.is_empty() {
                 return None;
             }
-            Some((text, o.confidence.unwrap_or(0.6).clamp(0.0, 1.0)))
+            let entities = o
+                .entities
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|e| {
+                    let name = e.name?.trim().to_string();
+                    if name.is_empty() {
+                        return None;
+                    }
+                    Some(ExtractedEntity {
+                        etype: EntityType::parse(e.etype.as_deref().unwrap_or("other")),
+                        name,
+                    })
+                })
+                .collect();
+            Some(ParsedOpinion {
+                text,
+                confidence: o.confidence.unwrap_or(0.6).clamp(0.0, 1.0),
+                entities,
+            })
         })
         .collect())
 }
@@ -188,7 +225,26 @@ mod tests {
         let raw = r#"{"opinions":[{"text":"I think Alice is reliable.","confidence":1.7},{"text":"  "},{"text":"I believe X"}]}"#;
         let ops = parse_opinions(raw).unwrap();
         assert_eq!(ops.len(), 2);
-        assert!((ops[0].1 - 1.0).abs() < 1e-6);
-        assert!((ops[1].1 - 0.6).abs() < 1e-6);
+        assert!((ops[0].confidence - 1.0).abs() < 1e-6);
+        assert!((ops[1].confidence - 0.6).abs() < 1e-6);
+        assert!(ops.iter().all(|o| o.entities.is_empty()));
+    }
+
+    #[test]
+    fn parse_opinions_with_entities() {
+        let raw = r#"{"opinions":[{"text":"I think Alice is reliable.","confidence":0.8,"entities":[{"name":"Alice","etype":"PERSON"},{"name":"  "},{"etype":"person"}]},{"text":"I believe X","entities":null}]}"#;
+        let ops = parse_opinions(raw).unwrap();
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].entities.len(), 1);
+        assert_eq!(ops[0].entities[0].name, "Alice");
+        assert_eq!(ops[0].entities[0].etype, EntityType::Person);
+        assert!(ops[1].entities.is_empty());
+    }
+
+    #[test]
+    fn opinion_extraction_prompt_asks_for_entities() {
+        let (system, _) = build_opinion_extraction_prompt("q", "a");
+        assert!(system.contains("ENTITIES"));
+        assert!(system.contains("entities"));
     }
 }

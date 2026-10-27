@@ -9,5 +9,5 @@ pub use consolidation::{
 pub use extraction::{build_extraction_prompt, parse_extraction, ExtractionConfig};
 pub use reflect::{
     build_mental_model_prompt, build_opinion_extraction_prompt, build_reflect_system,
-    parse_opinions, reflect_tools, verbalize_disposition,
+    parse_opinions, reflect_tools, verbalize_disposition, ParsedOpinion,
 };

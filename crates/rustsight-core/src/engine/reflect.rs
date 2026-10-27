@@ -1,12 +1,12 @@
 use crate::engine::Engine;
-use crate::entity::normalize_name;
+use crate::entity::{combined_score, normalize_name, string_similarity};
 use crate::prompts::reflect::{
     build_opinion_extraction_prompt, build_reflect_system, parse_opinions, reflect_tools,
 };
 use crate::traits::{ChatMessage, LlmRequest, LlmResponse, Role, ToolCall};
 use crate::types::*;
 use crate::{Error, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub(super) async fn reflect(e: &Engine, bank_id: &str, query: &str) -> Result<ReflectResponse> {
     if query.trim().is_empty() {
@@ -195,13 +195,22 @@ async fn form_opinions(e: &Engine, bank_id: &str, question: &str, answer: &str) 
         return Ok(0);
     }
     let existing = e.store.list_opinions(bank_id)?;
+    let bank_entities = e.store.entities_for_bank(bank_id)?;
+    let mut resolved_cache: HashMap<String, Option<Entity>> = HashMap::new();
     let now = e.clock.now_ms();
     let mut formed = 0usize;
-    let mut new_opinions: Vec<(String, f32)> = vec![];
-    for (text, confidence) in parsed {
+    let mut new_opinions: Vec<(String, f32, Vec<String>)> = vec![];
+    for op in parsed {
+        let entity_ids = resolve_opinion_entities(
+            e,
+            bank_id,
+            &op.entities,
+            &bank_entities,
+            &mut resolved_cache,
+        )?;
         let similar = existing
             .iter()
-            .find(|o| crate::entity::string_similarity(&text, &o.text) >= 0.85);
+            .find(|o| string_similarity(&op.text, &o.text) >= 0.85);
         match similar {
             Some(o) => {
                 let mut updated = o.clone();
@@ -210,20 +219,25 @@ async fn form_opinions(e: &Engine, bank_id: &str, question: &str, answer: &str) 
                     at_ms: now,
                     reason: "reinforced by reflect".into(),
                 });
-                updated.confidence = ((o.confidence + confidence) / 2.0).clamp(0.0, 1.0);
+                updated.confidence = ((o.confidence + op.confidence) / 2.0).clamp(0.0, 1.0);
                 updated.updated_at_ms = now;
+                for id in entity_ids {
+                    if !updated.entity_ids.contains(&id) {
+                        updated.entity_ids.push(id);
+                    }
+                }
                 e.store.upsert_opinion(&updated)?;
             }
             None => {
                 formed += 1;
-                new_opinions.push((text, confidence));
+                new_opinions.push((op.text, op.confidence, entity_ids));
             }
         }
     }
     if !new_opinions.is_empty() {
-        let texts: Vec<String> = new_opinions.iter().map(|(t, _)| t.clone()).collect();
+        let texts: Vec<String> = new_opinions.iter().map(|(t, _, _)| t.clone()).collect();
         let embeddings = e.embed.embed(texts).await?;
-        for ((text, confidence), emb) in new_opinions.into_iter().zip(embeddings) {
+        for ((text, confidence, entity_ids), emb) in new_opinions.into_iter().zip(embeddings) {
             let o = Opinion {
                 id: uuid::Uuid::new_v4().to_string(),
                 bank_id: bank_id.to_string(),
@@ -231,7 +245,7 @@ async fn form_opinions(e: &Engine, bank_id: &str, question: &str, answer: &str) 
                 confidence: confidence.clamp(0.0, 1.0),
                 evidence: vec![],
                 history: vec![],
-                entity_ids: vec![],
+                entity_ids,
                 updated_at_ms: now,
                 created_at_ms: now,
                 embedding: Some(emb),
@@ -240,6 +254,72 @@ async fn form_opinions(e: &Engine, bank_id: &str, question: &str, answer: &str) 
         }
     }
     Ok(formed)
+}
+
+/// Resolve LLM-tagged entity mentions in an opinion against the bank's
+/// canonical entities: exact alias match first, then fuzzy match above the
+/// resolver's link threshold. Unmatched mentions are dropped (never linked,
+/// never created) so opinions without known entities stay unlinked and are
+/// skipped by consolidation-time reinforcement.
+fn resolve_opinion_entities(
+    e: &Engine,
+    bank_id: &str,
+    mentions: &[ExtractedEntity],
+    bank_entities: &[Entity],
+    cache: &mut HashMap<String, Option<Entity>>,
+) -> Result<Vec<String>> {
+    let now = e.clock.now_ms();
+    let mut ids: Vec<String> = vec![];
+    for m in mentions {
+        let norm = normalize_name(&m.name);
+        if norm.is_empty() {
+            continue;
+        }
+        let hit = if let Some(h) = cache.get(&norm) {
+            h.clone()
+        } else {
+            let h = match e.store.find_by_alias(bank_id, &norm)? {
+                Some(x) => Some(x),
+                None => fuzzy_match_entity(e, bank_id, &norm, &m.name, bank_entities, now)?,
+            };
+            cache.insert(norm, h.clone());
+            h
+        };
+        if let Some(ent) = hit {
+            if !ids.contains(&ent.id) {
+                ids.push(ent.id);
+            }
+        }
+    }
+    Ok(ids)
+}
+
+fn fuzzy_match_entity(
+    e: &Engine,
+    bank_id: &str,
+    norm: &str,
+    display: &str,
+    candidates: &[Entity],
+    now: i64,
+) -> Result<Option<Entity>> {
+    let cfg = &e.config.entity;
+    let mut best: Option<(f32, &Entity)> = None;
+    for c in candidates {
+        let s = string_similarity(display, &c.name);
+        let t = 1.0
+            - (((now - c.last_mentioned_ms).abs() as f32) / (90.0 * 86_400_000.0)).min(1.0);
+        let score = combined_score(s, 0.0, t, cfg);
+        if best.as_ref().is_none_or(|(bs, _)| score > *bs) {
+            best = Some((score, c));
+        }
+    }
+    if let Some((score, ent)) = best {
+        if score >= cfg.link_threshold {
+            e.store.add_alias(bank_id, norm, &ent.id)?;
+            return Ok(Some(ent.clone()));
+        }
+    }
+    Ok(None)
 }
 
 #[allow(dead_code)]
