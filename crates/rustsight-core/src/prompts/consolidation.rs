@@ -110,9 +110,8 @@ pub fn build_opinion_reinforcement_prompt(
     confidence: f32,
     new_facts: &[Memory],
 ) -> (String, String) {
-    let mut user = format!(
-        "CURRENT OPINION (confidence {confidence:.2}):\n{opinion_text}\n\nNEW FACTS:\n"
-    );
+    let mut user =
+        format!("CURRENT OPINION (confidence {confidence:.2}):\n{opinion_text}\n\nNEW FACTS:\n");
     if new_facts.is_empty() {
         user.push_str("(none)\n");
     }
@@ -166,6 +165,8 @@ mod tests {
         let (t, c) = parse_reinforcement(raw).unwrap().unwrap();
         assert_eq!(t, "I now think Alice is meticulous.");
         assert!((c - 0.8).abs() < 1e-6);
-        assert!(parse_reinforcement(r#"{"changed":false}"#).unwrap().is_none());
+        assert!(parse_reinforcement(r#"{"changed":false}"#)
+            .unwrap()
+            .is_none());
     }
 }

@@ -1,14 +1,20 @@
 use clap::{Parser, Subcommand};
 use rustsight_core::types::*;
 use rustsight_core::{Engine, SystemClock};
-use rustsight_providers::{build_mock_providers, build_providers, ProviderEnv, SimpleTokenEstimator};
-use rustsight_storage::SqliteStore;
+use rustsight_providers::{
+    build_mock_providers, build_providers, ProviderEnv, SimpleTokenEstimator,
+};
 use rustsight_server::{http, mcp};
+use rustsight_storage::SqliteStore;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(name = "rustsight", version, about = "Hindsight-style agent memory engine")]
+#[command(
+    name = "rustsight",
+    version,
+    about = "Hindsight-style agent memory engine"
+)]
 struct Cli {
     #[arg(long, global = true)]
     db: Option<PathBuf>,
@@ -142,11 +148,19 @@ async fn main() {
     let engine = build_engine(&db, cli.mock);
     let result: Result<(), rustsight_core::Error> = match cli.cmd {
         Cmd::Serve { addr } => {
-            eprintln!("rustsight listening on http://{addr} (db: {})", db.display());
+            eprintln!(
+                "rustsight listening on http://{addr} (db: {})",
+                db.display()
+            );
             http::serve(engine, &addr).await
         }
         Cmd::Mcp { bank } => mcp::run_stdio(engine, bank).await,
-        Cmd::Retain { bank, content, context, timestamp_ms } => engine
+        Cmd::Retain {
+            bank,
+            content,
+            context,
+            timestamp_ms,
+        } => engine
             .retain(RetainRequest {
                 bank_id: bank,
                 content,
@@ -155,7 +169,11 @@ async fn main() {
             })
             .await
             .map(|r| print_json(&r)),
-        Cmd::Recall { bank, query, budget } => engine
+        Cmd::Recall {
+            bank,
+            query,
+            budget,
+        } => engine
             .recall(RecallRequest {
                 bank_id: bank,
                 query,
@@ -165,10 +183,7 @@ async fn main() {
             })
             .await
             .map(|r| print_json(&r)),
-        Cmd::Reflect { bank, query } => engine
-            .reflect(&bank, &query)
-            .await
-            .map(|r| print_json(&r)),
+        Cmd::Reflect { bank, query } => engine.reflect(&bank, &query).await.map(|r| print_json(&r)),
         Cmd::Consolidate { bank, max } => engine
             .consolidate_once(&bank, max)
             .await
@@ -187,42 +202,48 @@ async fn main() {
             }));
             Ok(())
         })(),
-        Cmd::Banks => engine
-            .store
-            .list_banks()
-            .map(|banks| print_json(&banks)),
-        Cmd::BankSet { bank, mission, directives, skepticism, literalism, empathy } => {
-            (|| -> rustsight_core::Result<()> {
-                let existing = engine.store.get_bank(&bank)?.unwrap_or(Bank {
-                    id: bank.clone(),
-                    mission: None,
-                    directives: None,
-                    background: None,
-                    disposition: Disposition::default(),
-                });
-                let mut b = existing;
-                if mission.is_some() {
-                    b.mission = mission;
-                }
-                if directives.is_some() {
-                    b.directives = directives;
-                }
-                if let Some(v) = skepticism {
-                    b.disposition.skepticism = v.clamp(1, 5);
-                }
-                if let Some(v) = literalism {
-                    b.disposition.literalism = v.clamp(1, 5);
-                }
-                if let Some(v) = empathy {
-                    b.disposition.empathy = v.clamp(1, 5);
-                }
-                engine.store.ensure_bank(&b)?;
-                engine.store.update_bank(&b)?;
-                print_json(&b);
-                Ok(())
-            })()
-        }
-        Cmd::MentalModel { bank, question, path } => engine
+        Cmd::Banks => engine.store.list_banks().map(|banks| print_json(&banks)),
+        Cmd::BankSet {
+            bank,
+            mission,
+            directives,
+            skepticism,
+            literalism,
+            empathy,
+        } => (|| -> rustsight_core::Result<()> {
+            let existing = engine.store.get_bank(&bank)?.unwrap_or(Bank {
+                id: bank.clone(),
+                mission: None,
+                directives: None,
+                background: None,
+                disposition: Disposition::default(),
+            });
+            let mut b = existing;
+            if mission.is_some() {
+                b.mission = mission;
+            }
+            if directives.is_some() {
+                b.directives = directives;
+            }
+            if let Some(v) = skepticism {
+                b.disposition.skepticism = v.clamp(1, 5);
+            }
+            if let Some(v) = literalism {
+                b.disposition.literalism = v.clamp(1, 5);
+            }
+            if let Some(v) = empathy {
+                b.disposition.empathy = v.clamp(1, 5);
+            }
+            engine.store.ensure_bank(&b)?;
+            engine.store.update_bank(&b)?;
+            print_json(&b);
+            Ok(())
+        })(),
+        Cmd::MentalModel {
+            bank,
+            question,
+            path,
+        } => engine
             .refresh_mental_model(&bank, &question, path.as_deref())
             .await
             .map(|m| print_json(&m)),

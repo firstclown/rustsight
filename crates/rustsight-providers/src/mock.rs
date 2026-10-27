@@ -1,7 +1,6 @@
 use async_trait::async_trait;
 use rustsight_core::traits::{
-    EmbedProvider, LlmProvider, LlmRequest, LlmResponse, RerankProvider, TokenEstimator,
-    ToolCall,
+    EmbedProvider, LlmProvider, LlmRequest, LlmResponse, RerankProvider, TokenEstimator, ToolCall,
 };
 use rustsight_core::Result;
 use serde_json::{json, Value};
@@ -41,11 +40,54 @@ impl MockLlm {
 }
 
 const STOPWORDS: &[&str] = &[
-    "i", "she", "he", "it", "they", "we", "the", "this", "that", "these", "those", "my", "our",
-    "his", "her", "their", "last", "next", "yesterday", "today", "tomorrow", "in", "on", "at",
-    "a", "an", "and", "but", "so", "then", "because", "when", "while", "after", "before",
-    "there", "here", "what", "who", "why", "how", "monday", "tuesday", "wednesday", "thursday",
-    "friday", "saturday", "sunday",
+    "i",
+    "she",
+    "he",
+    "it",
+    "they",
+    "we",
+    "the",
+    "this",
+    "that",
+    "these",
+    "those",
+    "my",
+    "our",
+    "his",
+    "her",
+    "their",
+    "last",
+    "next",
+    "yesterday",
+    "today",
+    "tomorrow",
+    "in",
+    "on",
+    "at",
+    "a",
+    "an",
+    "and",
+    "but",
+    "so",
+    "then",
+    "because",
+    "when",
+    "while",
+    "after",
+    "before",
+    "there",
+    "here",
+    "what",
+    "who",
+    "why",
+    "how",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
 ];
 
 fn demo_extraction(content: &str) -> Value {
@@ -106,7 +148,10 @@ fn demo_consolidation(user: &str) -> Value {
     }
     let texts: Vec<&str> = user
         .lines()
-        .filter(|l| l.trim_start_matches('[').starts_with(|c: char| c.is_ascii_digit()))
+        .filter(|l| {
+            l.trim_start_matches('[')
+                .starts_with(|c: char| c.is_ascii_digit())
+        })
         .collect();
     let summary = if texts.is_empty() {
         "Consolidated profile.".to_string()
@@ -118,7 +163,9 @@ fn demo_consolidation(user: &str) -> Value {
             .join(" ");
         format!("Summary: {}", joined.chars().take(400).collect::<String>())
     };
-    let evidence: Vec<Value> = (0..texts.len()).map(|i| json!({"fact_index": i, "quote": ""})).collect();
+    let evidence: Vec<Value> = (0..texts.len())
+        .map(|i| json!({"fact_index": i, "quote": ""}))
+        .collect();
     observations.push(json!({"text": summary, "evidence": evidence}));
     json!({"observations": observations})
 }
@@ -128,12 +175,10 @@ impl LlmProvider for MockLlm {
     async fn complete(&self, req: &LlmRequest) -> Result<LlmResponse> {
         let mut guard = self.mode.lock().unwrap();
         match &mut *guard {
-            Mode::Script(queue) => Ok(queue
-                .pop_front()
-                .unwrap_or(LlmResponse {
-                    content: Some("{}".into()),
-                    tool_calls: vec![],
-                })),
+            Mode::Script(queue) => Ok(queue.pop_front().unwrap_or(LlmResponse {
+                content: Some("{}".into()),
+                tool_calls: vec![],
+            })),
             Mode::Demo => {
                 let system = req.system.clone().unwrap_or_default();
                 if system.contains("FACT EXTRACTION ENGINE") {
@@ -150,7 +195,11 @@ impl LlmProvider for MockLlm {
                     });
                 }
                 if system.contains("OBJECTIVE OBSERVER") {
-                    let user = req.messages.last().map(|m| m.content.clone()).unwrap_or_default();
+                    let user = req
+                        .messages
+                        .last()
+                        .map(|m| m.content.clone())
+                        .unwrap_or_default();
                     return Ok(LlmResponse {
                         content: Some(demo_consolidation(&user).to_string()),
                         tool_calls: vec![],
@@ -206,7 +255,9 @@ impl LlmProvider for MockLlm {
                 }
                 if system.contains("MENTAL MODEL WRITER") {
                     return Ok(LlmResponse {
-                        content: Some("Standing answer (demo): the bank is currently small.".into()),
+                        content: Some(
+                            "Standing answer (demo): the bank is currently small.".into(),
+                        ),
                         tool_calls: vec![],
                     });
                 }

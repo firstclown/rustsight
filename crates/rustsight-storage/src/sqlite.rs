@@ -130,7 +130,9 @@ fn emb_to_blob(v: &[f32]) -> Vec<u8> {
 }
 
 fn blob_to_emb(b: &[u8]) -> Vec<f32> {
-    b.as_chunks::<4>().0.iter()
+    b.as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }
@@ -415,10 +417,16 @@ impl MemoryStore for SqliteStore {
             .map_err(store_err)?;
         for r in rows {
             let (id, kind, blob) = r.map_err(store_err)?;
-            out.push((id, MemoryKind::parse(&kind).unwrap_or(MemoryKind::World), blob_to_emb(&blob)));
+            out.push((
+                id,
+                MemoryKind::parse(&kind).unwrap_or(MemoryKind::World),
+                blob_to_emb(&blob),
+            ));
         }
         let mut stmt = conn
-            .prepare("SELECT id, embedding FROM observations WHERE bank_id=?1 AND embedding IS NOT NULL")
+            .prepare(
+                "SELECT id, embedding FROM observations WHERE bank_id=?1 AND embedding IS NOT NULL",
+            )
             .map_err(store_err)?;
         let rows = stmt
             .query_map(params![bank_id], |r| {
@@ -430,7 +438,9 @@ impl MemoryStore for SqliteStore {
             out.push((id, MemoryKind::Observation, blob_to_emb(&blob)));
         }
         let mut stmt = conn
-            .prepare("SELECT id, embedding FROM opinions WHERE bank_id=?1 AND embedding IS NOT NULL")
+            .prepare(
+                "SELECT id, embedding FROM opinions WHERE bank_id=?1 AND embedding IS NOT NULL",
+            )
             .map_err(store_err)?;
         let rows = stmt
             .query_map(params![bank_id], |r| {
@@ -569,9 +579,7 @@ impl MemoryStore for SqliteStore {
                 map.insert(m.id.clone(), m);
             }
 
-            let sql = format!(
-                "SELECT id, text, updated_at_ms FROM opinions WHERE id IN ({ph})"
-            );
+            let sql = format!("SELECT id, text, updated_at_ms FROM opinions WHERE id IN ({ph})");
             let mut stmt = conn.prepare(&sql).map_err(store_err)?;
             let rows = stmt
                 .query_map(params_from_iter(chunk.iter()), |r| {
@@ -809,7 +817,12 @@ impl MemoryStore for SqliteStore {
         Ok(())
     }
 
-    fn mark_entities_dirty(&self, bank_id: &str, entity_ids: &[String], reason: &str) -> Result<()> {
+    fn mark_entities_dirty(
+        &self,
+        bank_id: &str,
+        entity_ids: &[String],
+        reason: &str,
+    ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let now = chrono_now_ms();
         for id in entity_ids {
@@ -1047,9 +1060,7 @@ impl SqliteStore {
             evidence: serde_json::from_str(&evj).unwrap_or_default(),
             proof_count: r.get::<_, i64>(5)? as usize,
             history: serde_json::from_str(&hj).unwrap_or_default(),
-            embedding: r
-                .get::<_, Option<Vec<u8>>>(7)?
-                .map(|b| blob_to_emb(&b)),
+            embedding: r.get::<_, Option<Vec<u8>>>(7)?.map(|b| blob_to_emb(&b)),
             updated_at_ms: r.get(8)?,
             created_at_ms: r.get(9)?,
         })
@@ -1100,14 +1111,24 @@ mod tests {
         let mut b2 = b.clone();
         b2.mission = Some("updated".into());
         s.update_bank(&b2).unwrap();
-        assert_eq!(s.get_bank("b1").unwrap().unwrap().mission.as_deref(), Some("updated"));
+        assert_eq!(
+            s.get_bank("b1").unwrap().unwrap().mission.as_deref(),
+            Some("updated")
+        );
         assert_eq!(s.list_banks().unwrap().len(), 1);
     }
 
     #[test]
     fn insert_and_bm25() {
         let s = store();
-        s.ensure_bank(&Bank { id: "b".into(), mission: None, directives: None, background: None, disposition: Disposition::default() }).unwrap();
+        s.ensure_bank(&Bank {
+            id: "b".into(),
+            mission: None,
+            directives: None,
+            background: None,
+            disposition: Disposition::default(),
+        })
+        .unwrap();
         let mems = s
             .insert_memories(
                 "b",
@@ -1129,11 +1150,22 @@ mod tests {
     #[test]
     fn time_window() {
         let s = store();
-        s.ensure_bank(&Bank { id: "b".into(), mission: None, directives: None, background: None, disposition: Disposition::default() }).unwrap();
+        s.ensure_bank(&Bank {
+            id: "b".into(),
+            mission: None,
+            directives: None,
+            background: None,
+            disposition: Disposition::default(),
+        })
+        .unwrap();
         let may = 1_683_648_000_000i64;
-        s.insert_memories("b", &[new_mem("trip to Rome", may)]).unwrap();
-        s.insert_memories("b", &[new_mem("later party", 1_800_000_000_000)]).unwrap();
-        let w = s.memories_in_window("b", may - 1000, may + 1000, 10).unwrap();
+        s.insert_memories("b", &[new_mem("trip to Rome", may)])
+            .unwrap();
+        s.insert_memories("b", &[new_mem("later party", 1_800_000_000_000)])
+            .unwrap();
+        let w = s
+            .memories_in_window("b", may - 1000, may + 1000, 10)
+            .unwrap();
         assert_eq!(w.len(), 1);
         assert!(w[0].text.contains("Rome"));
     }
@@ -1141,13 +1173,34 @@ mod tests {
     #[test]
     fn graph_neighbors() {
         let s = store();
-        s.ensure_bank(&Bank { id: "b".into(), mission: None, directives: None, background: None, disposition: Disposition::default() }).unwrap();
+        s.ensure_bank(&Bank {
+            id: "b".into(),
+            mission: None,
+            directives: None,
+            background: None,
+            disposition: Disposition::default(),
+        })
+        .unwrap();
         let m = s
             .insert_memories("b", &[new_mem("a", 1), new_mem("b", 2), new_mem("c", 3)])
             .unwrap();
         s.add_edges(&[
-            Edge { bank_id: "b".into(), a_id: m[0].id.clone(), b_id: m[1].id.clone(), kind: EdgeKind::Entity, label: None, weight: 1.0 },
-            Edge { bank_id: "b".into(), a_id: m[1].id.clone(), b_id: m[2].id.clone(), kind: EdgeKind::Semantic, label: None, weight: 0.9 },
+            Edge {
+                bank_id: "b".into(),
+                a_id: m[0].id.clone(),
+                b_id: m[1].id.clone(),
+                kind: EdgeKind::Entity,
+                label: None,
+                weight: 1.0,
+            },
+            Edge {
+                bank_id: "b".into(),
+                a_id: m[1].id.clone(),
+                b_id: m[2].id.clone(),
+                kind: EdgeKind::Semantic,
+                label: None,
+                weight: 0.9,
+            },
         ])
         .unwrap();
         let n = s.neighbors("b", &[m[0].id.clone()], 2, 10).unwrap();
@@ -1158,11 +1211,23 @@ mod tests {
     #[test]
     fn dirty_cycle_and_observations() {
         let s = store();
-        s.ensure_bank(&Bank { id: "b".into(), mission: None, directives: None, background: None, disposition: Disposition::default() }).unwrap();
+        s.ensure_bank(&Bank {
+            id: "b".into(),
+            mission: None,
+            directives: None,
+            background: None,
+            disposition: Disposition::default(),
+        })
+        .unwrap();
         let ent = s
-            .create_entity(&NewEntity { bank_id: "b".into(), name: "Alice".into(), etype: EntityType::Person })
+            .create_entity(&NewEntity {
+                bank_id: "b".into(),
+                name: "Alice".into(),
+                etype: EntityType::Person,
+            })
             .unwrap();
-        s.mark_entities_dirty("b", std::slice::from_ref(&ent.id), "new_facts").unwrap();
+        s.mark_entities_dirty("b", std::slice::from_ref(&ent.id), "new_facts")
+            .unwrap();
         let d = s.list_dirty_entities("b", 10).unwrap();
         assert_eq!(d, vec![ent.id.clone()]);
         let o = Observation {
@@ -1189,8 +1254,17 @@ mod tests {
     #[test]
     fn refs_preserve_order_and_kinds() {
         let s = store();
-        s.ensure_bank(&Bank { id: "b".into(), mission: None, directives: None, background: None, disposition: Disposition::default() }).unwrap();
-        let m = s.insert_memories("b", &[new_mem("one", 1), new_mem("two", 2)]).unwrap();
+        s.ensure_bank(&Bank {
+            id: "b".into(),
+            mission: None,
+            directives: None,
+            background: None,
+            disposition: Disposition::default(),
+        })
+        .unwrap();
+        let m = s
+            .insert_memories("b", &[new_mem("one", 1), new_mem("two", 2)])
+            .unwrap();
         let o = Observation {
             id: "obs".into(),
             bank_id: "b".into(),

@@ -3,17 +3,24 @@ use chrono::{Datelike, Duration, NaiveDate};
 const DAY_MS: i64 = 86_400_000;
 
 fn date_ms(d: NaiveDate) -> i64 {
-    d.and_hms_opt(0, 0, 0)
-        .unwrap()
-        .and_utc()
-        .timestamp_millis()
+    d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis()
 }
 
 fn month_index(name: &str) -> Option<u32> {
     let n = name.to_lowercase();
     let months = [
-        "january", "february", "march", "april", "may", "june", "july", "august", "september",
-        "october", "november", "december",
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
     ];
     for (i, m) in months.iter().enumerate() {
         if n == *m || (n.len() >= 3 && m.starts_with(&n)) {
@@ -134,7 +141,11 @@ pub fn parse_window(query: &str, now_ms: i64) -> Option<(i64, i64)> {
                 year -= 1;
             }
             let s = NaiveDate::from_ymd_opt(year, m, 1)?;
-            let (ny, nm) = if m == 12 { (year + 1, 1) } else { (year, m + 1) };
+            let (ny, nm) = if m == 12 {
+                (year + 1, 1)
+            } else {
+                (year, m + 1)
+            };
             let e = NaiveDate::from_ymd_opt(ny, nm, 1)?;
             return Some((date_ms(s), date_ms(e)));
         }
@@ -159,7 +170,10 @@ mod tests {
     #[test]
     fn year_window() {
         let (s, e) = parse_window("what happened in 2023?", now()).unwrap();
-        assert_eq!(chrono::DateTime::from_timestamp_millis(s).unwrap().year(), 2023);
+        assert_eq!(
+            chrono::DateTime::from_timestamp_millis(s).unwrap().year(),
+            2023
+        );
         assert_eq!(
             chrono::DateTime::from_timestamp_millis(e).unwrap().year(),
             2024
@@ -178,7 +192,9 @@ mod tests {
     fn between_dates() {
         let (s, e) = parse_window("Between 2023-03-01 and 2023-04-15 anything?", now()).unwrap();
         assert_eq!(
-            chrono::DateTime::from_timestamp_millis(s).unwrap().date_naive(),
+            chrono::DateTime::from_timestamp_millis(s)
+                .unwrap()
+                .date_naive(),
             chrono::NaiveDate::from_ymd_opt(2023, 3, 1).unwrap()
         );
         assert!(e > s);

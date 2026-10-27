@@ -94,7 +94,8 @@ pub trait EmbedProvider: Send + Sync {
 
 #[async_trait]
 pub trait RerankProvider: Send + Sync {
-    async fn rerank(&self, query: &str, docs: &[String], top_k: usize) -> Result<Vec<(usize, f32)>>;
+    async fn rerank(&self, query: &str, docs: &[String], top_k: usize)
+        -> Result<Vec<(usize, f32)>>;
 }
 
 pub trait TokenEstimator: Send + Sync {

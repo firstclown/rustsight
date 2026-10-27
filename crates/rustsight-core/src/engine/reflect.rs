@@ -71,12 +71,7 @@ pub(super) async fn reflect(e: &Engine, bank_id: &str, query: &str) -> Result<Re
                     let mut text = String::new();
                     for m in &r.memories {
                         retrieved.insert(m.id.clone());
-                        text.push_str(&format!(
-                            "[{}] {}: {}\n",
-                            m.kind.as_str(),
-                            m.id,
-                            m.text
-                        ));
+                        text.push_str(&format!("[{}] {}: {}\n", m.kind.as_str(), m.id, m.text));
                     }
                     if text.is_empty() {
                         text = "(no memories found)".to_string();
@@ -104,9 +99,7 @@ pub(super) async fn reflect(e: &Engine, bank_id: &str, query: &str) -> Result<Re
                                     .map(|o| {
                                         format!(
                                             "[observation] {}: {} (evidence: {})",
-                                            o.id,
-                                            o.text,
-                                            o.proof_count
+                                            o.id, o.text, o.proof_count
                                         )
                                     })
                                     .collect::<Vec<_>>()
@@ -306,8 +299,7 @@ fn fuzzy_match_entity(
     let mut best: Option<(f32, &Entity)> = None;
     for c in candidates {
         let s = string_similarity(display, &c.name);
-        let t = 1.0
-            - (((now - c.last_mentioned_ms).abs() as f32) / (90.0 * 86_400_000.0)).min(1.0);
+        let t = 1.0 - (((now - c.last_mentioned_ms).abs() as f32) / (90.0 * 86_400_000.0)).min(1.0);
         let score = combined_score(s, 0.0, t, cfg);
         if best.as_ref().is_none_or(|(bs, _)| score > *bs) {
             best = Some((score, c));

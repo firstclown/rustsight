@@ -1,5 +1,5 @@
-use rustsight_core::*;
 use rustsight_core::Engine;
+use rustsight_core::*;
 use rustsight_providers::{MockEmbed, MockLlm, MockRerank, SimpleTokenEstimator};
 use rustsight_storage::SqliteStore;
 use serde_json::json;
@@ -73,8 +73,14 @@ async fn entity_resolution_merges_aliases() {
     retain(&e, "b", "Alice joined Google in March.").await;
     retain(&e, "b", "Alice later got promoted at Google.").await;
     let ents = e.store.entities_for_bank("b").unwrap();
-    let alices = ents.iter().filter(|x| x.name.eq_ignore_ascii_case("alice")).count();
-    let googles = ents.iter().filter(|x| x.name.eq_ignore_ascii_case("google")).count();
+    let alices = ents
+        .iter()
+        .filter(|x| x.name.eq_ignore_ascii_case("alice"))
+        .count();
+    let googles = ents
+        .iter()
+        .filter(|x| x.name.eq_ignore_ascii_case("google"))
+        .count();
     assert_eq!(alices, 1);
     assert_eq!(googles, 1);
 }
@@ -114,7 +120,12 @@ async fn temporal_window_recall() {
 #[tokio::test]
 async fn consolidation_builds_observation_with_evidence() {
     let e = engine();
-    retain(&e, "c", "Alice joined Google. Alice works on search infrastructure.").await;
+    retain(
+        &e,
+        "c",
+        "Alice joined Google. Alice works on search infrastructure.",
+    )
+    .await;
     let updated = e.consolidate_once("c", 10).await.unwrap();
     assert!(updated >= 1, "updated={updated}");
     let obs = e.store.observations_for_bank("c").unwrap();
@@ -173,7 +184,10 @@ async fn reflect_loop_with_scripted_tools() {
     assert_eq!(resp.answer, "Alice works at Google.");
     assert!(resp.rounds >= 2);
     assert!(resp.retrieved >= 1);
-    assert!(resp.citations.is_empty(), "bogus citation must be filtered: {resp:?}");
+    assert!(
+        resp.citations.is_empty(),
+        "bogus citation must be filtered: {resp:?}"
+    );
     assert_eq!(resp.opinions_formed, 0);
 }
 
@@ -183,9 +197,16 @@ async fn reflect_forms_and_stores_opinions() {
     let script = MockLlm::script(vec![
         extraction_resp(),
         tool_call("1", "recall", json!({"query": "python"})),
-        tool_call("2", "finish", json!({"answer": "I think Python suits this project."})),
+        tool_call(
+            "2",
+            "finish",
+            json!({"answer": "I think Python suits this project."}),
+        ),
         LlmResponse {
-            content: Some(r#"{"opinions":[{"text":"I think Python suits this project.","confidence":0.8}]}"#.into()),
+            content: Some(
+                r#"{"opinions":[{"text":"I think Python suits this project.","confidence":0.8}]}"#
+                    .into(),
+            ),
             tool_calls: vec![],
         },
     ]);
@@ -197,8 +218,16 @@ async fn reflect_forms_and_stores_opinions() {
         Arc::new(SimpleTokenEstimator),
         Arc::new(FixedClock::new(1_800_000_000_000)),
     );
-    retain(&e, "o", "The user asked about programming languages for data science.").await;
-    let resp = e.reflect("o", "Which language should I use?").await.unwrap();
+    retain(
+        &e,
+        "o",
+        "The user asked about programming languages for data science.",
+    )
+    .await;
+    let resp = e
+        .reflect("o", "Which language should I use?")
+        .await
+        .unwrap();
     assert_eq!(resp.opinions_formed, 1);
     let ops = e.store.list_opinions("o").unwrap();
     assert_eq!(ops.len(), 1);
@@ -268,7 +297,10 @@ async fn opinion_linked_to_entity_is_reinforced_by_consolidation() {
         Arc::new(FixedClock::new(1_800_000_000_000)),
     );
     retain(&e, "ri", "Alice works at Google as an engineer.").await;
-    let resp = e.reflect("ri", "What do you think of Alice?").await.unwrap();
+    let resp = e
+        .reflect("ri", "What do you think of Alice?")
+        .await
+        .unwrap();
     assert_eq!(resp.opinions_formed, 1);
 
     let alice = e
@@ -286,7 +318,9 @@ async fn opinion_linked_to_entity_is_reinforced_by_consolidation() {
 
     e.retain(RetainRequest {
         bank_id: "ri".into(),
-        content: "Alice delivered the migration ahead of schedule. Alice wrote thorough design docs.".into(),
+        content:
+            "Alice delivered the migration ahead of schedule. Alice wrote thorough design docs."
+                .into(),
         context: None,
         timestamp_ms: Some(1_800_003_600_000),
     })

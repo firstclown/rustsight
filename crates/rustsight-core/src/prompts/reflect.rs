@@ -37,7 +37,9 @@ pub fn build_reflect_system(bank: &Bank) -> String {
         s.push_str(&format!("BACKGROUND: {b}\n"));
     }
     if let Some(d) = &bank.directives {
-        s.push_str(&format!("DIRECTIVES (hard rules you must never break): {d}\n"));
+        s.push_str(&format!(
+            "DIRECTIVES (hard rules you must never break): {d}\n"
+        ));
     }
     s.push('\n');
     s.push_str(&verbalize_disposition(&bank.disposition));
@@ -54,7 +56,8 @@ pub fn reflect_tools() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "recall".into(),
-            description: "Search the memory bank and get relevant memories within a token budget.".into(),
+            description: "Search the memory bank and get relevant memories within a token budget."
+                .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -77,7 +80,8 @@ pub fn reflect_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "finish".into(),
-            description: "Deliver the final answer. Cite only memory ids that were returned by tools.".into(),
+            description:
+                "Deliver the final answer. Cite only memory ids that were returned by tools.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {

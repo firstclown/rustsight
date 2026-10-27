@@ -49,7 +49,11 @@ fn tools_list() -> Value {
     })
 }
 
-async fn call_tool(engine: &Engine, default_bank: &Option<String>, params: &Value) -> Result<Value, String> {
+async fn call_tool(
+    engine: &Engine,
+    default_bank: &Option<String>,
+    params: &Value,
+) -> Result<Value, String> {
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
     let bank_id = args
         .get("bank_id")
@@ -71,7 +75,10 @@ async fn call_tool(engine: &Engine, default_bank: &Option<String>, params: &Valu
                 .retain(RetainRequest {
                     bank_id,
                     content: content.to_string(),
-                    context: args.get("context").and_then(|v| v.as_str()).map(String::from),
+                    context: args
+                        .get("context")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
                     timestamp_ms: None,
                 })
                 .await
@@ -124,7 +131,10 @@ async fn call_tool(engine: &Engine, default_bank: &Option<String>, params: &Valu
     }
 }
 
-pub async fn run_stdio(engine: Arc<Engine>, default_bank: Option<String>) -> rustsight_core::Result<()> {
+pub async fn run_stdio(
+    engine: Arc<Engine>,
+    default_bank: Option<String>,
+) -> rustsight_core::Result<()> {
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin);
     let mut stdout = tokio::io::stdout();
@@ -165,14 +175,14 @@ pub async fn run_stdio(engine: Arc<Engine>, default_bank: Option<String>) -> rus
             "tools/list" => Ok(tools_list()),
             "tools/call" => call_tool(&engine, &default_bank, &v["params"])
                 .await
-                .map(|result| {
-                    json!({"content": [{"type": "text", "text": result.to_string()}]})
-                }),
+                .map(|result| json!({"content": [{"type": "text", "text": result.to_string()}]})),
             other => Err(format!("unknown method {other}")),
         };
         let resp = match outcome {
             Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
-            Err(msg) => json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32603, "message": msg}}),
+            Err(msg) => {
+                json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32603, "message": msg}})
+            }
         };
         let mut out = resp.to_string();
         out.push('\n');

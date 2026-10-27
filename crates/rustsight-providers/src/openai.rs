@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use rustsight_core::traits::{
-    ChatMessage, EmbedProvider, LlmProvider, LlmRequest, LlmResponse, Role, RerankProvider,
+    ChatMessage, EmbedProvider, LlmProvider, LlmRequest, LlmResponse, RerankProvider, Role,
     ToolCall,
 };
 use rustsight_core::{Error, Result};
@@ -94,10 +94,7 @@ impl LlmProvider for OpenAiCompat {
             .await
             .map_err(|e| Error::Llm(e.to_string()))?;
         let status = resp.status();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| Error::Llm(e.to_string()))?;
+        let text = resp.text().await.map_err(|e| Error::Llm(e.to_string()))?;
         if !status.is_success() {
             return Err(Error::Llm(format!("{}: {}", status, truncate(&text, 400))));
         }
@@ -165,12 +162,13 @@ impl EmbedProvider for OpenAiEmbed {
             .await
             .map_err(|e| Error::Embed(e.to_string()))?;
         let status = resp.status();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| Error::Embed(e.to_string()))?;
+        let text = resp.text().await.map_err(|e| Error::Embed(e.to_string()))?;
         if !status.is_success() {
-            return Err(Error::Embed(format!("{}: {}", status, truncate(&text, 400))));
+            return Err(Error::Embed(format!(
+                "{}: {}",
+                status,
+                truncate(&text, 400)
+            )));
         }
         let v: EmbedResponse =
             serde_json::from_str(&text).map_err(|e| Error::Embed(format!("bad json: {e}")))?;
@@ -210,7 +208,12 @@ struct RerankItem {
 
 #[async_trait]
 impl RerankProvider for ApiRerank {
-    async fn rerank(&self, query: &str, docs: &[String], top_k: usize) -> Result<Vec<(usize, f32)>> {
+    async fn rerank(
+        &self,
+        query: &str,
+        docs: &[String],
+        top_k: usize,
+    ) -> Result<Vec<(usize, f32)>> {
         if docs.is_empty() {
             return Ok(vec![]);
         }
@@ -233,7 +236,11 @@ impl RerankProvider for ApiRerank {
             .await
             .map_err(|e| Error::Rerank(e.to_string()))?;
         if !status.is_success() {
-            return Err(Error::Rerank(format!("{}: {}", status, truncate(&text, 400))));
+            return Err(Error::Rerank(format!(
+                "{}: {}",
+                status,
+                truncate(&text, 400)
+            )));
         }
         let v: RerankResponse =
             serde_json::from_str(&text).map_err(|e| Error::Rerank(format!("bad json: {e}")))?;
@@ -248,7 +255,12 @@ pub struct NoopRerank;
 
 #[async_trait]
 impl RerankProvider for NoopRerank {
-    async fn rerank(&self, _query: &str, docs: &[String], top_k: usize) -> Result<Vec<(usize, f32)>> {
+    async fn rerank(
+        &self,
+        _query: &str,
+        docs: &[String],
+        top_k: usize,
+    ) -> Result<Vec<(usize, f32)>> {
         Ok((0..docs.len().min(top_k))
             .map(|i| (i, 1.0 - i as f32 * 0.001))
             .collect())

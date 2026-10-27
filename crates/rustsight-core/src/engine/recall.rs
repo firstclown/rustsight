@@ -13,10 +13,14 @@ pub(super) async fn recall(e: &Engine, req: RecallRequest) -> Result<RecallRespo
         .next()
         .ok_or_else(|| Error::Embed("no embedding returned".into()))?;
 
-    let kinds = req
-        .kinds
-        .clone()
-        .unwrap_or_else(|| vec![MemoryKind::World, MemoryKind::Experience, MemoryKind::Observation, MemoryKind::Opinion]);
+    let kinds = req.kinds.clone().unwrap_or_else(|| {
+        vec![
+            MemoryKind::World,
+            MemoryKind::Experience,
+            MemoryKind::Observation,
+            MemoryKind::Opinion,
+        ]
+    });
     let k = req.top_k_per_arm.max(1);
 
     let mut sem: Vec<String> = vec![];

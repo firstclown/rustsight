@@ -55,8 +55,8 @@ pub fn build_extraction_prompt(
         ),
     }
 
-    let now = DateTime::from_timestamp_millis(now_ms)
-        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap());
+    let now =
+        DateTime::from_timestamp_millis(now_ms).unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap());
     let mut user = String::new();
     if let Some(ctx) = context {
         user.push_str(&format!("CONTEXT: {}\n\n", ctx));
@@ -81,10 +81,14 @@ pub fn parse_dt_ms(s: &str) -> Option<i64> {
         return Some(dt.timestamp_millis());
     }
     if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        return d.and_hms_opt(0, 0, 0).map(|t| t.and_utc().timestamp_millis());
+        return d
+            .and_hms_opt(0, 0, 0)
+            .map(|t| t.and_utc().timestamp_millis());
     }
     if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m") {
-        return d.and_hms_opt(0, 0, 0).map(|t| t.and_utc().timestamp_millis());
+        return d
+            .and_hms_opt(0, 0, 0)
+            .map(|t| t.and_utc().timestamp_millis());
     }
     if let Ok(y) = s.parse::<i32>() {
         if (1000..=3000).contains(&y) {
@@ -217,7 +221,8 @@ mod tests {
             custom_instructions: Some("Prefer technical detail.".into()),
             output_language: Some("German".into()),
         };
-        let (system, user) = build_extraction_prompt(&cfg, "Alice joined Google.", Some("career"), 0);
+        let (system, user) =
+            build_extraction_prompt(&cfg, "Alice joined Google.", Some("career"), 0);
         assert!(system.contains("LABEL FILTER"));
         assert!(system.contains("ADDITIONAL INSTRUCTIONS"));
         assert!(system.contains("German"));

@@ -50,7 +50,9 @@ async fn healthz() -> Json<serde_json::Value> {
     Json(json!({"status": "ok"}))
 }
 
-async fn list_banks(State(engine): State<Arc<Engine>>) -> Result<Json<Vec<Bank>>, (StatusCode, String)> {
+async fn list_banks(
+    State(engine): State<Arc<Engine>>,
+) -> Result<Json<Vec<Bank>>, (StatusCode, String)> {
     engine.store.list_banks().map(Json).map_err(http_err)
 }
 
@@ -175,7 +177,11 @@ async fn reflect(
     Path(bank_id): Path<String>,
     Json(body): Json<ReflectBody>,
 ) -> Result<Json<ReflectResponse>, (StatusCode, String)> {
-    engine.reflect(&bank_id, &body.query).await.map(Json).map_err(http_err)
+    engine
+        .reflect(&bank_id, &body.query)
+        .await
+        .map(Json)
+        .map_err(http_err)
 }
 
 #[derive(Serialize)]
@@ -190,7 +196,11 @@ async fn consolidate(
     engine
         .consolidate_once(&bank_id, 50)
         .await
-        .map(|n| Json(ConsolidateResponse { observations_updated: n }))
+        .map(|n| {
+            Json(ConsolidateResponse {
+                observations_updated: n,
+            })
+        })
         .map_err(http_err)
 }
 

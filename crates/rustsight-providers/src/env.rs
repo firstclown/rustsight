@@ -17,7 +17,10 @@ pub struct ProviderEnv {
 }
 
 fn var(name: &str, default: &str) -> String {
-    std::env::var(name).ok().filter(|v| !v.is_empty()).unwrap_or_else(|| default.to_string())
+    std::env::var(name)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| default.to_string())
 }
 
 fn var_opt(name: &str) -> Option<String> {

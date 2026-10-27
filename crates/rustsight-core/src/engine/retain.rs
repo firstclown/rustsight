@@ -1,5 +1,5 @@
-use crate::entity::{combined_score, normalize_name, string_similarity};
 use crate::engine::Engine;
+use crate::entity::{combined_score, normalize_name, string_similarity};
 use crate::prompts::extraction::{build_extraction_prompt, parse_extraction};
 use crate::traits::{ChatMessage, LlmRequest};
 use crate::types::*;
@@ -275,9 +275,7 @@ fn resolve_fuzzy(
                 .count() as f32;
             hits / siblings.len() as f32
         };
-        let t = 1.0 - (((now - c.last_mentioned_ms).abs() as f32)
-            / (90.0 * 86_400_000.0))
-            .min(1.0);
+        let t = 1.0 - (((now - c.last_mentioned_ms).abs() as f32) / (90.0 * 86_400_000.0)).min(1.0);
         let score = combined_score(s, co, t, cfg);
         if best.as_ref().is_none_or(|(bs, _)| score > *bs) {
             best = Some((score, c.clone()));
