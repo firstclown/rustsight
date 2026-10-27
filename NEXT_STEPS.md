@@ -79,16 +79,16 @@ non-blocking trigger after `retain`.
   `Engine::spawn_worker(interval)` rather than baking it into `serve()` only.
 
 ### Definition of done
-- [ ] `Engine::spawn_worker(interval, max_entities)` returns a join handle and
+- [x] `Engine::spawn_worker(interval, max_entities)` returns a join handle and
       loops: sleep → `consolidate_once` for every bank with a non-empty dirty
       queue (needs a `banks_with_dirty` store method or iterate `list_banks`).
-- [ ] `serve` (HTTP) and the MCP server spawn the worker; graceful shutdown on
+- [x] `serve` (HTTP) and the MCP server spawn the worker; graceful shutdown on
       ctrl-c cancels it.
-- [ ] Retain triggers a debounce-flavored immediate wakeup (channel or
+- [x] Retain triggers a debounce-flavored immediate wakeup (channel or
       `tokio::select!` on notify) without blocking its own response.
-- [ ] Test: retain → await worker tick (or notify) → observation exists
+- [x] Test: retain → await worker tick (or notify) → observation exists
       without any explicit consolidate call.
-- [ ] Config: `RUSTSIGHT_CONSOLIDATE_INTERVAL_MS` (default ~5s) documented in
+- [x] Config: `RUSTSIGHT_CONSOLIDATE_INTERVAL_MS` (default ~5s) documented in
       README.
 
 ---

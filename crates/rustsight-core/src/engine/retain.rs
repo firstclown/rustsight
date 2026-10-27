@@ -239,6 +239,9 @@ pub(super) async fn retain(e: &Engine, req: RetainRequest) -> Result<RetainRespo
     if !touched.is_empty() {
         e.store
             .mark_entities_dirty(&bank.id, &touched, "new_facts")?;
+        // Non-blocking wakeup: the background worker (if any) picks the
+        // dirty queue up on its next pass; retain never waits on it.
+        e.wake_worker();
     }
 
     embeddings.clear();

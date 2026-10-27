@@ -4,6 +4,7 @@ use rustsight_providers::{MockEmbed, MockLlm, MockRerank, SimpleTokenEstimator};
 use rustsight_storage::SqliteStore;
 use serde_json::json;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 fn engine() -> Engine {
     let store = SqliteStore::open_in_memory().unwrap();
@@ -133,6 +134,67 @@ async fn consolidation_builds_observation_with_evidence() {
     assert!(!obs[0].evidence.is_empty());
     assert!(obs[0].proof_count >= 1);
     assert!(e.store.list_dirty_entities("c", 10).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn background_worker_consolidates_after_retain_without_explicit_call() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let script = MockLlm::script(vec![
+        facts_resp(&[
+            ("Alice joined Google as an engineer.", "Alice"),
+            ("Alice works on search infrastructure.", "Alice"),
+        ]),
+        LlmResponse {
+            content: Some(
+                r#"{"observations":[{"text":"Summary: Alice works at Google on search infrastructure.","evidence":[{"fact_index":0,"quote":""}]}]}"#
+                    .into(),
+            ),
+            tool_calls: vec![],
+        },
+    ]);
+    let engine = Arc::new(Engine::new(
+        Arc::new(store),
+        Arc::new(script),
+        Arc::new(MockEmbed::default()),
+        Arc::new(MockRerank),
+        Arc::new(SimpleTokenEstimator),
+        Arc::new(FixedClock::new(1_800_000_000_000)),
+    ));
+    // Long interval: only the retain-time wakeup (not the periodic tick) can
+    // consolidate within the deadline, so this proves the notify path.
+    let worker = engine.spawn_worker(Duration::from_secs(3600), 10);
+    retain(
+        &engine,
+        "w",
+        "Alice joined Google as an engineer. Alice works on search infrastructure.",
+    )
+    .await;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let obs = engine.store.observations_for_bank("w").unwrap();
+        if !obs.is_empty() {
+            assert_eq!(obs.len(), 1);
+            assert_eq!(
+                obs[0].text,
+                "Summary: Alice works at Google on search infrastructure."
+            );
+            assert!(!obs[0].evidence.is_empty());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "worker never consolidated after retain"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(engine
+        .store
+        .list_dirty_entities("w", 10)
+        .unwrap()
+        .is_empty());
+    worker.abort();
+    let _ = worker.await;
 }
 
 fn tool_call(id: &str, name: &str, args: serde_json::Value) -> LlmResponse {

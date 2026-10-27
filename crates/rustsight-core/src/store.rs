@@ -51,6 +51,7 @@ pub trait MemoryStore: Send + Sync {
         -> Result<()>;
     fn list_dirty_entities(&self, bank_id: &str, limit: usize) -> Result<Vec<String>>;
     fn clear_dirty_entities(&self, bank_id: &str, entity_ids: &[String]) -> Result<()>;
+    fn banks_with_dirty(&self) -> Result<Vec<String>>;
 
     fn upsert_observation(&self, o: &Observation) -> Result<()>;
     fn observations_for_entity(&self, entity_id: &str) -> Result<Vec<Observation>>;

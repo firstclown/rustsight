@@ -4,6 +4,8 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+use crate::consolidate_interval_from_env;
+
 fn tools_list() -> Value {
     json!({
         "tools": [
@@ -135,6 +137,7 @@ pub async fn run_stdio(
     engine: Arc<Engine>,
     default_bank: Option<String>,
 ) -> rustsight_core::Result<()> {
+    let worker = engine.spawn_worker(consolidate_interval_from_env(), 50);
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin);
     let mut stdout = tokio::io::stdout();
@@ -195,5 +198,10 @@ pub async fn run_stdio(
             .await
             .map_err(|e| rustsight_core::Error::Store(format!("stdout flush: {e}")))?;
     }
+    // stdin closed (parent went away): stop the background worker before
+    // returning. A hard kill is safe too - dirty rows persist and the next
+    // run re-discovers them.
+    worker.abort();
+    let _ = worker.await;
     Ok(())
 }

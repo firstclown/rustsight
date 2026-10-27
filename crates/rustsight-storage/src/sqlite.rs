@@ -867,6 +867,21 @@ impl MemoryStore for SqliteStore {
         Ok(())
     }
 
+    fn banks_with_dirty(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT bank_id FROM dirty_entities ORDER BY bank_id")
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(store_err)?;
+        let mut out = vec![];
+        for r in rows {
+            out.push(r.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
     fn upsert_observation(&self, o: &Observation) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -1249,6 +1264,40 @@ mod tests {
         assert_eq!(hits.len(), 1);
         s.clear_dirty_entities("b", &d).unwrap();
         assert!(s.list_dirty_entities("b", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn banks_with_dirty_lists_distinct_banks() {
+        let s = store();
+        for id in ["a", "b", "c"] {
+            s.ensure_bank(&Bank {
+                id: id.into(),
+                mission: None,
+                directives: None,
+                background: None,
+                disposition: Disposition::default(),
+            })
+            .unwrap();
+        }
+        assert!(s.banks_with_dirty().unwrap().is_empty());
+        for bank in ["a", "a", "b"] {
+            let ent = s
+                .create_entity(&NewEntity {
+                    bank_id: bank.into(),
+                    name: "Alice".into(),
+                    etype: EntityType::Person,
+                })
+                .unwrap();
+            s.mark_entities_dirty(bank, std::slice::from_ref(&ent.id), "new_facts")
+                .unwrap();
+        }
+        assert_eq!(
+            s.banks_with_dirty().unwrap(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        let dirty_a = s.list_dirty_entities("a", 10).unwrap();
+        s.clear_dirty_entities("a", &dirty_a).unwrap();
+        assert_eq!(s.banks_with_dirty().unwrap(), vec!["b".to_string()]);
     }
 
     #[test]

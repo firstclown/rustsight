@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
 
+use crate::consolidate_interval_from_env;
+
 pub fn router(engine: Arc<Engine>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
@@ -29,12 +31,19 @@ pub fn router(engine: Arc<Engine>) -> Router {
 }
 
 pub async fn serve(engine: Arc<Engine>, addr: &str) -> Result<(), Error> {
+    let worker = engine.spawn_worker(consolidate_interval_from_env(), 50);
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| Error::BadInput(format!("bind {addr}: {e}")))?;
     axum::serve(listener, router(engine))
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
         .await
-        .map_err(|e| Error::Store(format!("server: {e}")))
+        .map_err(|e| Error::Store(format!("server: {e}")))?;
+    worker.abort();
+    let _ = worker.await;
+    Ok(())
 }
 
 fn http_err(e: Error) -> (StatusCode, String) {

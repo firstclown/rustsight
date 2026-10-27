@@ -52,6 +52,18 @@ Configuration (non-mock mode)
     RUSTSIGHT_RERANK_URL      optional; any /rerank endpoint (Jina/Cohere style)
     RUSTSIGHT_DB              default ~/.rustsight/rustsight.db
 
+Background consolidation
+------------------------
+`rustsight serve` and `rustsight mcp` spawn a worker that consolidates dirty
+entities automatically: it wakes on a timer (default 5s, set
+RUSTSIGHT_CONSOLIDATE_INTERVAL_MS) or immediately when a retain lands
+(debounced so bursts coalesce into one pass), then runs consolidation for
+every bank with pending work. Retain/recall responses never wait on it, and a
+crash mid-pass is safe - dirty rows persist and are re-discovered on the next
+tick. Library embedders get the same behavior via
+`Engine::spawn_worker(interval, max_entities)` (returns a tokio JoinHandle;
+abort it to stop).
+
 Offline demo (no API key)
 -------------------------
     rustsight --mock --db /tmp/demo.db retain --bank demo \
