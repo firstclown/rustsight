@@ -107,7 +107,7 @@ fn default_db() -> PathBuf {
     }
 }
 
-fn build_engine(db: &PathBuf, mock: bool) -> Arc<Engine> {
+async fn build_engine(db: &PathBuf, mock: bool) -> Arc<Engine> {
     let store = SqliteStore::open(db).unwrap_or_else(|e| {
         eprintln!("failed to open database {}: {e}", db.display());
         std::process::exit(1);
@@ -115,14 +115,23 @@ fn build_engine(db: &PathBuf, mock: bool) -> Arc<Engine> {
     let (llm, embed, rerank) = if mock {
         build_mock_providers()
     } else {
-        let env = ProviderEnv::from_env();
+        let env = match ProviderEnv::from_env() {
+            Ok(env) => env,
+            Err(msg) => {
+                eprintln!("configuration error: {msg}");
+                std::process::exit(1);
+            }
+        };
         if env.llm_api_key.is_empty() {
             eprintln!(
                 "no API key configured: set RUSTSIGHT_LLM_API_KEY (or use --mock for an offline demo)"
             );
             std::process::exit(1);
         }
-        build_providers(&env)
+        build_providers(&env).await.unwrap_or_else(|msg| {
+            eprintln!("provider setup failed: {msg}");
+            std::process::exit(1);
+        })
     };
     Arc::new(Engine::new(
         Arc::new(store),
@@ -145,7 +154,7 @@ fn print_json<T: serde::Serialize>(value: &T) {
 async fn main() {
     let cli = Cli::parse();
     let db = cli.db.clone().unwrap_or_else(default_db);
-    let engine = build_engine(&db, cli.mock);
+    let engine = build_engine(&db, cli.mock).await;
     let result: Result<(), rustsight_core::Error> = match cli.cmd {
         Cmd::Serve { addr } => {
             eprintln!(

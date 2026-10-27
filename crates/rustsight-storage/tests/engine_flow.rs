@@ -1,7 +1,8 @@
+use async_trait::async_trait;
 use rustsight_core::Engine;
 use rustsight_core::*;
 use rustsight_providers::{
-    FlakyEmbed, FlakyLlm, MockEmbed, MockLlm, MockRerank, SimpleTokenEstimator,
+    FlakyEmbed, FlakyLlm, MockEmbed, MockLlm, MockRerank, NoopRerank, SimpleTokenEstimator,
 };
 use rustsight_storage::SqliteStore;
 use serde_json::json;
@@ -705,4 +706,125 @@ async fn retain_reasks_at_half_size_on_parse_failure() {
     let bought = id("bought a house");
     let because = id("because prices fell");
     assert_causal_edge(&e, "rh", &because, &bought);
+}
+
+// --- RS-4: reranking -------------------------------------------------------
+
+/// Fixture reranker with a known relevance ground truth: docs mentioning
+/// "hiking" score highest, then "gear" docs, then everything else. Used to
+/// prove the recall pipeline orders results by reranker score rather than
+/// raw RRF order.
+struct FixtureRerank;
+
+#[async_trait]
+impl RerankProvider for FixtureRerank {
+    async fn rerank(
+        &self,
+        _query: &str,
+        docs: &[String],
+        top_k: usize,
+    ) -> Result<Vec<(usize, f32)>> {
+        let score = |d: &str| {
+            if d.contains("hiking") {
+                5.0
+            } else if d.contains("gear") {
+                3.0
+            } else {
+                0.5
+            }
+        };
+        let mut ranked: Vec<(usize, f32)> = docs
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (i, score(d)))
+            .collect();
+        ranked.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        ranked.truncate(top_k);
+        Ok(ranked)
+    }
+}
+
+const RERANK_FIXTURE: &str = "Alice said her favorite outdoor activity is a closely kept secret. \
+     Alice and Bob bought outdoor gear for their favorite trails. \
+     Alice loves hiking in the mountains. \
+     The committee meeting was postponed until Friday. \
+     Fireflies lit up the garden at dusk.";
+
+fn rerank_fixture_engine(rerank: Arc<dyn RerankProvider>) -> Engine {
+    Engine::new(
+        Arc::new(SqliteStore::open_in_memory().unwrap()),
+        Arc::new(MockLlm::demo()),
+        Arc::new(MockEmbed::default()),
+        rerank,
+        Arc::new(SimpleTokenEstimator),
+        Arc::new(FixedClock::new(1_800_000_000_000)),
+    )
+}
+
+async fn recall_fixture(e: &Engine) -> Vec<MemoryRef> {
+    retain(e, "rr", RERANK_FIXTURE).await;
+    e.recall(RecallRequest {
+        bank_id: "rr".into(),
+        query: "What is Alice's favorite outdoor activity?".into(),
+        token_budget: 1000,
+        top_k_per_arm: 10,
+        kinds: None,
+    })
+    .await
+    .unwrap()
+    .memories
+}
+
+/// With a real (scoring) reranker, the doc the reranker judges most relevant
+/// comes first even though RRF ranked distractors above it, and rerank
+/// scores propagate to the response.
+#[tokio::test]
+async fn reranked_recall_puts_relevant_doc_first() {
+    let e = rerank_fixture_engine(Arc::new(FixtureRerank));
+    let memories = recall_fixture(&e).await;
+    assert!(memories.len() >= 3, "{memories:?}");
+    assert!(
+        memories[0].text.contains("hiking"),
+        "top memory was: {:?}",
+        memories[0]
+    );
+    assert!(
+        memories[0].score > memories[1].score,
+        "rerank scores must order the response: {memories:?}"
+    );
+    assert!((memories[0].score - 5.0).abs() < 1e-6, "{memories:?}");
+    // known relevance order: hiking doc, then the gear doc, then the rest
+    let pos = |needle: &str| {
+        memories
+            .iter()
+            .position(|m| m.text.contains(needle))
+            .unwrap_or_else(|| panic!("doc {needle} missing: {memories:?}"))
+    };
+    assert!(pos("hiking") < pos("gear"), "{memories:?}");
+    assert!(pos("gear") < pos("postponed"), "{memories:?}");
+    assert!(pos("gear") < pos("Fireflies"), "{memories:?}");
+}
+
+/// The control: NoopRerank keeps raw RRF order, in which keyword-sharing
+/// distractors outrank the actually relevant doc — exactly the accuracy gap
+/// RS-4's cross-encoder reranking closes.
+#[tokio::test]
+async fn noop_rerank_leaves_raw_rrf_order() {
+    let e = rerank_fixture_engine(Arc::new(NoopRerank));
+    let memories = recall_fixture(&e).await;
+    assert!(memories.len() >= 3, "{memories:?}");
+    assert!(
+        !memories[0].text.contains("hiking"),
+        "NoopRerank must preserve RRF order, but hiking doc won: {:?}",
+        memories[0]
+    );
+    // the relevant doc is still retrieved, just not first
+    assert!(
+        memories.iter().any(|m| m.text.contains("hiking")),
+        "{memories:?}"
+    );
 }

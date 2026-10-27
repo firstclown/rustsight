@@ -158,16 +158,41 @@ real (non-mock) deployments.
   (`search/decision_reranker.py`) — out of scope here, note for later.
 
 ### Definition of done
-- [ ] `rustsight-providers` feature `onnx-rerank` implementing `OrtRerank`
+- [x] `rustsight-providers` feature `onnx-rerank` implementing `OrtRerank`
       with batching, model download/cache, env config
       (`RUSTSIGHT_RERANK=local`).
-- [ ] Default provider selection: real API key + no rerank config → warn
+- [x] Default provider selection: real API key + no rerank config → warn
       loudly or default to API rerank if key/URL present; document the
       accuracy implication.
-- [ ] Fixture test: given 5 docs with known relevance order, reranked recall
+- [x] Fixture test: given 5 docs with known relevance order, reranked recall
       puts the relevant doc first (NoopRerank does not).
-- [ ] Latency note in README: p50/p95 added to recall at 100 docs.
-- [ ] Mock mode untouched (MockRerank stays for offline demo/tests).
+- [x] Latency note in README: p50/p95 added to recall at 100 docs.
+- [x] Mock mode untouched (MockRerank stays for offline demo/tests).
+
+Done Oct 2026, plus a CUDA extension beyond the original ticket
+(`onnx-rerank-cuda` feature, `RUSTSIGHT_RERANK_DEVICE`). Facts for later
+tickets:
+
+- Default model repos are device-paired: CPU → `rafa754/bge-reranker-v2-m3`
+  int8 (`onnx/model_quantized.onnx`, ~544 MB, ~3x faster on CPU than the
+  onnx-community int8 export); CUDA →
+  `onnx-community/bge-reranker-v2-m3-ONNX` fp16 (`onnx/model_fp16.onnx`,
+  ~1.1 GB, the only fp16 export found). Measured on a 16-core laptop CPU +
+  RTX 3050 Ti: CPU int8 p50 1.78s / CUDA fp16 p50 0.29s at 50 docs.
+- **int8-on-CUDA trap**: int8 exports use `MatMulInteger`, which has no CUDA
+  kernels — ORT runs those ops on CPU with device copies and the result is
+  *slower* than pure CPU (2.8s vs 1.8s at 50 docs). Never register the CUDA
+  EP for the int8 file; `cuda_paired_repo(_file)` in
+  `rustsight-providers/src/onnx.rs` enforces the pairing.
+- ONNX Runtime **silently** falls back to CPU when CUDA provider libs are
+  missing (registration never errors), so `auto` probes the stack by
+  dlopen (driver + `libcudart.so.13`/`libcublas{,Lt}.so.13`/
+  `libcurand.so.10`) before promising CUDA.
+- fp32 exports keep weights in an external `model.onnx_data` blob; the
+  resolver downloads it alongside when present (HEAD probe).
+- Upstream's "decision-model reranker" with pruning (`search/
+  decision_reranker.py`) remains out of scope; if built, it layers on the
+  same `RerankProvider` seam.
 
 ---
 

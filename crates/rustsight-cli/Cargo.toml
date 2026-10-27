@@ -9,6 +9,13 @@ description = "rustsight command line: serve, mcp, retain/recall/reflect, inspec
 name = "rustsight"
 path = "src/main.rs"
 
+[features]
+# Passthrough so release binaries can opt into the local ONNX reranker:
+# cargo build --release -p rustsight-cli --features onnx-rerank
+onnx-rerank = ["rustsight-providers/onnx-rerank"]
+# CUDA-enabled ONNX reranker (NVIDIA driver + CUDA 13 + cuDNN 9 at runtime).
+onnx-rerank-cuda = ["rustsight-providers/onnx-rerank-cuda"]
+
 [dependencies]
 rustsight-core = { workspace = true }
 rustsight-storage = { workspace = true }

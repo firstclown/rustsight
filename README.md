@@ -49,8 +49,76 @@ Configuration (non-mock mode)
     RUSTSIGHT_LLM_MODEL       default gpt-4o-mini
     RUSTSIGHT_EMBED_BASE_URL  defaults to RUSTSIGHT_LLM_BASE_URL
     RUSTSIGHT_EMBED_MODEL     default text-embedding-3-small
+    RUSTSIGHT_RERANK          local | api | off | auto (default auto; see below)
     RUSTSIGHT_RERANK_URL      optional; any /rerank endpoint (Jina/Cohere style)
+    RUSTSIGHT_RERANK_MODEL_PATH  pre-placed ONNX model (file or dir); skips download
+    RUSTSIGHT_RERANK_DEVICE   auto | cpu | cuda (default auto)
     RUSTSIGHT_DB              default ~/.rustsight/rustsight.db
+
+Reranking (accuracy-critical)
+-----------------------------
+Recall fuses four retrieval arms with RRF and then reranks with a
+cross-encoder — the paper attributes a significant share of its benchmark
+lead to that reranking step. With no reranker configured, real (non-mock)
+runs print a loud warning and fall back to raw RRF ordering; set
+`RUSTSIGHT_RERANK=off` to silence the warning and accept the accuracy hit.
+
+Three reranker backends:
+
+- `local` (default choice when nothing else is set): an in-process
+  bge-reranker-v2-m3 cross-encoder via the `ort` ONNX runtime. Requires a
+  binary built with the opt-in feature (it adds ~50-100 MB of runtime):
+
+      cargo build --release -p rustsight-cli --features onnx-rerank          # CPU
+      cargo build --release -p rustsight-cli --features onnx-rerank-cuda    # + NVIDIA GPU
+
+  The model is downloaded from HuggingFace on first use into
+  `~/.rustsight/models/` and cached; `RUSTSIGHT_RERANK_MODEL_PATH` points at
+  a pre-placed model for offline hosts. Query/doc pairs are scored in
+  batches (`RUSTSIGHT_RERANK_BATCH`, default 16; 16-64 is the sweet spot),
+  truncated at `RUSTSIGHT_RERANK_MAX_LEN` tokens (default 512). Recall caps
+  rerank input at min(50, refs) candidates.
+- `api`: `RUSTSIGHT_RERANK_URL` (+ optional `RUSTSIGHT_RERANK_API_KEY`,
+  `RUSTSIGHT_RERANK_MODEL`) pointing at a Jina/Cohere-style `/rerank`
+  endpoint.
+- mock mode keeps `MockRerank` (identity) — fully offline, unchanged.
+
+### GPU (CUDA) acceleration
+
+`RUSTSIGHT_RERANK_DEVICE=cuda` (or `auto`, the default, when the CUDA stack
+is present) runs the reranker on the GPU. Two things to know:
+
+- int8-quantized models have no CUDA kernels for their `MatMulInteger` ops,
+  so the CUDA path automatically uses the fp16 export instead (tensor
+  cores); CPU runs use the int8 export, which is ~3x faster than fp16 on
+  CPU. The device and the default model file are paired automatically;
+  explicit `RUSTSIGHT_RERANK_MODEL_REPO`/`_FILE` settings always win.
+- ONNX Runtime silently falls back to CPU when CUDA libraries are missing,
+  so rustsight probes the stack itself (driver + CUDA 13 runtime libs:
+  `libcudart.so.13`, `libcublas.so.13`, `libcublasLt.so.13`,
+  `libcurand.so.10`) before promising CUDA. `auto` degrades to CPU
+  quietly; `cuda` fails with an error naming what is missing.
+
+  The CUDA 13 runtime libs can come from a system CUDA toolkit install or
+  from NVIDIA's redistributable archives on `LD_LIBRARY_PATH`; the NVIDIA
+  driver must already be installed. Roughly 1.5 GB of extra VRAM is used.
+
+### Latency added to recall
+
+Measured with `cargo run -p rustsight-providers --features onnx-rerank
+--example rerank_latency` (bge-reranker-v2-m3, batch 16, ~60-token docs, 20
+rounds; desktop with 16-core laptop CPU and RTX 3050 Ti 4 GB — expect
+faster numbers on real desktop GPUs):
+
+    config            50 docs (recall cap)      100 docs
+    CPU int8          p50 1.78s   p95 2.33s     p50 3.41s   p95 3.92s
+    CUDA fp16         p50 0.29s   p95 0.30s     p50 0.59s   p95 0.59s
+
+Reranking is the dominant cost in recall at full candidate sets; the
+pipeline itself (four retrieval arms + fusion) stays in the milliseconds.
+Note the int8-on-CUDA trap: registering CUDA for the int8 model runs its
+quantized ops on CPU with device copies in between — measured *slower* than
+pure CPU, which is why device and model file are paired.
 
 Background consolidation
 ------------------------
@@ -103,7 +171,6 @@ MCP (stdio)
 Roadmap
 -------
 - vendor upstream prompt sets behind a sync script (pinned tags)
-- local ONNX cross-encoder reranker (bge-reranker-v2-m3)
 - sqlite-vec / HNSW ANN backend
 - LongMemEval-S evaluation harness
 - knowledge-page fs mount
