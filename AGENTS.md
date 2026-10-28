@@ -161,6 +161,9 @@ Env vars, read in `crates/rustsight-providers/src/env.rs`:
 - `RUSTSIGHT_DB` (default `~/.rustsight/rustsight.db`)
 - `RUSTSIGHT_CONSOLIDATE_INTERVAL_MS` (default 5000; worker cadence, invalid
   values fall back to default with a warning)
+- `RUSTSIGHT_API_TOKEN` / `RUSTSIGHT_API_TOKEN_FILE` (optional; bearer-token
+  auth for the HTTP API — without one, `serve` refuses non-loopback binds
+  unless `--allow-unauth`. MCP stdio needs no auth.)
 
 ## Conventions
 

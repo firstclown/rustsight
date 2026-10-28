@@ -11,3 +11,8 @@ axum = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+rustsight-providers = { workspace = true }
+rustsight-storage = { workspace = true }
+tower = { workspace = true }

@@ -4,7 +4,7 @@ use rustsight_core::{Engine, SystemClock};
 use rustsight_providers::{
     build_mock_providers, build_providers, ProviderEnv, SimpleTokenEstimator,
 };
-use rustsight_server::{http, mcp};
+use rustsight_server::{auth::ApiAuth, http, mcp};
 use rustsight_storage::SqliteStore;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -31,6 +31,10 @@ enum Cmd {
     Serve {
         #[arg(long, default_value = "127.0.0.1:8888")]
         addr: String,
+        /// Serve on non-loopback interfaces without an API token
+        /// (RUSTSIGHT_API_TOKEN / RUSTSIGHT_API_TOKEN_FILE).
+        #[arg(long)]
+        allow_unauth: bool,
     },
     Mcp {
         #[arg(long)]
@@ -156,12 +160,17 @@ async fn main() {
     let db = cli.db.clone().unwrap_or_else(default_db);
     let engine = build_engine(&db, cli.mock).await;
     let result: Result<(), rustsight_core::Error> = match cli.cmd {
-        Cmd::Serve { addr } => {
+        Cmd::Serve { addr, allow_unauth } => {
+            let auth = ApiAuth::from_env();
+            let auth_note = match &auth {
+                ApiAuth::Token(_) => " (bearer-token auth on)",
+                ApiAuth::None => " (no auth; loopback only)",
+            };
             eprintln!(
-                "rustsight listening on http://{addr} (db: {})",
+                "rustsight listening on http://{addr} (db: {}){auth_note}",
                 db.display()
             );
-            http::serve(engine, &addr).await
+            http::serve(engine, &addr, auth, allow_unauth).await
         }
         Cmd::Mcp { bank } => mcp::run_stdio(engine, bank).await,
         Cmd::Retain {

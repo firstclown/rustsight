@@ -1641,9 +1641,12 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "rustsight-core",
+ "rustsight-providers",
+ "rustsight-storage",
  "serde",
  "serde_json",
  "tokio",
+ "tower",
 ]
 
 [[package]]

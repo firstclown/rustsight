@@ -54,6 +54,19 @@ Configuration (non-mock mode)
     RUSTSIGHT_RERANK_MODEL_PATH  pre-placed ONNX model (file or dir); skips download
     RUSTSIGHT_RERANK_DEVICE   auto | cpu | cuda (default auto)
     RUSTSIGHT_DB              default ~/.rustsight/rustsight.db
+    RUSTSIGHT_API_TOKEN       optional; bearer token required by every HTTP
+                              endpoint except /healthz (see below)
+    RUSTSIGHT_API_TOKEN_FILE  optional; read the token from a file instead
+
+HTTP API authentication
+------------------------
+Set `RUSTSIGHT_API_TOKEN` (or point `RUSTSIGHT_API_TOKEN_FILE` at a file
+containing it) and every HTTP request must carry
+`Authorization: Bearer <token>`; `/healthz` stays public for liveness
+probes. Without a token the server only serves loopback addresses:
+binding a non-loopback `--addr` without auth is refused unless you pass
+`--allow-unauth` deliberately. The MCP stdio server needs no token — the
+parent process controls the pipe, so it is not exposed.
 
 Reranking (accuracy-critical)
 -----------------------------
