@@ -41,6 +41,8 @@ ort = { version = "=2.0.0-rc.15", default-features = false, features = [
 tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
 # dlopen probe for the CUDA runtime stack (onnx-rerank-cuda only)
 libloading = "0.8"
+# Snapshot tests for the upstream prompt parity suite (RS-5)
+insta = { version = "1", features = ["filters"] }
 
 [profile.release]
 lto = "thin"

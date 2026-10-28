@@ -1,0 +1,7 @@
+# Pin for the vendored upstream prompt sources under prompts/upstream/<tag>/.
+# Consumed by scripts/prompt-sync; keep tag, commit hash, and date in sync.
+tag=v1.1.0
+commit=a5a619b5ca59c5c39e0f96be6f7a31fabd136bd5
+released=2026-10-21
+repo=https://github.com/vectorize-io/hindsight
+submodule=hindsight-api-slim/hindsight_api

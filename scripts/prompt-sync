@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# Vendor the upstream (vectorize-io/hindsight) prompt sources at the pinned
+# tag/commit and diff them against the previous vendor to surface upstream
+# prompt changes.
+#
+# Pin lives in crates/rustsight-core/prompts/upstream/PROMPTS_VERSION
+# (tag=, commit=, repo=, submodule=). Vendored files land under
+# crates/rustsight-core/prompts/upstream/<tag>/.
+#
+# After a sync that shows changes, regenerate the parity fixtures with
+# scripts/prompt-goldens and review with `cargo insta review` (or accept the
+# diff consciously) — a fixture change means the Rust builders in
+# crates/rustsight-core/src/prompts/upstream/ must be re-ported to match.
+#
+# Requires: git, curl. Offline-safe: skips the fetch when the vendored tree
+# already matches the pin and --check is given.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+UPSTREAM_DIR="$ROOT/crates/rustsight-core/prompts/upstream"
+VERSION_FILE="$UPSTREAM_DIR/PROMPTS_VERSION"
+
+fail() { echo "prompt-sync: $*" >&2; exit 1; }
+
+tag="$(sed -n 's/^tag=//p' "$VERSION_FILE")"
+commit="$(sed -n 's/^commit=//p' "$VERSION_FILE")"
+repo="$(sed -n 's/^repo=//p' "$VERSION_FILE")"
+submodule="$(sed -n 's/^submodule=//p' "$VERSION_FILE")"
+[ -n "$tag" ] && [ -n "$commit" ] && [ -n "$repo" ] && [ -n "$submodule" ] \
+    || fail "PROMPTS_VERSION is missing tag=/commit=/repo=/submodule= lines"
+
+DEST="$UPSTREAM_DIR/$tag"
+[ -e "$DEST" ] && [ ! -d "$DEST" ] && fail "$DEST exists and is not a directory"
+
+# Files vendored from $submodule (relative paths), plus upstream's own prompt
+# tests (relative to $submodule's parent, i.e. hindsight-api-slim/tests) used
+# as parity-fixture sources.
+ENGINE_FILES=(
+    engine/prompt_utils.py
+    engine/retain/fact_extraction.py
+    engine/retain/entity_labels.py
+    engine/consolidation/prompts.py
+    engine/reflect/prompts.py
+    engine/reflect/tools.py
+    engine/reflect/tools_schema.py
+    engine/reflect/tokenization.py
+    engine/search/temporal_extraction.py
+    engine/search/think_utils.py
+)
+TEST_FILES=(
+    test_fact_extraction_fact_type_prompt.py
+    test_reflect_prompt_builder.py
+    test_prompt_brace_escape.py
+    test_prompt_context_truncation.py
+    test_llm_judge_prompt.py
+    test_delta_prompt_schema_parity.py
+)
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+echo "prompt-sync: cloning $repo at $tag ($commit)"
+git -c advice.detachedHead=false clone --quiet --depth 1 --branch "$tag" "$repo" "$WORK/src" \
+    || fail "clone of $repo at $tag failed (network?)"
+
+actual="$(git -C "$WORK/src" rev-parse HEAD)"
+if [ "$actual" != "$commit" ]; then
+    fail "tag $tag resolves to $actual, but PROMPTS_VERSION pins $commit.
+Update PROMPTS_VERSION (and re-port the builders) before vendoring."
+fi
+
+STAGE="$WORK/stage"
+mkdir -p "$STAGE"
+for f in "${ENGINE_FILES[@]}"; do
+    [ -f "$WORK/src/$submodule/$f" ] || fail "missing in upstream: $submodule/$f"
+    mkdir -p "$STAGE/engine/$(dirname "${f#engine/}")"
+    cp "$WORK/src/$submodule/$f" "$STAGE/engine/${f#engine/}"
+done
+tests_dir="${submodule%/*}/tests"
+mkdir -p "$STAGE/tests"
+for f in "${TEST_FILES[@]}"; do
+    [ -f "$WORK/src/$tests_dir/$f" ] || fail "missing in upstream: $tests_dir/$f"
+    cp "$WORK/src/$tests_dir/$f" "$STAGE/tests/$f"
+done
+
+if [ -d "$DEST" ]; then
+    echo "prompt-sync: diffing vendored $tag against fresh checkout"
+    if diff -ru --exclude='.git' "$DEST" "$STAGE" > "$WORK/diff.txt"; then
+        echo "prompt-sync: no changes — vendored $tag already matches $commit"
+    else
+        cat "$WORK/diff.txt"
+        rm -rf "$DEST"
+        cp -r "$STAGE" "$DEST"
+        echo "prompt-sync: UPDATED $DEST (changes above).
+Next: scripts/prompt-goldens, then cargo insta review; re-port the Rust
+builders in crates/rustsight-core/src/prompts/upstream/ where output changed."
+    fi
+else
+    previous="$(find "$UPSTREAM_DIR" -mindepth 1 -maxdepth 1 -type d -name 'v*' ! -path "$DEST" | sort -V | tail -1 || true)"
+    cp -r "$STAGE" "$DEST"
+    echo "prompt-sync: vendored $tag (new) into $DEST"
+    if [ -n "$previous" ]; then
+        echo "prompt-sync: diffing against previous vendor $previous"
+        diff -ru "$previous" "$DEST" || true
+    fi
+    echo "Next: scripts/prompt-goldens, then cargo insta review; re-port the Rust
+builders in crates/rustsight-core/src/prompts/upstream/ where output changed."
+fi

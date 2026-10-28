@@ -15,11 +15,19 @@ for a desktop harness. From-scratch Rust reimplementation of the architecture in
 ```bash
 cargo build                              # debug build (workspace)
 cargo build --release                    # release build (thin LTO); binary at target/release/rustsight
-cargo test                               # all 63 tests; fully offline, mock providers, no API key needed
+cargo test                               # all 85 tests; fully offline, mock providers, no API key needed
 cargo test -p rustsight-storage --test engine_flow   # just the end-to-end integration suite
+cargo test -p rustsight-core --test upstream_prompt_parity   # upstream prompt parity suite (35 cases)
 cargo fmt --check                        # formatting check (must pass; no rustfmt.toml, defaults only)
 cargo fmt                                # auto-fix formatting
 cargo clippy --workspace --all-targets -- -D warnings # lints (must pass with zero warnings)
+```
+
+Prompt vendor tooling (RS-5):
+
+```bash
+scripts/prompt-sync      # re-vendor upstream prompt sources at the pinned tag; diffs vs previous vendor
+scripts/prompt-goldens   # regenerate src/prompts/upstream/texts.rs + parity fixtures (python3 + pydantic)
 ```
 
 Run the CLI from source:
@@ -91,7 +99,11 @@ Key source map:
 - `crates/rustsight-core/src/traits.rs` — `LlmProvider`, `EmbedProvider`,
   `RerankProvider`, `TokenEstimator`, `Clock` (+ `SystemClock`/`FixedClock`).
 - `crates/rustsight-core/src/prompts/` — extraction/consolidation/reflect prompt
-  builders (currently informed rewrites; RS-5 will vendor upstream's).
+  builders. Extraction prompts are the vendored upstream ones (RS-5, pinned
+  tag `v1.1.0`): `src/prompts/upstream/` holds the byte-parity ports and
+  `crates/rustsight-core/prompts/upstream/` the vendored sources + pin +
+  DIVERGENCES.md. Consolidation/reflect prompts are still informed rewrites
+  until their response machines are ported (see DIVERGENCES.md).
 - `crates/rustsight-storage/src/sqlite.rs` — schema + all queries (~1.3k lines;
   schema inline at top).
 - `crates/rustsight-cli/src/main.rs` — `build_engine` is the three-line

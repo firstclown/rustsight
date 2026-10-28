@@ -155,6 +155,32 @@ Offline demo (no API key)
     rustsight --mock --db /tmp/demo.db recall --bank demo --query "Where does Alice work?"
     rustsight --mock --db /tmp/demo.db reflect --bank demo --query "What should I know about Alice?"
 
+Upstream prompts, sync, and parity tests
+----------------------------------------
+The retain extraction prompts rustsight sends are the upstream Hindsight
+production prompts, vendored at a pinned release (`v1.1.0`, commit
+`a5a619b5`) under `crates/rustsight-core/prompts/upstream/<tag>/` and ported
+byte-for-byte into `crates/rustsight-core/src/prompts/upstream/`
+(`crates/rustsight-core/prompts/upstream/PROMPTS_VERSION` records the pin).
+
+Two scripts manage them:
+
+    scripts/prompt-sync      # re-vendor the pinned upstream files and diff
+                             # against the previous vendor to surface changes
+    scripts/prompt-goldens   # regenerate texts.rs + golden fixtures by
+                             # running the vendored upstream builders
+                             # (needs python3 + pydantic; no network)
+
+The parity suite (`cargo test -p rustsight-core --test
+upstream_prompt_parity`) asserts the Rust builders produce output
+byte-identical to fixtures generated from the upstream Python itself — 35
+cases covering extraction (default/verbose/custom/labels/language modes and
+the chunk user message), consolidation (system/mission/input), and reflect
+(the full tools-prompt branch matrix plus final system/user prompts).
+Divergences — where the engine intentionally differs (JSON-mode output
+envelope, lenient parsing, unadopted consolidation/reflect prompts) — are
+recorded in `crates/rustsight-core/prompts/upstream/DIVERGENCES.md`.
+
 Serve
 -----
     rustsight serve --addr 127.0.0.1:8888
@@ -170,7 +196,8 @@ MCP (stdio)
 
 Roadmap
 -------
-- vendor upstream prompt sets behind a sync script (pinned tags)
 - sqlite-vec / HNSW ANN backend
 - LongMemEval-S evaluation harness
 - knowledge-page fs mount
+- adopt upstream consolidation + reflect prompts end-to-end (see
+  prompts/upstream/DIVERGENCES.md)

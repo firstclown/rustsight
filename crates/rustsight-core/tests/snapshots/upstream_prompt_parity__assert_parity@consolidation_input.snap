@@ -1,0 +1,21 @@
+---
+source: crates/rustsight-core/tests/upstream_prompt_parity.rs
+expression: output
+---
+## MISSION
+
+{"dedup": true}
+
+## CAPACITY CONSTRAINT
+
+Use shape {limit, used}
+
+## INPUT
+
+### New facts
+
+<facts>
+
+### Existing observations
+
+<observations>{"id": "o1"}</observations>

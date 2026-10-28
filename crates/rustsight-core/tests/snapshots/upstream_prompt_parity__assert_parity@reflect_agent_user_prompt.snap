@@ -1,0 +1,10 @@
+---
+source: crates/rustsight-core/tests/upstream_prompt_parity.rs
+expression: output
+---
+Who owns billing?
+
+## Bank mission (it governs what you search and how you answer)
+Chat decisions outrank commits.
+
+IMPORTANT: Respond exclusively in Spanish. Translate any source content into Spanish. All output text — including fact text, observations, entity names, and the final response — must be in Spanish.

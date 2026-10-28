@@ -16,3 +16,21 @@ Its prompt wording and pipeline structure are informed by the open-source
 reference implementation at https://github.com/vectorize-io/hindsight
 (MIT License, Copyright (c) 2025 Vectorize AI, Inc.), which this project is a
 from-scratch Rust reimplementation of, not a derivative code port.
+
+Vendored upstream sources
+-------------------------
+Prompt source files from the upstream reference are vendored verbatim under
+`crates/rustsight-core/prompts/upstream/<tag>/` (pinned tag `v1.1.0`, commit
+`a5a619b5ca59c5c39e0f96be6f7a31fabd136bd5`, released 2026-10-21) so the Rust
+prompt builders in `crates/rustsight-core/src/prompts/upstream/` can be held to
+byte-for-byte parity. Vendored files (retain/fact_extraction.py,
+retain/entity_labels.py, consolidation/prompts.py, reflect/prompts.py +
+tools.py + tools_schema.py + tokenization.py, search/temporal_extraction.py +
+think_utils.py, engine/prompt_utils.py, and upstream's prompt tests) retain
+their upstream content, including copyright notice, and are MIT
+Licensed, Copyright (c) 2025 Vectorize AI, Inc. See
+`crates/rustsight-core/prompts/upstream/PROMPTS_VERSION` for the pin and
+`scripts/prompt-sync` for re-vendoring. The Rust builders are a translation of
+those files' prompt-building logic; see
+`crates/rustsight-core/prompts/upstream/DIVERGENCES.md` for intentional
+differences.

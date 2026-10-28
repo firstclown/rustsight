@@ -1,0 +1,472 @@
+#!/usr/bin/env python3
+"""Regenerate the upstream prompt parity fixtures.
+
+Assembles a stub package around the VENDORED upstream sources
+(crates/rustsight-core/prompts/upstream/<tag>/engine/...), runs the real
+upstream prompt builders, and writes their output byte-for-byte to:
+
+  crates/rustsight-core/tests/fixtures/upstream_prompts/<case>.txt
+
+The Rust parity suite (crates/rustsight-core/tests/upstream_prompt_parity.rs)
+asserts the ported builders produce identical output. Run this after
+scripts/prompt-sync whenever the vendored prompt sources change, then review
+with `INSTA_FORCE_UPDATE=1 cargo test -p rustsight-core` / `cargo insta review`
+to refresh the .snap files once the .txt comparison passes.
+
+Volatile inputs are frozen the same way upstream's own tests freeze them
+(tests/test_reflect_prompt_builder.py monkeypatches _current_utc_datetime to
+"2026-08-09 14:32 UTC").
+
+Requires python3 with pydantic (pip install pydantic). No network access.
+"""
+import shutil
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+from types import SimpleNamespace
+
+ROOT = Path(__file__).resolve().parent.parent
+VERSION_FILE = ROOT / "crates/rustsight-core/prompts/upstream/PROMPTS_VERSION"
+FIXTURES = ROOT / "crates/rustsight-core/tests/fixtures/upstream_prompts"
+
+FROZEN_NOW = "2026-08-09 14:32 UTC"  # matches upstream test_reflect_prompt_builder.py
+
+# --- stub modules so the vendored builders import without the full service ---
+STUBS = {
+    "hindsight_api/__init__.py": "",
+    "hindsight_api/config.py": (
+        "def get_config():\n"
+        "    raise RuntimeError('stub: config not available in golden harness')\n"
+    ),
+    "hindsight_api/engine/__init__.py": "",
+    "hindsight_api/engine/token_encoding.py": (
+        "def count_tokens(text):\n"
+        "    return max(1, len(text) // 4)\n"
+    ),
+    "hindsight_api/engine/metadata_utils.py": (
+        "def as_string_metadata(md):\n"
+        "    if md is None:\n"
+        "        return {}\n"
+        "    return {k: str(v) for k, v in md.items() if v is not None}\n"
+    ),
+    "hindsight_api/engine/response_models.py": (
+        "from pydantic import BaseModel\n\n\n"
+        "class DispositionTraits(BaseModel):\n"
+        "    skepticism: int = 3\n"
+        "    literalism: int = 3\n"
+        "    empathy: int = 3\n\n\n"
+        "class TokenUsage(BaseModel):\n"
+        "    input_tokens: int = 0\n"
+        "    output_tokens: int = 0\n\n\n"
+        "class MemoryFact(BaseModel):\n"
+        "    id: str = ''\n"
+        "    text: str = ''\n"
+        "    fact_type: str = 'world'\n"
+        "    context: str | None = None\n"
+        "    source_fact_ids: list = []\n"
+    ),
+    "hindsight_api/engine/llm_interface.py": (
+        "class PromptCachePrefix: ...\n"
+        "class ProviderAuthError(Exception): ...\n"
+        "class ProviderContentPolicyError(Exception): ...\n"
+        "class ProviderRateLimitResetError(Exception): ...\n"
+    ),
+    "hindsight_api/engine/llm_wrapper.py": (
+        "class AnyLLMProvider: ...\n"
+        "class OutputTooLongError(Exception): ...\n"
+        "def parse_llm_json(*a, **k): raise RuntimeError('stub')\n"
+        "def sanitize_llm_output(x): return x\n"
+        "def sanitize_value(x): return x\n"
+    ),
+    "hindsight_api/engine/operation_metadata.py": "class RetainExtractionErrors: ...\n",
+    "hindsight_api/engine/remote_retry.py": "def status_code_of(e): return None\n",
+    "hindsight_api/engine/stored_dates.py": "def is_placeholder_date(s): return False\n",
+    "hindsight_api/engine/structured_output.py": (
+        "def provider_json_schema(m): return {}\n"
+        "def strict_json_schema(s): return s\n"
+    ),
+    "hindsight_api/engine/retain/__init__.py": "",
+    "hindsight_api/engine/retain/attachment_content.py": (
+        "# Stub: rustsight has no attachments; the placeholder scanner is inert here.\n"
+        "import re\n"
+        "_PLACEHOLDER_RE = re.compile(r'⟦hs-att:[0-9a-f]+⟧')\n"
+        "def iter_placeholder_ids(text):\n"
+        "    return _PLACEHOLDER_RE.findall(text or '')\n"
+    ),
+    "hindsight_api/engine/retain/orchestrator.py": (
+        "from datetime import timezone\n"
+        "def parse_datetime_flexible(dt):\n"
+        "    if dt.tzinfo is None:\n"
+        "        return dt.replace(tzinfo=timezone.utc)\n"
+        "    return dt.astimezone(timezone.utc)\n"
+    ),
+    # Minimal stand-ins for retain/types.py: only the names fact_extraction
+    # imports at module level; used solely in paths the builders never touch.
+    "hindsight_api/engine/retain/types.py": (
+        "from dataclasses import dataclass, field\n"
+        "from datetime import datetime\n"
+        "from pydantic import BaseModel, Field\n\n\n"
+        "class CausalRelation(BaseModel):\n"
+        "    target_fact_index: int = Field(description='Index of the related fact in the facts array (0-based).')\n"
+        "    relation_type: str = Field(default='caused_by')\n\n\n"
+        "@dataclass\n"
+        "class ChunkMetadata:\n"
+        "    text: str = ''\n"
+        "    index: int = 0\n\n\n"
+        "@dataclass\n"
+        "class ExtractionResult:\n"
+        "    facts: list = field(default_factory=list)\n\n\n"
+        "@dataclass\n"
+        "class RetainContent:\n"
+        "    text: str | None = None\n"
+        "    timestamp: datetime | None = None\n\n\n"
+        "@dataclass\n"
+        "class ExtractedFact:\n"
+        "    fact: str = ''\n"
+        "    fact_type: str = 'world'\n"
+        "    occurred_start: str | None = None\n"
+        "    occurred_end: str | None = None\n"
+        "    where: str | None = None\n"
+        "    entities: list = field(default_factory=list)\n"
+        "    causal_relations: list = field(default_factory=list)\n"
+        "    mentioned_at: datetime | None = None\n"
+    ),
+    "hindsight_api/engine/consolidation/__init__.py": "",
+    "hindsight_api/engine/reflect/__init__.py": "",
+    "hindsight_api/engine/search/__init__.py": "",
+}
+
+
+def build_harness(vendored: Path) -> Path:
+    """Assemble an importable hindsight_api package from vendored + stubs."""
+    work = Path(tempfile.mkdtemp(prefix="prompt-goldens-"))
+    pkg = work / "hindsight_api"
+    for rel, content in STUBS.items():
+        target = work / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+    copies = {
+        "engine/prompt_utils.py": pkg / "engine/prompt_utils.py",
+        "engine/retain/fact_extraction.py": pkg / "engine/retain/fact_extraction.py",
+        "engine/retain/entity_labels.py": pkg / "engine/retain/entity_labels.py",
+        "engine/consolidation/prompts.py": pkg / "engine/consolidation/prompts.py",
+        "engine/reflect/prompts.py": pkg / "engine/reflect/prompts.py",
+        "engine/reflect/tokenization.py": pkg / "engine/reflect/tokenization.py",
+        "engine/search/think_utils.py": pkg / "engine/search/think_utils.py",
+    }
+    for src, dst in copies.items():
+        shutil.copyfile(vendored / src, dst)
+    return work
+
+
+def rust_raw(s: str) -> str:
+    """Render s as a Rust raw string literal, using as many #s as needed."""
+    n = 1
+    while ('"' + "#" * n) in s:
+        n += 1
+    hashes = "#" * n
+    return f'r{hashes}"{s}"{hashes}'
+
+
+def write_texts_rs(tag: str):
+    """Regenerate src/prompts/upstream/texts.rs from the vendored constants.
+
+    Runs the real upstream modules (already imported by generate_cases) and
+    dumps each text block the Rust builders compose from, so no prompt text
+    is hand-transcribed.
+    """
+    from hindsight_api.engine.consolidation import prompts as cp
+    from hindsight_api.engine.retain import fact_extraction as fe
+    from hindsight_api.engine.reflect import prompts as rp
+
+    consts = [
+        ("EXTRACTION_DEFAULT_LANGUAGE_RULE", "retain", fe._DEFAULT_LANGUAGE_RULE),
+        ("EXTRACTION_CONCISE_TEMPLATE", "retain", fe.CONCISE_FACT_EXTRACTION_PROMPT),
+        ("EXTRACTION_CUSTOM_TEMPLATE", "retain", fe.CUSTOM_FACT_EXTRACTION_PROMPT),
+        ("EXTRACTION_VERBOSE_TEMPLATE", "retain", fe.VERBOSE_FACT_EXTRACTION_PROMPT),
+        ("EXTRACTION_VERBATIM_TEMPLATE", "retain", fe.VERBATIM_FACT_EXTRACTION_PROMPT),
+        ("EXTRACTION_CAUSAL_SECTION", "retain", fe.CAUSAL_RELATIONSHIPS_SECTION),
+        ("EXTRACTION_OPTIONAL_DIMENSIONS_SECTION", "retain", fe.OPTIONAL_DIMENSIONS_SECTION),
+        ("CONSOLIDATION_DEFAULT_MISSION", "consolidation", cp._DEFAULT_MISSION),
+        ("CONSOLIDATION_MISSION_PRIORITY_NOTE", "consolidation", cp._MISSION_PRIORITY_NOTE),
+        ("CONSOLIDATION_DEFAULT_LANGUAGE_RULE", "consolidation", cp._DEFAULT_LANGUAGE_RULE),
+        ("CONSOLIDATION_PROCESSING_RULES", "consolidation", cp._PROCESSING_RULES),
+        ("CONSOLIDATION_INPUT_FORMAT_NOTE", "consolidation", cp._INPUT_FORMAT_NOTE),
+        ("CONSOLIDATION_SPLIT_INPUT_SECTION", "consolidation", cp._SPLIT_INPUT_SECTION),
+        ("CONSOLIDATION_DECISION_GUIDE", "consolidation", cp._DECISION_GUIDE),
+        ("CONSOLIDATION_OUTPUT_SECTION", "consolidation", cp._OUTPUT_SECTION.format()),
+        ("REFLECT_TOOLS_LANGUAGE_RULE", "reflect", rp._TOOLS_LANGUAGE_RULE),
+        ("REFLECT_GROUNDING_BOUNDARY", "reflect", rp._GROUNDING_BOUNDARY),
+        ("REFLECT_NO_IDS_IN_TEXT_RULE", "reflect", rp.NO_IDS_IN_TEXT_RULE),
+        ("REFLECT_FINAL_INSTRUCTIONS", "reflect", rp._FINAL_INSTRUCTIONS),
+        ("REFLECT_FINAL_SYSTEM_BASE", "reflect", rp._FINAL_SYSTEM_PROMPT_BASE),
+        ("REFLECT_FINAL_LANGUAGE_RULE", "reflect", rp._FINAL_LANGUAGE_RULE),
+        ("REFLECT_DEFAULT_ROLE", "reflect", rp._DEFAULT_ROLE),
+        ("REFLECT_DEFAULT_FINAL_ROLE", "reflect", rp._DEFAULT_FINAL_ROLE),
+    ]
+    out = ROOT / "crates/rustsight-core/src/prompts/upstream/texts.rs"
+    with out.open("w", encoding="utf-8") as f:
+        f.write("//! Upstream prompt text constants, generated verbatim from the\n")
+        f.write(f"//! vendored Python sources at prompts/upstream/{tag}/engine/ by\n")
+        f.write("//! scripts/prompt-goldens. Do not edit by hand; regenerate instead.\n")
+        f.write("//! MIT Licensed upstream, Copyright 2025 Vectorize AI, Inc.\n")
+        f.write("//!\n")
+        f.write("//! Some constants feed builders not yet ported; they stay so the file\n")
+        f.write("//! matches the full upstream constant set.\n")
+        f.write("#![allow(dead_code)]\n\n")
+        for name, group, value in consts:
+            assert isinstance(value, str), (name, type(value))
+            f.write(f"/// Upstream `{group}` prompt text block.\n")
+            f.write(f"pub const {name}: &str = {rust_raw(value)};\n\n")
+    print(f"wrote {out.relative_to(ROOT)} ({len(consts)} constants)")
+
+
+def label_groups():
+    """Raw entity-labels config shared verbatim with the Rust parity test.
+
+    Passed RAW (list of dicts), exactly as a real bank config carries it —
+    the builder runs parse_entity_labels on config.entity_labels itself, and
+    that helper only accepts dict | list | None (an already-parsed
+    EntityLabelsConfig would parse to None and drop the section).
+    """
+    return [
+        {
+            "key": "pedagogy",
+            "description": "Teaching approach the fact demonstrates",
+            "type": "value",
+            "values": [
+                {"value": "scaffolding", "description": "Support scaled to the learner"},
+                {"value": "modeling", "description": ""},
+            ],
+        },
+        {
+            "key": "interest",
+            "description": "Engagement signals",
+            "type": "multi-values",
+            "values": [{"value": "active", "description": ""}, {"value": "passive", "description": ""}],
+        },
+        {
+            "key": "notes",
+            "description": "Free-text teaching notes",
+            "type": "text",
+        },
+        {
+            "key": "people",
+            "description": "Structured entities",
+            "type": "map",
+            "fields": {
+                "student": {"type": "text", "description": "Student name"},
+                "grade": {
+                    "type": "value",
+                    "description": "Grade level",
+                    "values": [{"value": "freshman", "description": ""}],
+                },
+                "guardian": {
+                    "type": "map",
+                    "description": "Guardian details",
+                    "fields": {
+                        "name": {"type": "text", "description": ""},
+                        "relation": {
+                            "type": "value",
+                            "description": "",
+                            "values": [{"value": "parent", "description": ""}],
+                        },
+                    },
+                },
+            },
+        },
+    ]
+
+
+def extraction_cfg(**overrides):
+    base = dict(
+        entity_labels=None,
+        entities_allow_free_form=True,
+        retain_extraction_mode="concise",
+        retain_extract_causal_links=False,
+        retain_mission=None,
+        retain_custom_instructions=None,
+        llm_output_language=None,
+        llm_supports_string_pattern=False,
+        retain_optional_fact_dimensions=False,
+    )
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def generate_cases():
+    """(case name, upstream builder output) for every parity shape."""
+    from hindsight_api.engine.consolidation import prompts as cp
+    from hindsight_api.engine.retain import fact_extraction as fe
+    from hindsight_api.engine.reflect import prompts as rp
+
+    # Freeze the volatile clock exactly like upstream's own test does.
+    rp._current_utc_datetime = lambda: FROZEN_NOW
+
+    bank = {"name": "TestBank", "mission": ""}
+    cases = {}
+
+    # --- extraction system prompts ---
+    cases["extraction_default"] = fe._build_extraction_prompt_and_schema(extraction_cfg()).system_prompt
+    cases["extraction_causal"] = fe._build_extraction_prompt_and_schema(
+        extraction_cfg(retain_extract_causal_links=True)
+    ).system_prompt
+    cases["extraction_verbose"] = fe._build_extraction_prompt_and_schema(
+        extraction_cfg(retain_extraction_mode="verbose")
+    ).system_prompt
+    cases["extraction_custom"] = fe._build_extraction_prompt_and_schema(
+        extraction_cfg(
+            retain_extraction_mode="custom",
+            retain_custom_instructions="Output as {key: value} pairs. Prefer technical detail.",
+        )
+    ).system_prompt
+    cases["extraction_custom_no_instructions"] = fe._build_extraction_prompt_and_schema(
+        extraction_cfg(retain_extraction_mode="custom")
+    ).system_prompt
+    cases["extraction_language"] = fe._build_extraction_prompt_and_schema(
+        extraction_cfg(llm_output_language="Spanish")
+    ).system_prompt
+    labels = label_groups()
+    cases["extraction_labels"] = fe._build_extraction_prompt_and_schema(
+        extraction_cfg(entity_labels=labels)
+    ).system_prompt
+    cases["extraction_labels_only"] = fe._build_extraction_prompt_and_schema(
+        extraction_cfg(entity_labels=labels, entities_allow_free_form=False)
+    ).system_prompt
+    cases["extraction_optional_dimensions"] = fe._build_extraction_prompt_and_schema(
+        extraction_cfg(retain_optional_fact_dimensions=True)
+    ).system_prompt
+
+    # --- extraction user message (chunk prompt parts) ---
+    parts = fe.build_chunk_prompt_parts(
+        extraction_cfg(retain_mission='{"focus": "compliance"}'),
+        chunk="Alice joined Google. She works on search infrastructure.",
+        chunk_index=1,
+        total_chunks=3,
+        event_date=datetime(2026, 10, 27, tzinfo=timezone.utc),
+        context="career conversation",
+        metadata={"source": "transcript", "room": "hallway"},
+        agent_name="Rustsight",
+    )
+    cases["extraction_user_message"] = parts.user_message
+    cases["extraction_user_message_plain"] = fe.build_chunk_prompt_parts(
+        extraction_cfg(), chunk="Hello there."
+    ).user_message
+
+    # --- consolidation ---
+    cases["consolidation_system_default"] = cp.build_consolidation_system_prompt(None)
+    cases["consolidation_system_language"] = cp.build_consolidation_system_prompt("Spanish")
+    cases["consolidation_mission_default"] = cp.build_mission_section(None)
+    cases["consolidation_mission_custom"] = cp.build_mission_section('{"dedup": true}')
+    cases["consolidation_input"] = cp.build_consolidation_input(
+        facts_text="<facts>",
+        observations_text='<observations>{"id": "o1"}</observations>',
+        observations_mission='{"dedup": true}',
+        observation_capacity_note="Use shape {limit, used}",
+    )
+
+    # --- reflect tools system prompt (full branch matrix) ---
+    combos = {
+        "mm_and_obs": dict(has_mental_models=True, include_observations=True),
+        "mm_only": dict(has_mental_models=True, include_observations=False),
+        "obs_only": dict(has_mental_models=False, include_observations=True),
+        "recall_only": dict(has_mental_models=False, include_observations=False),
+    }
+    for name, flags in combos.items():
+        cases[f"reflect_tools_{name}"] = rp.build_system_prompt_for_tools(bank, **flags)
+    for budget in ("low", "mid", "high"):
+        cases[f"reflect_tools_budget_{budget}"] = rp.build_system_prompt_for_tools(
+            bank, has_mental_models=False, include_observations=False, budget=budget
+        )
+    cases["reflect_tools_mission"] = rp.build_system_prompt_for_tools(
+        {"name": "TestBank", "mission": "Track customer feedback"},
+        has_mental_models=False,
+        include_observations=False,
+    )
+    cases["reflect_tools_directives"] = rp.build_system_prompt_for_tools(
+        bank,
+        has_mental_models=False,
+        include_observations=False,
+        directives=[{"name": "No Competitors", "content": "Never mention competitor names."}],
+    )
+    cases["reflect_tools_disposition"] = rp.build_system_prompt_for_tools(
+        {"name": "TestBank", "mission": "", "disposition": {"skepticism": 5}},
+        has_mental_models=False,
+        include_observations=False,
+    )
+    cases["reflect_tools_disposition_neutral"] = rp.build_system_prompt_for_tools(
+        {
+            "name": "TestBank",
+            "mission": "",
+            "disposition": {"skepticism": 3, "literalism": 2, "empathy": 4},
+        },
+        has_mental_models=False,
+        include_observations=False,
+    )
+    cases["reflect_tools_context"] = rp.build_system_prompt_for_tools(
+        bank, has_mental_models=False, include_observations=False, context="Focus on Q3 metrics."
+    )
+    cases["reflect_tools_language"] = rp.build_system_prompt_for_tools(
+        bank, has_mental_models=False, include_observations=True, llm_output_language="Spanish"
+    )
+    cases["reflect_tools_answer_ready"] = rp.build_system_prompt_for_tools(
+        bank, has_mental_models=True, include_observations=True, answer_ready=True
+    )
+    cases["reflect_tools_answer_as_document"] = rp.build_system_prompt_for_tools(
+        bank, has_mental_models=False, include_observations=False, answer_as_document=True
+    )
+
+    # --- reflect final system prompt + user prompt ---
+    cases["reflect_final_default"] = rp.build_final_system_prompt()
+    cases["reflect_final_mission"] = rp.build_final_system_prompt(mission="Track {entity} changes")
+    cases["reflect_final_language_directives"] = rp.build_final_system_prompt(
+        llm_output_language="Spanish",
+        directives=[
+            {
+                "name": "Language Policy",
+                "content": "ALWAYS respond in French language. Never respond in English.",
+            }
+        ],
+    )
+    cases["reflect_agent_user_prompt"] = rp.build_agent_user_prompt(
+        "Who owns billing?", llm_output_language="Spanish", mission="  Chat decisions outrank commits.  "
+    )
+    return cases
+
+
+def main() -> int:
+    tag = None
+    for line in VERSION_FILE.read_text().splitlines():
+        if line.startswith("tag="):
+            tag = line.split("=", 1)[1].strip()
+    if not tag:
+        print("prompt-goldens: no tag= in PROMPTS_VERSION", file=sys.stderr)
+        return 1
+    vendored = ROOT / "crates/rustsight-core/prompts/upstream" / tag
+    if not vendored.is_dir():
+        print(f"prompt-goldens: vendored dir missing: {vendored}", file=sys.stderr)
+        return 1
+
+    harness = build_harness(vendored)
+    sys.path.insert(0, str(harness))
+    try:
+        cases = generate_cases()
+        write_texts_rs(tag)
+    finally:
+        shutil.rmtree(harness, ignore_errors=True)
+
+    FIXTURES.mkdir(parents=True, exist_ok=True)
+    for name, output in sorted(cases.items()):
+        path = FIXTURES / f"{name}.txt"
+        header = (
+            f"# golden: upstream {tag} builder output for case '{name}'\n"
+            f"# generated by scripts/prompt-goldens — do not edit by hand\n"
+        )
+        path.write_text(header + output, encoding="utf-8")
+        print(f"wrote {path.relative_to(ROOT)} ({len(output)} bytes)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,10 +1,11 @@
 use crate::engine::chunks::{merge_chunk_facts, split_chunks, split_half, OVERLAP_DEDUP_THRESHOLD};
 use crate::engine::{with_retry, Engine};
 use crate::entity::{combined_score, normalize_name, string_similarity};
-use crate::prompts::extraction::{build_extraction_prompt, parse_extraction};
+use crate::prompts::extraction::{build_extraction_messages, parse_extraction_with_reference};
 use crate::traits::{ChatMessage, LlmRequest};
 use crate::types::*;
 use crate::{cosine, temporal_weight, Error, Result};
+use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -34,9 +35,25 @@ pub(super) async fn retain(e: &Engine, req: RetainRequest) -> Result<RetainRespo
         e.config.chunk_overlap_tokens,
         e.tokens.as_ref(),
     );
-    let mut per_chunk: Vec<Vec<ExtractedFact>> = Vec::with_capacity(chunks.len());
-    for chunk in &chunks {
-        per_chunk.push(extract_chunk(e, chunk, req.context.as_deref(), now).await?);
+    let event_date = DateTime::from_timestamp_millis(now).map(|dt| dt.with_timezone(&Utc));
+    let total_chunks = chunks.len();
+    let bank_mission = bank.mission.as_deref();
+    let mut per_chunk: Vec<Vec<ExtractedFact>> = Vec::with_capacity(total_chunks);
+    for (idx, chunk) in chunks.iter().enumerate() {
+        per_chunk.push(
+            extract_chunk(
+                e,
+                ChunkExtract {
+                    content: chunk,
+                    chunk_index: idx,
+                    total_chunks,
+                    context: req.context.as_deref(),
+                    event_date,
+                    bank_mission,
+                },
+            )
+            .await?,
+        );
     }
     let facts = merge_chunk_facts(per_chunk, OVERLAP_DEDUP_THRESHOLD);
     if facts.is_empty() {
@@ -251,30 +268,42 @@ pub(super) async fn retain(e: &Engine, req: RetainRequest) -> Result<RetainRespo
     })
 }
 
+/// Everything one extraction call needs, bundled so the recursive re-ask
+/// path can pass it through unchanged.
+struct ChunkExtract<'a> {
+    content: &'a str,
+    chunk_index: usize,
+    total_chunks: usize,
+    context: Option<&'a str>,
+    event_date: Option<DateTime<Utc>>,
+    bank_mission: Option<&'a str>,
+}
+
 /// Extract facts from one retain chunk, retrying transient provider failures.
 /// If the extraction output fails to parse (e.g. JSON truncated by an output
 /// token limit), the chunk is re-asked once at half size — upstream's
 /// auto-split — before the error surfaces.
-async fn extract_chunk(
-    e: &Engine,
-    content: &str,
-    context: Option<&str>,
-    now: i64,
-) -> Result<Vec<ExtractedFact>> {
-    extract_chunk_at(e, content, context, now, 0).await
+async fn extract_chunk(e: &Engine, args: ChunkExtract<'_>) -> Result<Vec<ExtractedFact>> {
+    extract_chunk_at(e, args, 0).await
 }
 
 /// Boxed because it recurses once (re-ask at half size); the depth cap keeps
 /// the recursion at one level.
 fn extract_chunk_at<'a>(
     e: &'a Engine,
-    content: &'a str,
-    context: Option<&'a str>,
-    now: i64,
+    args: ChunkExtract<'a>,
     depth: usize,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<ExtractedFact>>> + Send + 'a>> {
     Box::pin(async move {
-        let (system, user) = build_extraction_prompt(&e.config.extract, content, context, now);
+        let (system, user) = build_extraction_messages(
+            &e.config.extract,
+            args.bank_mission,
+            args.content,
+            args.chunk_index,
+            args.total_chunks,
+            args.event_date,
+            args.context,
+        );
         let llm = Arc::clone(&e.llm);
         let request = LlmRequest {
             system: Some(system),
@@ -284,15 +313,32 @@ fn extract_chunk_at<'a>(
             ..Default::default()
         };
         let resp = with_retry(e, || llm.complete(&request)).await?;
-        match parse_extraction(&resp.content.unwrap_or_default()) {
+        match parse_extraction_with_reference(&resp.content.unwrap_or_default(), args.event_date) {
             Ok(facts) => Ok(facts),
             Err(err) => {
                 if depth == 0 {
-                    if let Some((head, tail)) = split_half(content, e.tokens.as_ref()) {
-                        let first = extract_chunk_at(e, &head, context, now, depth + 1).await?;
+                    if let Some((head, tail)) = split_half(args.content, e.tokens.as_ref()) {
+                        let first = extract_chunk_at(
+                            e,
+                            ChunkExtract {
+                                content: &head,
+                                ..args
+                            },
+                            depth + 1,
+                        )
+                        .await?;
                         let offset = first.len();
                         let mut merged = first;
-                        for mut fact in extract_chunk_at(e, &tail, context, now, depth + 1).await? {
+                        for mut fact in extract_chunk_at(
+                            e,
+                            ChunkExtract {
+                                content: &tail,
+                                ..args
+                            },
+                            depth + 1,
+                        )
+                        .await?
+                        {
                             for c in &mut fact.causal {
                                 c.fact_index += offset;
                             }

@@ -231,19 +231,43 @@ rendering parity with fixtures derived from upstream's own prompt tests.
   equivalent.
 
 ### Definition of done
-- [ ] `scripts/prompt-sync` (bash) fetches the four upstream files at a pinned
+- [x] `scripts/prompt-sync` (bash) fetches the four upstream files at a pinned
       tag/commit, writes them under
       `crates/rustsight-core/prompts/upstream/<tag>/`, and diffs against the
       previous vendor to surface upstream prompt changes.
-- [ ] `PROMPTS_VERSION` file records tag + commit hash; NOTICE updated.
-- [ ] Rust builders ported so that, given identical config inputs, output
+- [x] `PROMPTS_VERSION` file records tag + commit hash; NOTICE updated.
+- [x] Rust builders ported so that, given identical config inputs, output
       matches the ported upstream fixtures byte-for-byte (`insta` snapshot
       tests, at least: extraction default + labels + custom-instruction +
       language-directive shapes; consolidation standard/custom; reflect
       system with/without mission).
-- [ ] Deliberate divergences (e.g., our reflect tool names) listed in
+- [x] Deliberate divergences (e.g., our reflect tool names) listed in
       `prompts/upstream/DIVERGENCES.md`.
-- [ ] `cargo test` runs the parity suite; sync script documented in README.
+- [x] `cargo test` runs the parity suite; sync script documented in README.
+
+Done Oct 2026. Facts for later tickets:
+
+- Parity oracle is upstream's own Python: `scripts/prompt-goldens` assembles
+  a stub harness around the vendored files, runs the real builders, and
+  writes `tests/fixtures/upstream_prompts/*.txt` + regenerates
+  `src/prompts/upstream/texts.rs` (all big prompt text comes from this
+  generator — nothing hand-transcribed). 35 cases incl. the full reflect
+  tools-prompt branch matrix; volatile clock frozen to
+  `2026-08-09 14:32 UTC` exactly like upstream's own test.
+- Tests assert BOTH `assert_eq` against the fixture and an insta snapshot
+  (`.snap` bodies are upstream bytes, proven equal at generation time).
+  After a sync+goldens round, refresh snapshots deliberately:
+  `INSTA_FORCE_UPDATE=1 cargo test -p rustsight-core`, then review.
+- Escape semantics to remember when porting more builders: values
+  substituted into a `.format()` template keep their braces **doubled**
+  (extraction custom instructions, `build_final_system_prompt` mission);
+  text embedded **into** a template that is then formatted as a whole comes
+  out single (consolidation mission/capacity). Both pinned by fixtures.
+- Production retain now sends the upstream prompts; the parser accepts both
+  upstream and legacy response shapes (see `parse_extraction`), so scripted
+  tests and older providers keep working. Consolidation/reflect pipelines
+  keep their own prompts until their response machines are ported — see
+  `prompts/upstream/DIVERGENCES.md` for exactly what adopting requires.
 
 ---
 
