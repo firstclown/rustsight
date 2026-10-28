@@ -9,7 +9,11 @@
 //! Model acquisition:
 //! - by default the model and tokenizer are downloaded from HuggingFace on
 //!   first use into the models cache (`~/.rustsight/models/` unless
-//!   `RUSTSIGHT_MODELS_DIR` is set);
+//!   `RUSTSIGHT_MODELS_DIR` is set). A cache directory is only used after a
+//!   `.complete` marker (written once every file has landed) confirms the
+//!   download finished, so a cached model starts with zero network round
+//!   trips — offline hosts work. `RUSTSIGHT_RERANK_MODEL_SHA256` optionally
+//!   pins the model file's hash; a mismatching download is refused;
 //! - `RUSTSIGHT_RERANK_MODEL_PATH` points at a pre-placed `.onnx` file (or a
 //!   directory containing `model.onnx` + `tokenizer.json`) for offline hosts;
 //!   no download is attempted then.
@@ -25,8 +29,10 @@ use crate::env::{RerankDevice, DEFAULT_RERANK_REPO_CUDA, DEFAULT_RERANK_REPO_FIL
 use async_trait::async_trait;
 use rustsight_core::traits::RerankProvider;
 use rustsight_core::{Error, Result};
+use sha2::{Digest, Sha256};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokenizers::{Tokenizer, TruncationParams, TruncationStrategy};
@@ -41,6 +47,10 @@ pub struct OrtRerankSpec {
     pub repo: String,
     /// Model file within `repo`.
     pub repo_file: String,
+    /// Optional sha256 pin (hex) for the downloaded model file, from
+    /// `RUSTSIGHT_RERANK_MODEL_SHA256`. When set, the download is hashed
+    /// while streaming and refused on mismatch.
+    pub model_sha256: Option<String>,
     /// Download cache root; defaults to `~/.rustsight/models`.
     pub cache_dir: Option<PathBuf>,
     /// Query/doc pairs scored per ONNX session run (16-64 recommended).
@@ -61,6 +71,7 @@ impl OrtRerankSpec {
             local_path: env.rerank_model_path.clone().map(PathBuf::from),
             repo: env.rerank_model_repo.clone(),
             repo_file: env.rerank_model_file.clone(),
+            model_sha256: env.rerank_model_sha256.clone(),
             cache_dir: env.rerank_models_dir.clone().map(PathBuf::from),
             batch_size: env.rerank_batch_size,
             max_len: env.rerank_max_len,
@@ -75,6 +86,7 @@ impl Default for OrtRerankSpec {
             local_path: None,
             repo: crate::env::DEFAULT_RERANK_REPO.to_string(),
             repo_file: crate::env::DEFAULT_RERANK_REPO_FILE.to_string(),
+            model_sha256: None,
             cache_dir: None,
             batch_size: 16,
             max_len: 512,
@@ -460,6 +472,42 @@ pub(crate) fn padded_batch(rows: &[&[u32]], len: usize, pad_id: u32) -> (Vec<i64
     (ids, mask)
 }
 
+/// Marker file stamped into a model cache dir after every file of the model
+/// has landed. Its content records whether the external-data blob was part
+/// of the download ([`MARKER_DATA`]) or the model is self-contained
+/// ([`MARKER_OK`]).
+const CACHE_MARKER: &str = ".complete";
+const MARKER_OK: &str = "ok";
+const MARKER_DATA: &str = "ok-data";
+
+fn marker_content(external_data: bool) -> &'static str {
+    if external_data {
+        MARKER_DATA
+    } else {
+        MARKER_OK
+    }
+}
+
+/// Whether the marker says the cached model needs its `model.onnx_data`
+/// sibling. An absent or unreadable marker makes no claim.
+fn marker_requires_data(marker: &Path) -> bool {
+    std::fs::read_to_string(marker)
+        .map(|c| c.trim() == MARKER_DATA)
+        .unwrap_or(false)
+}
+
+/// Whether the download cache in `dir` is complete and usable without any
+/// network access: a marker stamped by a finished download plus the files
+/// that download wrote — including the external-data blob when the marker
+/// says the model needs one (catches, say, a user deleting the large
+/// sibling to reclaim space).
+fn cache_complete(dir: &Path, needs_data: bool) -> bool {
+    dir.join(CACHE_MARKER).is_file()
+        && dir.join("model.onnx").is_file()
+        && dir.join("tokenizer.json").is_file()
+        && (!needs_data || dir.join("model.onnx_data").is_file())
+}
+
 async fn resolve_model_files(
     spec: &OrtRerankSpec,
 ) -> std::result::Result<(PathBuf, PathBuf), String> {
@@ -503,22 +551,71 @@ async fn resolve_model_files(
     let model = dir.join("model.onnx");
     let tokenizer = dir.join("tokenizer.json");
     let data = dir.join("model.onnx_data");
+    let marker = dir.join(CACHE_MARKER);
     // fp32 exports keep their weights in a sibling `<repo_file>_data` blob
     // referenced by the bare name `model.onnx_data`; quantized exports are
     // self-contained. Probe for the sibling so both work.
     let data_repo_file = format!("{}_data", spec.repo_file);
+
+    // Cache check first, before any network: the `.complete` marker is
+    // stamped only after every file of a model landed, so a marked cache is
+    // usable as-is — a cached model must start on an offline host.
+    if cache_complete(&dir, marker_requires_data(&marker)) {
+        return Ok((model, tokenizer));
+    }
+
     let token = hf_token();
-    let external_data = hf_file_exists(&spec.repo, &data_repo_file, token.as_deref()).await?;
+    let external_data = match hf_file_exists(&spec.repo, &data_repo_file, token.as_deref()).await {
+        Ok(exists) => exists,
+        Err(err) => {
+            // Unmarked-but-full cache (written by an older rustsight) on an
+            // unreachable host: use it rather than failing startup. If the
+            // model does reference a data blob that is missing, session
+            // creation surfaces that error instead of a network one.
+            if model.is_file() && tokenizer.is_file() {
+                eprintln!(
+                    "rustsight: cannot reach HuggingFace to verify the model cache ({err}); \
+                     using the unmarked cache at {}",
+                    dir.display()
+                );
+                return Ok((model, tokenizer));
+            }
+            return Err(err);
+        }
+    };
     if model.is_file() && tokenizer.is_file() && (!external_data || data.is_file()) {
+        // Complete cache from before markers existed: stamp it so the next
+        // boot skips the probe. Best-effort — an unwritable marker only
+        // costs one HEAD request next time.
+        let _ = std::fs::write(&marker, marker_content(external_data));
         return Ok((model, tokenizer));
     }
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("failed to create models cache {}: {e}", dir.display()))?;
-    download_hf_file(&spec.repo, "tokenizer.json", &tokenizer, token.as_deref()).await?;
-    download_hf_file(&spec.repo, &spec.repo_file, &model, token.as_deref()).await?;
+    download_hf_file(
+        &spec.repo,
+        "tokenizer.json",
+        &tokenizer,
+        token.as_deref(),
+        None,
+    )
+    .await?;
+    download_hf_file(
+        &spec.repo,
+        &spec.repo_file,
+        &model,
+        token.as_deref(),
+        spec.model_sha256.as_deref(),
+    )
+    .await?;
     if external_data {
-        download_hf_file(&spec.repo, &data_repo_file, &data, token.as_deref()).await?;
+        download_hf_file(&spec.repo, &data_repo_file, &data, token.as_deref(), None).await?;
     }
+    // Stamp the marker last: a download that crashed or failed midway
+    // leaves no marker, so the next boot treats the cache as a miss and
+    // retries (the individual files are skipped if they did land).
+    std::fs::write(&marker, marker_content(external_data))
+        .map_err(|e| format!("cannot write {}: {e}", marker.display()))?;
     Ok((model, tokenizer))
 }
 
@@ -566,14 +663,49 @@ fn default_models_dir() -> std::result::Result<PathBuf, String> {
     Ok(PathBuf::from(home).join(".rustsight").join("models"))
 }
 
-/// Stream `file` from HuggingFace `repo` into `dest` (via a `.part` temp
-/// file, renamed into place on success so a partial download never shadows a
-/// good model).
+/// Sequence counter making `.part` temp names unique within a process;
+/// combined with the pid, paths are unique across concurrent rustsight
+/// processes sharing a cache dir.
+static PART_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Unique temp path for one download attempt (`model.onnx` →
+/// `model.<pid>.<seq>.part`). Concurrent downloads must never share a temp
+/// path: one process could otherwise rename the other's half-written file
+/// into the cache as if it were complete.
+fn part_path(dest: &Path) -> PathBuf {
+    let seq = PART_SEQ.fetch_add(1, Ordering::Relaxed);
+    dest.with_extension(format!("{}.{}.part", std::process::id(), seq))
+}
+
+/// After streaming, check the byte count against `Content-Length` when the
+/// server advertised one (`total == 0` means it did not). A short read means
+/// the transfer died without `chunk()` surfacing an error; catching it here
+/// keeps a truncated file from being renamed into the cache as complete.
+fn verify_sizes(done: u64, total: u64) -> std::result::Result<(), String> {
+    if total > 0 && done != total {
+        Err(format!(
+            "truncated download: received {done} of {total} advertised bytes"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Stream `file` from HuggingFace `repo` into `dest` via a unique `.part`
+/// temp file, renamed into place only after the full body passed size and
+/// (optionally) sha256 verification, so a partial or corrupted download
+/// never shadows a good model. `expected_sha256` is the optional hex pin
+/// for the model file (`RUSTSIGHT_RERANK_MODEL_SHA256`).
 async fn download_hf_file(
     repo: &str,
     file: &str,
     dest: &Path,
     hf_token: Option<&str>,
+    expected_sha256: Option<&str>,
 ) -> std::result::Result<(), String> {
     if dest.is_file() {
         return Ok(());
@@ -596,10 +728,34 @@ async fn download_hf_file(
         return Err(format!("download failed for {url}: HTTP {}", resp.status()));
     }
     let total = resp.content_length().unwrap_or(0);
-    let tmp = dest.with_extension("part");
+    let tmp = part_path(dest);
+    if let Err(err) = stream_to_file(&mut resp, &url, &tmp, total, expected_sha256).await {
+        // Never leave a partial `.part` behind; a retry starts a fresh temp
+        // path anyway.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    std::fs::rename(&tmp, dest).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("rename {} -> {} failed: {e}", tmp.display(), dest.display())
+    })
+}
+
+/// Stream `resp` into `tmp`, verifying the advertised byte count and the
+/// optional sha256 pin before the caller renames the file into place. The
+/// hash is computed incrementally while streaming so a pinned file is never
+/// re-read from disk.
+async fn stream_to_file(
+    resp: &mut reqwest::Response,
+    url: &str,
+    tmp: &Path,
+    total: u64,
+    expected_sha256: Option<&str>,
+) -> std::result::Result<(), String> {
     let mut out = std::io::BufWriter::new(
-        std::fs::File::create(&tmp).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?,
+        std::fs::File::create(tmp).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?,
     );
+    let mut hasher = expected_sha256.map(|_| Sha256::new());
     let mut done: u64 = 0;
     let mut next_progress: u64 = 64 * 1024 * 1024;
     while let Some(chunk) = resp
@@ -609,6 +765,9 @@ async fn download_hf_file(
     {
         out.write_all(&chunk)
             .map_err(|e| format!("write to {} failed: {e}", tmp.display()))?;
+        if let Some(h) = hasher.as_mut() {
+            h.update(&chunk);
+        }
         done += chunk.len() as u64;
         if done >= next_progress {
             let progress = if total > 0 {
@@ -623,14 +782,106 @@ async fn download_hf_file(
     out.flush()
         .map_err(|e| format!("write to {} failed: {e}", tmp.display()))?;
     drop(out);
-    std::fs::rename(&tmp, dest)
-        .map_err(|e| format!("rename {} -> {} failed: {e}", tmp.display(), dest.display()))?;
+    verify_sizes(done, total).map_err(|e| format!("download failed for {url}: {e}"))?;
+    if let (Some(h), Some(expected)) = (hasher, expected_sha256) {
+        let got = hex_lower(&h.finalize());
+        if !got.eq_ignore_ascii_case(expected) {
+            return Err(format!(
+                "sha256 mismatch for {url}: expected {expected}, got {got}; if the upstream \
+                 file changed legitimately, update RUSTSIGHT_RERANK_MODEL_SHA256"
+            ));
+        }
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fresh scratch dir under the system temp dir, unique per test.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rustsight-onnx-tests-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn cache_complete_requires_marker_and_all_files() {
+        let dir = scratch("cache_complete");
+        // nothing cached
+        assert!(!cache_complete(&dir, false));
+        // marker but no files
+        std::fs::write(dir.join(CACHE_MARKER), MARKER_OK).unwrap();
+        assert!(!cache_complete(&dir, false));
+        // model but no tokenizer
+        std::fs::write(dir.join("model.onnx"), b"m").unwrap();
+        assert!(!cache_complete(&dir, false));
+        // complete self-contained cache
+        std::fs::write(dir.join("tokenizer.json"), b"t").unwrap();
+        assert!(cache_complete(&dir, false));
+        // a cache whose model needs the data blob requires the sibling file
+        assert!(!cache_complete(&dir, true));
+        std::fs::write(dir.join("model.onnx_data"), b"d").unwrap();
+        assert!(cache_complete(&dir, true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn marker_requires_data_only_for_data_markers() {
+        let dir = scratch("marker_requires_data");
+        let marker = dir.join(CACHE_MARKER);
+        assert!(!marker_requires_data(&marker)); // absent marker makes no claim
+        std::fs::write(&marker, MARKER_OK).unwrap();
+        assert!(!marker_requires_data(&marker));
+        std::fs::write(&marker, MARKER_DATA).unwrap();
+        assert!(marker_requires_data(&marker));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_sizes_rejects_mismatch_only_when_advertised() {
+        assert!(verify_sizes(100, 100).is_ok());
+        // total == 0: no Content-Length advertised, nothing to check
+        assert!(verify_sizes(100, 0).is_ok());
+        assert!(verify_sizes(99, 100).is_err());
+        assert!(verify_sizes(101, 100).is_err());
+    }
+
+    #[test]
+    fn part_paths_are_unique_per_call() {
+        let a = part_path(Path::new("/cache/models/repo/model.onnx"));
+        let b = part_path(Path::new("/cache/models/repo/model.onnx"));
+        assert_ne!(a, b);
+        let pid = std::process::id().to_string();
+        for p in [&a, &b] {
+            let name = p.file_name().unwrap().to_str().unwrap();
+            assert!(name.starts_with("model."), "{p:?}");
+            assert!(name.ends_with(".part"), "{p:?}");
+            assert!(name.contains(&pid), "{p:?}");
+        }
+        // each dest keeps its own stem
+        let t = part_path(Path::new("/cache/models/repo/tokenizer.json"));
+        assert!(t
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("tokenizer."));
+    }
+
+    #[test]
+    fn hex_lower_formats_sha256_digests() {
+        // sha256 of the empty string — well-known vector
+        assert_eq!(
+            hex_lower(&Sha256::digest(b"")),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
 
     #[test]
     fn sigmoid_maps_logits_to_scores() {

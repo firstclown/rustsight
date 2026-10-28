@@ -189,7 +189,13 @@ tickets:
   dlopen (driver + `libcudart.so.13`/`libcublas{,Lt}.so.13`/
   `libcurand.so.10`) before promising CUDA.
 - fp32 exports keep weights in an external `model.onnx_data` blob; the
-  resolver downloads it alongside when present (HEAD probe).
+  resolver downloads it alongside when present (HEAD probe). Cache dirs are
+  stamped with a `.complete` marker after all files land, so cached models
+  start with zero network calls (offline hosts work; pre-marker caches are
+  adopted when the HEAD probe fails but the files are there). Downloads go
+  through unique `<pid>.<seq>.part` temps and verify `Content-Length` plus
+  the optional `RUSTSIGHT_RERANK_MODEL_SHA256` pin before renaming into
+  place.
 - Upstream's "decision-model reranker" with pruning (`search/
   decision_reranker.py`) remains out of scope; if built, it layers on the
   same `RerankProvider` seam.

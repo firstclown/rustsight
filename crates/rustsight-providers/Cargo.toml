@@ -10,7 +10,7 @@ description = "LLM, embedding, and rerank providers for rustsight (OpenAI-compat
 # (~50-100 MB of prebuilt binaries) and the HuggingFace `tokenizers` crate.
 # Opt-in so default builds stay light; the release binary is built with
 # `cargo build --release -p rustsight-cli --features onnx-rerank`.
-onnx-rerank = ["dep:ort", "dep:tokenizers"]
+onnx-rerank = ["dep:ort", "dep:tokenizers", "dep:sha2"]
 # CUDA build of the above: ONNX Runtime with CUDA execution-provider
 # kernels (needs NVIDIA driver + CUDA 13 runtime + cuDNN 9 at run time;
 # falls back to CPU automatically unless RUSTSIGHT_RERANK_DEVICE=cuda).
@@ -25,6 +25,7 @@ serde_json = { workspace = true }
 ort = { workspace = true, optional = true }
 tokenizers = { workspace = true, optional = true }
 libloading = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

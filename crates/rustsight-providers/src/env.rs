@@ -122,6 +122,9 @@ pub struct ProviderEnv {
     pub rerank_model_repo: String,
     /// `RUSTSIGHT_RERANK_MODEL_FILE`: model file within that repo.
     pub rerank_model_file: String,
+    /// `RUSTSIGHT_RERANK_MODEL_SHA256`: optional hex sha256 pin for the
+    /// downloaded model file; a mismatching download is refused.
+    pub rerank_model_sha256: Option<String>,
     /// `RUSTSIGHT_MODELS_DIR`: download cache root (default
     /// `~/.rustsight/models`).
     pub rerank_models_dir: Option<String>,
@@ -160,6 +163,28 @@ fn var_num(name: &str, default: usize, min: usize, max: usize) -> usize {
     }
 }
 
+/// Reads an optional sha256 pin env var, rejecting malformed values at
+/// startup — a typo would otherwise only surface as a mismatch after the
+/// multi-hundred-MB download finished.
+fn validated_sha256(name: &str) -> Result<Option<String>, String> {
+    parse_sha256(var_opt(name).as_deref(), name)
+}
+
+fn parse_sha256(value: Option<&str>, name: &str) -> Result<Option<String>, String> {
+    // Mirror `var_opt`: an empty value means "unset", same as absent.
+    let Some(raw) = value.filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let hex = raw.trim();
+    if hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(Some(hex.to_ascii_lowercase()))
+    } else {
+        Err(format!(
+            "invalid {name}={raw:?}: expected 64 hex characters (sha256)"
+        ))
+    }
+}
+
 impl ProviderEnv {
     pub fn from_env() -> Result<Self, String> {
         let llm_base_url = var("RUSTSIGHT_LLM_BASE_URL", "https://api.openai.com/v1");
@@ -175,6 +200,7 @@ impl ProviderEnv {
         let rerank_model_path = var_opt("RUSTSIGHT_RERANK_MODEL_PATH");
         let rerank_model_repo = var("RUSTSIGHT_RERANK_MODEL_REPO", DEFAULT_RERANK_REPO);
         let rerank_model_file = var("RUSTSIGHT_RERANK_MODEL_FILE", DEFAULT_RERANK_REPO_FILE);
+        let rerank_model_sha256 = validated_sha256("RUSTSIGHT_RERANK_MODEL_SHA256")?;
         let rerank_models_dir = var_opt("RUSTSIGHT_MODELS_DIR");
         let rerank_batch_size = var_num("RUSTSIGHT_RERANK_BATCH", 16, 1, 128);
         let rerank_max_len = var_num("RUSTSIGHT_RERANK_MAX_LEN", 512, 32, 8192);
@@ -194,6 +220,7 @@ impl ProviderEnv {
             rerank_model_path,
             rerank_model_repo,
             rerank_model_file,
+            rerank_model_sha256,
             rerank_models_dir,
             rerank_batch_size,
             rerank_max_len,
@@ -327,5 +354,20 @@ mod tests {
         assert_eq!(RerankDevice::parse("gpu"), Ok(RerankDevice::Cuda));
         assert!(RerankDevice::parse("cudaa").is_err());
         assert!(RerankDevice::parse("metal").is_err());
+    }
+
+    #[test]
+    fn sha256_pin_is_validated_and_normalized() {
+        assert_eq!(parse_sha256(None, "X").unwrap(), None);
+        assert_eq!(parse_sha256(Some(""), "X").unwrap(), None);
+        let pin = format!(" {} ", "aB".repeat(32));
+        assert_eq!(
+            parse_sha256(Some(&pin), "X").unwrap(),
+            Some("ab".repeat(32))
+        );
+        // wrong length, non-hex characters, and empty-after-trim all fail
+        assert!(parse_sha256(Some("a".repeat(63)).as_deref(), "X").is_err());
+        assert!(parse_sha256(Some("z".repeat(64)).as_deref(), "X").is_err());
+        assert!(parse_sha256(Some("nothex"), "X").is_err());
     }
 }

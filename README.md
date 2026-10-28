@@ -52,6 +52,8 @@ Configuration (non-mock mode)
     RUSTSIGHT_RERANK          local | api | off | auto (default auto; see below)
     RUSTSIGHT_RERANK_URL      optional; any /rerank endpoint (Jina/Cohere style)
     RUSTSIGHT_RERANK_MODEL_PATH  pre-placed ONNX model (file or dir); skips download
+    RUSTSIGHT_RERANK_MODEL_SHA256  optional; hex sha256 pin — a downloaded model
+                              file whose hash differs is refused
     RUSTSIGHT_RERANK_DEVICE   auto | cpu | cuda (default auto)
     RUSTSIGHT_DB              default ~/.rustsight/rustsight.db
     RUSTSIGHT_API_TOKEN       optional; bearer token required by every HTTP
@@ -86,7 +88,10 @@ Three reranker backends:
       cargo build --release -p rustsight-cli --features onnx-rerank-cuda    # + NVIDIA GPU
 
   The model is downloaded from HuggingFace on first use into
-  `~/.rustsight/models/` and cached; `RUSTSIGHT_RERANK_MODEL_PATH` points at
+  `~/.rustsight/models/` and cached; the cache is marked complete only after
+  every file landed, so later starts use it with no network access (offline
+  hosts work), and `RUSTSIGHT_RERANK_MODEL_SHA256` can pin the downloaded
+  model's hash. `RUSTSIGHT_RERANK_MODEL_PATH` points at
   a pre-placed model for offline hosts. Query/doc pairs are scored in
   batches (`RUSTSIGHT_RERANK_BATCH`, default 16; 16-64 is the sweet spot),
   truncated at `RUSTSIGHT_RERANK_MAX_LEN` tokens (default 512). Recall caps
