@@ -828,3 +828,98 @@ async fn noop_rerank_leaves_raw_rrf_order() {
         "{memories:?}"
     );
 }
+
+/// RS-5: retain now sends the vendored upstream extraction prompts, whose
+/// responses use upstream's schema — what/when/who/why dimensions, plain
+/// string entities, fact_type world|assistant, causal_relations with
+/// target_index. Proves the pipeline stores such responses end-to-end:
+/// combined fact text, experience kind for assistant facts, entity
+/// resolution from string entities, and causal edges from target_index.
+#[tokio::test]
+async fn retain_parses_upstream_shaped_extraction_response() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let upstream_resp = LlmResponse {
+        content: Some(
+            json!({"facts": [
+                {
+                    "what": "Alice joined Google.",
+                    "when": "Monday, September 14, 2026",
+                    "where": "N/A",
+                    "who": "Alice",
+                    "why": "N/A",
+                    "fact_kind": "event",
+                    "occurred_start": "2026-09-14",
+                    "occurred_end": null,
+                    "fact_type": "world",
+                    "entities": ["Alice", "Google"],
+                    "causal_relations": null
+                },
+                {
+                    "what": "I recommended Alice for the infra team.",
+                    "when": "N/A",
+                    "where": "N/A",
+                    "who": "N/A",
+                    "why": "She asked me which team to join.",
+                    "fact_kind": "conversation",
+                    "occurred_start": null,
+                    "occurred_end": null,
+                    "fact_type": "assistant",
+                    "entities": ["Alice"],
+                    "causal_relations": [{"target_index": 0, "relation_type": "caused_by"}]
+                }
+            ]})
+            .to_string(),
+        ),
+        tool_calls: vec![],
+    };
+    let e = Engine::new(
+        Arc::new(store),
+        Arc::new(MockLlm::script(vec![upstream_resp])),
+        Arc::new(MockEmbed::default()),
+        Arc::new(NoopRerank),
+        Arc::new(SimpleTokenEstimator),
+        Arc::new(FixedClock::new(1_800_000_000_000)),
+    );
+    let r = e
+        .retain(RetainRequest {
+            bank_id: "upstream-shape".into(),
+            content: "Alice joined Google. I recommended Alice for the infra team.".into(),
+            context: None,
+            timestamp_ms: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(r.memories_stored, 2, "{r:?}");
+
+    let memories = e.store.recent_memories("upstream-shape", 10).unwrap();
+    assert_eq!(memories.len(), 2, "{memories:?}");
+    let joined = memories
+        .iter()
+        .find(|m| m.text.contains("Alice joined Google"))
+        .expect("world fact stored with combined text");
+    assert!(
+        joined.text.contains("When: Monday, September 14, 2026"),
+        "combined dimension text missing: {joined:?}"
+    );
+    assert!(joined.occurred_start_ms.is_some(), "{joined:?}");
+    let recommended = memories
+        .iter()
+        .find(|m| m.text.contains("recommended Alice"))
+        .expect("assistant fact stored");
+    assert_eq!(recommended.kind, MemoryKind::Experience);
+
+    // entity resolution turned the plain-string entities into canonical ones
+    assert!(r.entities.len() >= 2, "{r:?}");
+
+    // causal_relations[target_index=0] produced a Causal edge 1 -> 0
+    let causal: Vec<_> = e
+        .store
+        .edges_for_bank("upstream-shape", 100)
+        .unwrap()
+        .into_iter()
+        .filter(|ed| ed.kind == EdgeKind::Causal)
+        .collect();
+    assert_eq!(causal.len(), 1, "{causal:?}");
+    assert_eq!(causal[0].b_id, joined.id);
+    assert_eq!(causal[0].label.as_deref(), Some("caused_by"));
+}

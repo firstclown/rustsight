@@ -92,12 +92,9 @@ const STOPWORDS: &[&str] = &[
 ];
 
 fn demo_extraction(content: &str) -> Value {
-    let content = content.split("CONTENT:\n").nth(1).unwrap_or(content);
-    let content = content
-        .split("\n\nRespond with")
-        .next()
-        .unwrap_or(content)
-        .trim();
+    // The upstream user message ends with "Content:\n<chunk>"; take the tail.
+    let content = content.rsplit("Content:\n").next().unwrap_or(content);
+    let content = content.trim();
     let mut facts = vec![];
     for sentence in content.split(['.', '!', '?']) {
         let sentence = sentence.trim();
@@ -182,7 +179,9 @@ impl LlmProvider for MockLlm {
             })),
             Mode::Demo => {
                 let system = req.system.clone().unwrap_or_default();
-                if system.contains("FACT EXTRACTION ENGINE") {
+                // Upstream (v1.1.0) extraction system prompt header — the
+                // retain pipeline sends the vendored upstream prompt.
+                if system.contains("Extract SIGNIFICANT facts from text") {
                     let user_msg = req
                         .messages
                         .iter()
