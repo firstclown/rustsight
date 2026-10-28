@@ -196,10 +196,18 @@ impl SqliteStore {
         })
     }
 
-    fn fts_upsert(&self, bank_id: &str, kind: &str, ref_id: &str, text: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM texts_fts WHERE ref_id = ?1", params![ref_id])
-            .map_err(store_err)?;
+    fn fts_upsert(
+        conn: &Connection,
+        bank_id: &str,
+        kind: &str,
+        ref_id: &str,
+        text: &str,
+    ) -> Result<()> {
+        conn.execute(
+            "DELETE FROM texts_fts WHERE bank_id = ?1 AND ref_id = ?2",
+            params![bank_id, ref_id],
+        )
+        .map_err(store_err)?;
         conn.execute(
             "INSERT INTO texts_fts(text, bank_id, kind, ref_id) VALUES (?1, ?2, ?3, ?4)",
             params![text, bank_id, kind, ref_id],
@@ -760,20 +768,22 @@ impl MemoryStore for SqliteStore {
     }
 
     fn link_memory_entities(&self, memory_id: &MemoryId, links: &[(String, String)]) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
+        let now = chrono_now_ms();
+        let tx = conn.transaction().map_err(store_err)?;
         for (entity_id, mention) in links {
-            conn.execute(
+            tx.execute(
                 "INSERT OR IGNORE INTO memory_entities(memory_id, entity_id, mention) VALUES (?1, ?2, ?3)",
                 params![memory_id, entity_id, mention],
             )
             .map_err(store_err)?;
-            conn.execute(
+            tx.execute(
                 "UPDATE entities SET last_mentioned_ms = MAX(last_mentioned_ms, ?2) WHERE id = ?1",
-                params![entity_id, chrono_now_ms()],
+                params![entity_id, now],
             )
             .map_err(store_err)?;
         }
-        Ok(())
+        tx.commit().map_err(store_err)
     }
 
     fn memory_entity_ids(&self, memory_id: &MemoryId) -> Result<Vec<String>> {
@@ -828,15 +838,16 @@ impl MemoryStore for SqliteStore {
     }
 
     fn add_edges(&self, edges: &[Edge]) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(store_err)?;
         for e in edges {
-            conn.execute(
+            tx.execute(
                 "INSERT OR IGNORE INTO edges(bank_id, a_id, b_id, kind, label, weight) VALUES (?1,?2,?3,?4,?5,?6)",
                 params![e.bank_id, e.a_id, e.b_id, e.kind.as_str(), e.label.clone().unwrap_or_default(), e.weight],
             )
             .map_err(store_err)?;
         }
-        Ok(())
+        tx.commit().map_err(store_err)
     }
 
     fn edges_for_bank(&self, bank_id: &str, limit: usize) -> Result<Vec<Edge>> {
@@ -872,16 +883,17 @@ impl MemoryStore for SqliteStore {
         entity_ids: &[String],
         reason: &str,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
         let now = chrono_now_ms();
+        let tx = conn.transaction().map_err(store_err)?;
         for id in entity_ids {
-            conn.execute(
+            tx.execute(
                 "INSERT OR REPLACE INTO dirty_entities(bank_id, entity_id, reason, marked_at_ms) VALUES (?1,?2,?3,?4)",
                 params![bank_id, id, reason, now],
             )
             .map_err(store_err)?;
         }
-        Ok(())
+        tx.commit().map_err(store_err)
     }
 
     fn list_dirty_entities(&self, bank_id: &str, limit: usize) -> Result<Vec<String>> {
@@ -932,8 +944,9 @@ impl MemoryStore for SqliteStore {
     }
 
     fn upsert_observation(&self, o: &Observation) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(store_err)?;
+        tx.execute(
             "INSERT INTO observations(id, bank_id, entity_id, text, evidence_json, proof_count, history_json, embedding, updated_at_ms, created_at_ms)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
              ON CONFLICT(id) DO UPDATE SET text=excluded.text, evidence_json=excluded.evidence_json, proof_count=excluded.proof_count, history_json=excluded.history_json, embedding=excluded.embedding, updated_at_ms=excluded.updated_at_ms",
@@ -951,8 +964,8 @@ impl MemoryStore for SqliteStore {
             ],
         )
         .map_err(store_err)?;
-        drop(conn);
-        self.fts_upsert(&o.bank_id, "observation", &o.id, &o.text)
+        Self::fts_upsert(&tx, &o.bank_id, "observation", &o.id, &o.text)?;
+        tx.commit().map_err(store_err)
     }
 
     fn observations_for_entity(&self, entity_id: &str) -> Result<Vec<Observation>> {
@@ -986,8 +999,9 @@ impl MemoryStore for SqliteStore {
     }
 
     fn upsert_opinion(&self, o: &Opinion) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(store_err)?;
+        tx.execute(
             "INSERT INTO opinions(id, bank_id, text, confidence, evidence_json, history_json, embedding, created_at_ms, updated_at_ms)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
              ON CONFLICT(id) DO UPDATE SET text=excluded.text, confidence=excluded.confidence, evidence_json=excluded.evidence_json, history_json=excluded.history_json, embedding=excluded.embedding, updated_at_ms=excluded.updated_at_ms",
@@ -1005,14 +1019,14 @@ impl MemoryStore for SqliteStore {
         )
         .map_err(store_err)?;
         for eid in &o.entity_ids {
-            conn.execute(
+            tx.execute(
                 "INSERT OR IGNORE INTO opinion_entities(opinion_id, entity_id) VALUES (?1, ?2)",
                 params![o.id, eid],
             )
             .map_err(store_err)?;
         }
-        drop(conn);
-        self.fts_upsert(&o.bank_id, "opinion", &o.id, &o.text)
+        Self::fts_upsert(&tx, &o.bank_id, "opinion", &o.id, &o.text)?;
+        tx.commit().map_err(store_err)
     }
 
     fn list_opinions(&self, bank_id: &str) -> Result<Vec<Opinion>> {
@@ -1427,5 +1441,94 @@ mod tests {
         assert_eq!(refs[0].kind, MemoryKind::Observation);
         assert_eq!(refs[1].text, "two");
         assert_eq!(refs[2].text, "one");
+    }
+
+    #[test]
+    fn observation_fts_upsert_is_atomic_dedup() {
+        let s = store();
+        s.ensure_bank(&Bank {
+            id: "b".into(),
+            mission: None,
+            directives: None,
+            background: None,
+            disposition: Disposition::default(),
+        })
+        .unwrap();
+        let o = Observation {
+            id: "o1".into(),
+            bank_id: "b".into(),
+            entity_id: "e".into(),
+            text: "Alice works at Google".into(),
+            evidence: vec![],
+            proof_count: 0,
+            history: vec![],
+            updated_at_ms: 1,
+            created_at_ms: 1,
+            embedding: None,
+        };
+        s.upsert_observation(&o).unwrap();
+        let mut updated = o.clone();
+        updated.text = "Alice works at Amazon".into();
+        updated.updated_at_ms = 2;
+        s.upsert_observation(&updated).unwrap();
+
+        assert!(
+            s.search_bm25("b", &["google".into()], 5)
+                .unwrap()
+                .is_empty(),
+            "stale text must be deleted from the fts index"
+        );
+        let hits = s.search_bm25("b", &["alice".into()], 5).unwrap();
+        assert_eq!(hits.len(), 1, "re-upsert must not duplicate fts rows");
+        assert_eq!(hits[0].0, "o1");
+        assert_eq!(hits[0].1, MemoryKind::Observation);
+    }
+
+    #[test]
+    fn opinion_fts_upsert_is_atomic_dedup() {
+        let s = store();
+        s.ensure_bank(&Bank {
+            id: "b".into(),
+            mission: None,
+            directives: None,
+            background: None,
+            disposition: Disposition::default(),
+        })
+        .unwrap();
+        let op = Opinion {
+            id: "op1".into(),
+            bank_id: "b".into(),
+            text: "Bob is enthusiastic about rust".into(),
+            confidence: 0.7,
+            evidence: vec![],
+            history: vec![],
+            entity_ids: vec!["e1".into(), "e2".into()],
+            updated_at_ms: 1,
+            created_at_ms: 1,
+            embedding: None,
+        };
+        s.upsert_opinion(&op).unwrap();
+        let mut updated = op.clone();
+        updated.text = "Bob is enthusiastic about zig".into();
+        updated.updated_at_ms = 2;
+        s.upsert_opinion(&updated).unwrap();
+
+        assert!(
+            s.search_bm25("b", &["rust".into()], 5).unwrap().is_empty(),
+            "stale text must be deleted from the fts index"
+        );
+        let hits = s.search_bm25("b", &["zig".into()], 5).unwrap();
+        assert_eq!(hits.len(), 1, "re-upsert must not duplicate fts rows");
+        assert_eq!(hits[0].0, "op1");
+        assert_eq!(hits[0].1, MemoryKind::Opinion);
+
+        let listed = s.list_opinions("b").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].entity_ids.len(),
+            2,
+            "entity links survive re-upsert"
+        );
+        assert_eq!(listed[0].text, "Bob is enthusiastic about zig");
     }
 }
