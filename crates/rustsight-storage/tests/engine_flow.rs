@@ -139,6 +139,92 @@ async fn consolidation_builds_observation_with_evidence() {
     assert!(e.store.list_dirty_entities("c", 10).unwrap().is_empty());
 }
 
+/// CR-5: the recall arms run concurrently now, but `strategies_used` must
+/// keep the fixed semantic → keyword → graph → temporal order. The ghost
+/// edge exists because the graph arm can only surface ids outside the
+/// semantic/BM25 seed set (seeds count toward the neighbor limit), and in a
+/// bank this small every real memory already sits in those seeds.
+#[tokio::test]
+async fn recall_strategies_used_keeps_fixed_order() {
+    let e = engine();
+    e.store
+        .ensure_bank(&Bank {
+            id: "so".into(),
+            mission: None,
+            directives: None,
+            background: None,
+            disposition: Disposition::default(),
+        })
+        .unwrap();
+    let may2023 = 1_683_648_000_000i64;
+    let emb = e
+        .embed
+        .embed(vec![
+            "Alice works at Google".into(),
+            "Bob likes quiet trails".into(),
+        ])
+        .await
+        .unwrap();
+    let stored = e
+        .store
+        .insert_memories(
+            "so",
+            &[
+                NewMemoryRecord {
+                    kind: MemoryKind::World,
+                    text: "Alice works at Google".into(),
+                    confidence: None,
+                    occurred_start_ms: Some(may2023),
+                    occurred_end_ms: None,
+                    mentioned_at_ms: may2023,
+                    embedding: emb[0].clone(),
+                    source: None,
+                    context: None,
+                },
+                NewMemoryRecord {
+                    kind: MemoryKind::World,
+                    text: "Bob likes quiet trails".into(),
+                    confidence: None,
+                    occurred_start_ms: None,
+                    occurred_end_ms: None,
+                    mentioned_at_ms: may2023 + 1000,
+                    embedding: emb[1].clone(),
+                    source: None,
+                    context: None,
+                },
+            ],
+        )
+        .unwrap();
+    e.store
+        .add_edges(&[Edge {
+            bank_id: "so".into(),
+            a_id: stored[0].id.clone(),
+            b_id: "graph-only-ghost".into(),
+            kind: EdgeKind::Entity,
+            label: None,
+            weight: 1.0,
+        }])
+        .unwrap();
+
+    let resp = e
+        .recall(RecallRequest {
+            bank_id: "so".into(),
+            query: "Where did Alice work in 2023?".into(),
+            token_budget: 500,
+            top_k_per_arm: 3,
+            kinds: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.strategies_used,
+        vec!["semantic", "keyword", "graph", "temporal"]
+    );
+    assert!(resp.window.is_some());
+    assert!(!resp.memories.is_empty(), "{resp:?}");
+}
+
 /// CR-6: the embedding backfill targets observations by id, so after a
 /// pass every observation carries an embedding — including ones created via
 /// the update path on a later pass.

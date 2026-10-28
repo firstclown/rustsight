@@ -22,6 +22,8 @@ reqwest = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# `tokio::task::spawn_blocking` for the ONNX reranker's blocking inference
+tokio = { workspace = true }
 ort = { workspace = true, optional = true }
 tokenizers = { workspace = true, optional = true }
 libloading = { workspace = true, optional = true }

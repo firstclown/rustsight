@@ -33,7 +33,7 @@ use sha2::{Digest, Sha256};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokenizers::{Tokenizer, TruncationParams, TruncationStrategy};
 
@@ -115,6 +115,14 @@ fn ort_env() -> std::result::Result<&'static ort::environment::Environment, Stri
 }
 
 pub struct OrtRerank {
+    core: Arc<OrtCore>,
+}
+
+/// Session + tokenizer state shared between the async [`RerankProvider`]
+/// entry point and the blocking inference task it spawns. Fields are
+/// intentionally grouped here so an `Arc<OrtCore>` can move into the
+/// `spawn_blocking` closure.
+struct OrtCore {
     session: Mutex<ort::session::Session>,
     tokenizer: Mutex<Tokenizer>,
     input_ids_name: String,
@@ -215,34 +223,46 @@ impl OrtRerank {
             .or_else(|| tokenizer.token_to_id("<pad>"))
             .unwrap_or(1);
         Self {
-            session: Mutex::new(session),
-            tokenizer: Mutex::new(tokenizer),
-            input_ids_name,
-            attention_name,
-            token_type_name,
-            pad_id,
-            batch_size: batch_size.max(1),
+            core: Arc::new(OrtCore {
+                session: Mutex::new(session),
+                tokenizer: Mutex::new(tokenizer),
+                input_ids_name,
+                attention_name,
+                token_type_name,
+                pad_id,
+                batch_size: batch_size.max(1),
+            }),
         }
     }
+}
 
+impl OrtCore {
     fn tokenize_and_score(&self, query: &str, docs: &[String]) -> Result<Vec<f32>> {
         if docs.is_empty() {
             return Ok(vec![]);
         }
-        let tokenizer = self
-            .tokenizer
-            .lock()
-            .map_err(|_| Error::Rerank("tokenizer lock poisoned".to_string()))?;
         let mut scores = Vec::with_capacity(docs.len());
         for chunk in docs.chunks(self.batch_size) {
             let pairs: Vec<(String, String)> = chunk
                 .iter()
                 .map(|d| (query.to_string(), d.clone()))
                 .collect();
-            let encodings = tokenizer
-                .encode_batch(pairs, true)
-                .map_err(|e| Error::Rerank(format!("tokenization failed: {e}")))?;
-            let rows: Vec<&[u32]> = encodings.iter().map(|e| e.get_ids()).collect();
+            // Encode under the tokenizer lock, then drop the guard before
+            // inference: the lock is never held across `session.run`, so
+            // tokenization of the next batch can overlap with scoring.
+            let encodings: Vec<Vec<u32>> = {
+                let tokenizer = self
+                    .tokenizer
+                    .lock()
+                    .map_err(|_| Error::Rerank("tokenizer lock poisoned".to_string()))?;
+                tokenizer
+                    .encode_batch(pairs, true)
+                    .map_err(|e| Error::Rerank(format!("tokenization failed: {e}")))?
+                    .into_iter()
+                    .map(|e| e.get_ids().to_vec())
+                    .collect()
+            };
+            let rows: Vec<&[u32]> = encodings.iter().map(|e| e.as_slice()).collect();
             scores.extend(self.score_rows(&rows).map_err(Error::Rerank)?);
         }
         Ok(scores)
@@ -436,7 +456,15 @@ impl RerankProvider for OrtRerank {
         docs: &[String],
         top_k: usize,
     ) -> Result<Vec<(usize, f32)>> {
-        let scores = self.tokenize_and_score(query, docs)?;
+        // Tokenization + CPU inference take hundreds of ms for a 50-doc ×
+        // 512-token batch; running them inline would stall every task on the
+        // async runtime thread, so the whole body moves to the blocking pool.
+        let core = Arc::clone(&self.core);
+        let query = query.to_string();
+        let docs = docs.to_vec();
+        let scores = tokio::task::spawn_blocking(move || core.tokenize_and_score(&query, &docs))
+            .await
+            .map_err(|e| Error::Rerank(format!("rerank task failed: {e}")))??;
         Ok(select_top_k(scores, top_k))
     }
 }
