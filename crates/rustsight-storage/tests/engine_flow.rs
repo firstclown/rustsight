@@ -139,6 +139,50 @@ async fn consolidation_builds_observation_with_evidence() {
     assert!(e.store.list_dirty_entities("c", 10).unwrap().is_empty());
 }
 
+/// CR-6: the embedding backfill targets observations by id, so after a
+/// pass every observation carries an embedding — including ones created via
+/// the update path on a later pass.
+#[tokio::test]
+async fn consolidation_backfills_observation_embeddings_by_id() {
+    let e = engine();
+    retain(
+        &e,
+        "emb",
+        "Alice joined Google. Alice works on search infrastructure.",
+    )
+    .await;
+    e.consolidate_once("emb", 10).await.unwrap();
+    let obs = e.store.observations_for_bank("emb").unwrap();
+    assert!(!obs.is_empty());
+    for o in &obs {
+        assert!(
+            o.embedding.is_some(),
+            "embedding missing on observation {} ({:?})",
+            o.id,
+            o.text
+        );
+    }
+
+    // A second retain dirties the entity again; whether the next pass
+    // updates the existing observation or writes a new one, every
+    // observation must still end up embedded.
+    retain(
+        &e,
+        "emb",
+        "Alice delivered the migration ahead of schedule.",
+    )
+    .await;
+    e.consolidate_once("emb", 10).await.unwrap();
+    for o in e.store.observations_for_bank("emb").unwrap() {
+        assert!(
+            o.embedding.is_some(),
+            "embedding missing on observation {} ({:?})",
+            o.id,
+            o.text
+        );
+    }
+}
+
 #[tokio::test]
 async fn background_worker_consolidates_after_retain_without_explicit_call() {
     let store = SqliteStore::open_in_memory().unwrap();

@@ -57,6 +57,10 @@ pub trait MemoryStore: Send + Sync {
     fn upsert_observation(&self, o: &Observation) -> Result<()>;
     fn observations_for_entity(&self, entity_id: &str) -> Result<Vec<Observation>>;
     fn observations_for_bank(&self, bank_id: &str) -> Result<Vec<Observation>>;
+    /// Attach (or clear) an embedding on an existing observation by id,
+    /// without rewriting the rest of the row. Used by consolidation's
+    /// post-embed backfill; unknown ids are a no-op.
+    fn set_observation_embedding(&self, id: &str, embedding: Option<Vec<f32>>) -> Result<()>;
 
     fn upsert_opinion(&self, o: &Opinion) -> Result<()>;
     fn list_opinions(&self, bank_id: &str) -> Result<Vec<Opinion>>;

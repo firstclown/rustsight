@@ -21,7 +21,16 @@ pub(super) async fn consolidate_once(
     }
     let now = e.clock.now_ms();
     let mut updated = 0usize;
-    let mut obs_texts: Vec<String> = vec![];
+    // (observation id, text) pairs awaiting the embedding backfill below.
+    // Tracking ids (not just texts) means each observation gets its own
+    // embedding even when two observations share identical text.
+    let mut obs_pending: Vec<(String, String)> = vec![];
+    // One opinion snapshot for the whole pass (CR-6): `list_opinions` reads
+    // the entire bank, so re-reading it per dirty entity made consolidation
+    // quadratic in bank size. Reinforced opinions are written back into the
+    // snapshot so later entities in this pass still see fresh
+    // confidence/timestamps, exactly as the per-entity re-fetch did.
+    let mut opinions = e.store.list_opinions(bank_id)?;
 
     for eid in &dirty {
         let entity = match e.store.get_entity(eid)? {
@@ -45,6 +54,9 @@ pub(super) async fn consolidate_once(
             })
             .await?;
         let parsed = parse_observations(&resp.content.unwrap_or_default())?;
+        // A parse failure above aborts the whole pass via `?` — intentional:
+        // dirty rows are only cleared after a successful pass, so the next
+        // worker tick re-discovers and retries this entity.
         for p in parsed {
             let mut evidence: Vec<Evidence> = vec![];
             for (idx, quote) in &p.evidence {
@@ -92,7 +104,9 @@ pub(super) async fn consolidate_once(
                     if old_text != upd.text {
                         upd.history.push(old_text);
                     }
-                    obs_texts.push(upd.text.clone());
+                    if upd.embedding.is_none() {
+                        obs_pending.push((upd.id.clone(), upd.text.clone()));
+                    }
                     e.store.upsert_observation(&upd)?;
                     updated += 1;
                 }
@@ -109,20 +123,21 @@ pub(super) async fn consolidate_once(
                         created_at_ms: now,
                         embedding: None,
                     };
-                    obs_texts.push(o.text.clone());
+                    obs_pending.push((o.id.clone(), o.text.clone()));
                     e.store.upsert_observation(&o)?;
                     updated += 1;
                 }
             }
         }
 
-        let opinions: Vec<Opinion> = e
-            .store
-            .list_opinions(bank_id)?
-            .into_iter()
-            .filter(|o| o.entity_ids.iter().any(|id| id == eid))
+        let matching: Vec<usize> = opinions
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| o.entity_ids.iter().any(|id| id == eid))
+            .map(|(i, _)| i)
             .collect();
-        for op in opinions {
+        for i in matching {
+            let op = opinions[i].clone();
             let new_facts: Vec<Memory> = facts
                 .iter()
                 .filter(|f| f.mentioned_at_ms > op.updated_at_ms)
@@ -156,22 +171,16 @@ pub(super) async fn consolidate_once(
                 upd.confidence = confidence;
                 upd.updated_at_ms = now;
                 e.store.upsert_opinion(&upd)?;
+                opinions[i] = upd;
             }
         }
     }
 
-    if !obs_texts.is_empty() {
-        let embeddings = e.embed.embed(obs_texts.clone()).await?;
-        for (text, emb) in obs_texts.into_iter().zip(embeddings) {
-            let hit = e
-                .store
-                .observations_for_bank(bank_id)?
-                .into_iter()
-                .find(|o| o.text == text && o.embedding.is_none());
-            if let Some(mut o) = hit {
-                o.embedding = Some(emb);
-                e.store.upsert_observation(&o)?;
-            }
+    if !obs_pending.is_empty() {
+        let texts: Vec<String> = obs_pending.iter().map(|(_, t)| t.clone()).collect();
+        let embeddings = e.embed.embed(texts).await?;
+        for ((id, _), emb) in obs_pending.into_iter().zip(embeddings) {
+            e.store.set_observation_embedding(&id, Some(emb))?;
         }
     }
 

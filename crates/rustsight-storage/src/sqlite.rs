@@ -998,6 +998,16 @@ impl MemoryStore for SqliteStore {
         Ok(out)
     }
 
+    fn set_observation_embedding(&self, id: &str, embedding: Option<Vec<f32>>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE observations SET embedding = ?2 WHERE id = ?1",
+            params![id, embedding.as_deref().map(emb_to_blob)],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
     fn upsert_opinion(&self, o: &Opinion) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(store_err)?;
@@ -1057,14 +1067,6 @@ impl MemoryStore for SqliteStore {
                 serde_json::from_str(&evj).map_err(|e| Error::Store(e.to_string()))?;
             let history: Vec<ConfidencePoint> =
                 serde_json::from_str(&hj).map_err(|e| Error::Store(e.to_string()))?;
-            let mut stmt2 = conn
-                .prepare("SELECT entity_id FROM opinion_entities WHERE opinion_id = ?1")
-                .map_err(store_err)?;
-            let eids = stmt2
-                .query_map(params![id], |r| r.get::<_, String>(0))
-                .map_err(store_err)?
-                .collect::<rusqlite::Result<Vec<String>>>()
-                .map_err(store_err)?;
             out.push(Opinion {
                 id,
                 bank_id,
@@ -1072,11 +1074,39 @@ impl MemoryStore for SqliteStore {
                 confidence,
                 evidence,
                 history,
-                entity_ids: eids,
+                entity_ids: vec![],
                 updated_at_ms: updated,
                 created_at_ms: created,
                 embedding: emb.map(|b| blob_to_emb(&b)),
             });
+        }
+        drop(stmt);
+        if !out.is_empty() {
+            // Batched entity-link fetch: one IN query per 400 opinions instead
+            // of a prepared statement per row (CR-17).
+            let ids: Vec<String> = out.iter().map(|o| o.id.clone()).collect();
+            let mut links: HashMap<String, Vec<String>> = HashMap::new();
+            for chunk in ids.chunks(400) {
+                let ph = placeholders(chunk.len());
+                let sql = format!(
+                    "SELECT opinion_id, entity_id FROM opinion_entities WHERE opinion_id IN ({ph}) ORDER BY opinion_id, entity_id"
+                );
+                let mut links_stmt = conn.prepare(&sql).map_err(store_err)?;
+                let link_rows = links_stmt
+                    .query_map(params_from_iter(chunk.iter()), |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                    })
+                    .map_err(store_err)?;
+                for r in link_rows {
+                    let (oid, eid) = r.map_err(store_err)?;
+                    links.entry(oid).or_default().push(eid);
+                }
+            }
+            for o in out.iter_mut() {
+                if let Some(eids) = links.remove(&o.id) {
+                    o.entity_ids = eids;
+                }
+            }
         }
         Ok(out)
     }
@@ -1530,5 +1560,84 @@ mod tests {
             "entity links survive re-upsert"
         );
         assert_eq!(listed[0].text, "Bob is enthusiastic about zig");
+    }
+
+    #[test]
+    fn set_observation_embedding_writes_by_id() {
+        let s = store();
+        s.ensure_bank(&Bank {
+            id: "b".into(),
+            mission: None,
+            directives: None,
+            background: None,
+            disposition: Disposition::default(),
+        })
+        .unwrap();
+        let o = Observation {
+            id: "o1".into(),
+            bank_id: "b".into(),
+            entity_id: "e".into(),
+            text: "Alice works at Google".into(),
+            evidence: vec![],
+            proof_count: 0,
+            history: vec![],
+            updated_at_ms: 1,
+            created_at_ms: 1,
+            embedding: None,
+        };
+        s.upsert_observation(&o).unwrap();
+
+        s.set_observation_embedding("o1", Some(vec![0.25, 0.75]))
+            .unwrap();
+        let obs = s.observations_for_entity("e").unwrap();
+        assert_eq!(obs[0].embedding.as_deref(), Some(&[0.25f32, 0.75][..]));
+
+        // clearing works too
+        s.set_observation_embedding("o1", None).unwrap();
+        assert!(s.observations_for_entity("e").unwrap()[0]
+            .embedding
+            .is_none());
+
+        // unknown ids are a no-op, not an error
+        s.set_observation_embedding("missing", Some(vec![1.0]))
+            .unwrap();
+    }
+
+    #[test]
+    fn list_opinions_batches_entity_links() {
+        let s = store();
+        s.ensure_bank(&Bank {
+            id: "b".into(),
+            mission: None,
+            directives: None,
+            background: None,
+            disposition: Disposition::default(),
+        })
+        .unwrap();
+        let mk = |id: &str, eids: &[&str]| Opinion {
+            id: id.into(),
+            bank_id: "b".into(),
+            text: format!("opinion {id}"),
+            confidence: 0.5,
+            evidence: vec![],
+            history: vec![],
+            entity_ids: eids.iter().map(|e| e.to_string()).collect(),
+            updated_at_ms: 1,
+            created_at_ms: 1,
+            embedding: None,
+        };
+        s.upsert_opinion(&mk("op1", &["e1", "e2"])).unwrap();
+        s.upsert_opinion(&mk("op2", &["e2"])).unwrap();
+        s.upsert_opinion(&mk("op3", &[])).unwrap();
+
+        let listed = s.list_opinions("b").unwrap();
+        assert_eq!(listed.len(), 3);
+        let by = |id: &str| listed.iter().find(|o| o.id == id).unwrap();
+        assert_eq!(
+            by("op1").entity_ids,
+            vec!["e1".to_string(), "e2".to_string()]
+        );
+        assert_eq!(by("op2").entity_ids, vec!["e2".to_string()]);
+        assert!(by("op3").entity_ids.is_empty());
     }
 }
