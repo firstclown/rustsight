@@ -524,7 +524,7 @@ impl MemoryStore for SqliteStore {
         Ok(out)
     }
 
-    fn get_refs(&self, _bank_id: &str, ids: &[MemoryId]) -> Result<Vec<MemoryRef>> {
+    fn get_refs(&self, bank_id: &str, ids: &[MemoryId]) -> Result<Vec<MemoryRef>> {
         if ids.is_empty() {
             return Ok(vec![]);
         }
@@ -533,23 +533,28 @@ impl MemoryStore for SqliteStore {
         for chunk in ids.chunks(400) {
             let ph = placeholders(chunk.len());
             let sql = format!(
-                "SELECT id, kind, text, occurred_start_ms, occurred_end_ms, mentioned_at_ms FROM memories WHERE id IN ({ph})"
+                "SELECT id, kind, text, occurred_start_ms, occurred_end_ms, mentioned_at_ms FROM memories WHERE bank_id = ? AND id IN ({ph})"
             );
             let mut stmt = conn.prepare(&sql).map_err(store_err)?;
             let rows = stmt
-                .query_map(params_from_iter(chunk.iter()), |r| {
-                    Ok(MemoryRef {
-                        id: r.get(0)?,
-                        kind: MemoryKind::parse(&r.get::<_, String>(1)?)
-                            .unwrap_or(MemoryKind::World),
-                        text: r.get(2)?,
-                        score: 0.0,
-                        occurred_start_ms: r.get(3)?,
-                        occurred_end_ms: r.get(4)?,
-                        mentioned_at_ms: Some(r.get(5)?),
-                        entity_ids: vec![],
-                    })
-                })
+                .query_map(
+                    params_from_iter(
+                        std::iter::once(bank_id.to_string()).chain(chunk.iter().cloned()),
+                    ),
+                    |r| {
+                        Ok(MemoryRef {
+                            id: r.get(0)?,
+                            kind: MemoryKind::parse(&r.get::<_, String>(1)?)
+                                .unwrap_or(MemoryKind::World),
+                            text: r.get(2)?,
+                            score: 0.0,
+                            occurred_start_ms: r.get(3)?,
+                            occurred_end_ms: r.get(4)?,
+                            mentioned_at_ms: Some(r.get(5)?),
+                            entity_ids: vec![],
+                        })
+                    },
+                )
                 .map_err(store_err)?;
             for row in rows {
                 let m = row.map_err(store_err)?;
@@ -557,49 +562,64 @@ impl MemoryStore for SqliteStore {
             }
 
             let sql = format!(
-                "SELECT id, text, entity_id, updated_at_ms FROM observations WHERE id IN ({ph})"
+                "SELECT id, text, entity_id, updated_at_ms FROM observations WHERE bank_id = ? AND id IN ({ph})"
             );
             let mut stmt = conn.prepare(&sql).map_err(store_err)?;
             let rows = stmt
-                .query_map(params_from_iter(chunk.iter()), |r| {
-                    Ok(MemoryRef {
-                        id: r.get(0)?,
-                        kind: MemoryKind::Observation,
-                        text: r.get(1)?,
-                        score: 0.0,
-                        occurred_start_ms: None,
-                        occurred_end_ms: None,
-                        mentioned_at_ms: Some(r.get(3)?),
-                        entity_ids: vec![r.get(2)?],
-                    })
-                })
+                .query_map(
+                    params_from_iter(
+                        std::iter::once(bank_id.to_string()).chain(chunk.iter().cloned()),
+                    ),
+                    |r| {
+                        Ok(MemoryRef {
+                            id: r.get(0)?,
+                            kind: MemoryKind::Observation,
+                            text: r.get(1)?,
+                            score: 0.0,
+                            occurred_start_ms: None,
+                            occurred_end_ms: None,
+                            mentioned_at_ms: Some(r.get(3)?),
+                            entity_ids: vec![r.get(2)?],
+                        })
+                    },
+                )
                 .map_err(store_err)?;
             for row in rows {
                 let m = row.map_err(store_err)?;
                 map.insert(m.id.clone(), m);
             }
 
-            let sql = format!("SELECT id, text, updated_at_ms FROM opinions WHERE id IN ({ph})");
+            let sql = format!(
+                "SELECT id, text, updated_at_ms FROM opinions WHERE bank_id = ? AND id IN ({ph})"
+            );
             let mut stmt = conn.prepare(&sql).map_err(store_err)?;
             let rows = stmt
-                .query_map(params_from_iter(chunk.iter()), |r| {
-                    Ok(MemoryRef {
-                        id: r.get(0)?,
-                        kind: MemoryKind::Opinion,
-                        text: r.get(1)?,
-                        score: 0.0,
-                        occurred_start_ms: None,
-                        occurred_end_ms: None,
-                        mentioned_at_ms: Some(r.get(2)?),
-                        entity_ids: vec![],
-                    })
-                })
+                .query_map(
+                    params_from_iter(
+                        std::iter::once(bank_id.to_string()).chain(chunk.iter().cloned()),
+                    ),
+                    |r| {
+                        Ok(MemoryRef {
+                            id: r.get(0)?,
+                            kind: MemoryKind::Opinion,
+                            text: r.get(1)?,
+                            score: 0.0,
+                            occurred_start_ms: None,
+                            occurred_end_ms: None,
+                            mentioned_at_ms: Some(r.get(2)?),
+                            entity_ids: vec![],
+                        })
+                    },
+                )
                 .map_err(store_err)?;
             for row in rows {
                 let m = row.map_err(store_err)?;
                 map.insert(m.id.clone(), m);
             }
 
+            // memory_entities has no bank column, but it is only consulted
+            // for ids already admitted to `map` by the bank-filtered
+            // memories query above, so no cross-bank rows can attach.
             let sql = format!(
                 "SELECT memory_id, entity_id FROM memory_entities WHERE memory_id IN ({ph})"
             );
@@ -621,7 +641,7 @@ impl MemoryStore for SqliteStore {
 
     fn neighbors(
         &self,
-        _bank_id: &str,
+        bank_id: &str,
         seeds: &[MemoryId],
         hops: usize,
         limit: usize,
@@ -643,14 +663,16 @@ impl MemoryStore for SqliteStore {
                 }
                 let ph = placeholders(chunk.len());
                 let sql = format!(
-                    "SELECT b_id FROM edges WHERE a_id IN ({ph}) UNION SELECT a_id FROM edges WHERE b_id IN ({ph})",
+                    "SELECT b_id FROM edges WHERE bank_id = ? AND a_id IN ({ph}) UNION SELECT a_id FROM edges WHERE bank_id = ? AND b_id IN ({ph})",
                 );
                 let mut stmt = conn.prepare(&sql).map_err(store_err)?;
-                let all: Vec<String> = chunk.to_vec();
+                let mut bind: Vec<String> = Vec::with_capacity(chunk.len() * 2 + 2);
+                bind.push(bank_id.to_string());
+                bind.extend(chunk.iter().cloned());
+                bind.push(bank_id.to_string());
+                bind.extend(chunk.iter().cloned());
                 let rows = stmt
-                    .query_map(params_from_iter(all.iter().chain(all.iter())), |r| {
-                        r.get::<_, String>(0)
-                    })
+                    .query_map(params_from_iter(bind), |r| r.get::<_, String>(0))
                     .map_err(store_err)?;
                 for r in rows {
                     let id = r.map_err(store_err)?;
@@ -1248,6 +1270,51 @@ mod tests {
         let n = s.neighbors("b", &[m[0].id.clone()], 2, 10).unwrap();
         assert!(n.contains(&m[1].id));
         assert!(n.contains(&m[2].id));
+    }
+
+    #[test]
+    fn neighbors_and_refs_are_bank_isolated() {
+        let s = store();
+        for id in ["a", "b"] {
+            s.ensure_bank(&Bank {
+                id: id.into(),
+                mission: None,
+                directives: None,
+                background: None,
+                disposition: Disposition::default(),
+            })
+            .unwrap();
+        }
+        let ma = s
+            .insert_memories("a", &[new_mem("fact a1", 1), new_mem("fact a2", 2)])
+            .unwrap();
+        s.insert_memories("b", &[new_mem("fact b1", 1)]).unwrap();
+        s.add_edges(&[Edge {
+            bank_id: "a".into(),
+            a_id: ma[0].id.clone(),
+            b_id: ma[1].id.clone(),
+            kind: EdgeKind::Entity,
+            label: None,
+            weight: 1.0,
+        }])
+        .unwrap();
+
+        // graph expansion must not cross banks: bank b sees only its seed
+        let n = s.neighbors("b", &[ma[0].id.clone()], 2, 10).unwrap();
+        assert_eq!(
+            n,
+            vec![ma[0].id.clone()],
+            "bank b must not expand into bank a's edges"
+        );
+
+        // refs must not cross banks either
+        assert!(s.get_refs("b", &[ma[0].id.clone()]).unwrap().is_empty());
+        // sanity: the same lookups under bank a still work
+        let refs = s.get_refs("a", &[ma[0].id.clone()]).unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].text, "fact a1");
+        let n = s.neighbors("a", &[ma[0].id.clone()], 2, 10).unwrap();
+        assert!(n.contains(&ma[1].id));
     }
 
     #[test]
