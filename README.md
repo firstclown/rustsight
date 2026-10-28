@@ -157,8 +157,10 @@ Retain splits long content into token-sized chunks (default ~3000 tokens with a
 `EngineConfig.chunk_size_tokens` / `chunk_overlap_tokens`) and extracts each
 chunk separately. Chunk-local causal fact indexes are remapped to a global
 index before edges are built, and facts re-extracted from the overlap region
-(normalized similarity >= 0.9) are stored once. Transient provider failures
-(HTTP 429 / 5xx, surfaced as typed statuses) are retried with exponential
+(normalized similarity >= 0.9) are stored once. Every provider call (LLM,
+embeddings, rerank) in every pipeline — retain, recall, reflect,
+consolidation, mental model — retries transient failures
+(HTTP 429 / 5xx, surfaced as typed statuses) with exponential
 backoff — 3 attempts, 400ms base, both configurable via `retry_max_attempts`
 and `retry_base_delay_ms`; other errors (auth, bad requests) fail fast. If a
 chunk's extraction output fails to parse (e.g. JSON truncated by an output

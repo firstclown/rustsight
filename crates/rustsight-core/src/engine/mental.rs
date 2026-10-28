@@ -1,8 +1,9 @@
-use crate::engine::Engine;
+use crate::engine::{with_retry, Engine};
 use crate::prompts::reflect::build_mental_model_prompt;
 use crate::traits::{ChatMessage, LlmRequest};
 use crate::types::*;
 use crate::Result;
+use std::sync::Arc;
 
 pub(super) async fn refresh(
     e: &Engine,
@@ -32,15 +33,14 @@ pub(super) async fn refresh(
             .join("\n")
     };
     let (system, user) = build_mental_model_prompt(question, &block);
-    let resp = e
-        .llm
-        .complete(&LlmRequest {
-            system: Some(system),
-            messages: vec![ChatMessage::user(user)],
-            temperature: Some(0.2),
-            ..Default::default()
-        })
-        .await?;
+    let llm = Arc::clone(&e.llm);
+    let request = LlmRequest {
+        system: Some(system),
+        messages: vec![ChatMessage::user(user)],
+        temperature: Some(0.2),
+        ..Default::default()
+    };
+    let resp = with_retry(e, || llm.complete(&request)).await?;
     let content = resp.content.unwrap_or_default();
     let now = e.clock.now_ms();
     let existing = e

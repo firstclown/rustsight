@@ -212,7 +212,7 @@ impl Engine {
 /// `retry_base_delay_ms * 2^(N-1)` before firing, up to
 /// `retry_max_attempts` total attempts. Non-transient errors surface
 /// immediately after the first attempt.
-async fn with_retry<T, F, Fut>(e: &Engine, op: F) -> Result<T>
+pub(crate) async fn with_retry<T, F, Fut>(e: &Engine, op: F) -> Result<T>
 where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Result<T>>,

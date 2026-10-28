@@ -1,4 +1,4 @@
-use crate::engine::Engine;
+use crate::engine::{with_retry, Engine};
 use crate::types::*;
 use crate::{
     apply_token_budget, bm25_terms, cosine, parse_window, rrf_fuse, Error, MemoryStore, Result,
@@ -8,9 +8,8 @@ use std::sync::Arc;
 pub(super) async fn recall(e: &Engine, req: RecallRequest) -> Result<RecallResponse> {
     let now = e.clock.now_ms();
     let window = parse_window(&req.query, now);
-    let qemb = e
-        .embed
-        .embed(vec![req.query.clone()])
+    let embed = Arc::clone(&e.embed);
+    let qemb = with_retry(e, || embed.embed(vec![req.query.clone()]))
         .await?
         .into_iter()
         .next()
@@ -76,10 +75,10 @@ pub(super) async fn recall(e: &Engine, req: RecallRequest) -> Result<RecallRespo
     }
 
     let docs: Vec<String> = refs.iter().map(|r| r.text.clone()).collect();
-    let rr = e
-        .rerank
-        .rerank(&req.query, &docs, refs.len().min(50))
-        .await?;
+    let rerank = Arc::clone(&e.rerank);
+    let query = req.query.clone();
+    let top_k = refs.len().min(50);
+    let rr = with_retry(e, || rerank.rerank(&query, &docs, top_k)).await?;
     if !rr.is_empty() {
         let mut scored: Vec<(f32, MemoryRef)> = rr
             .into_iter()

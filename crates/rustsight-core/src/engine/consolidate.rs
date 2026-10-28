@@ -1,4 +1,4 @@
-use crate::engine::Engine;
+use crate::engine::{with_retry, Engine};
 use crate::prompts::consolidation::{
     build_consolidation_prompt, build_opinion_reinforcement_prompt, parse_observations,
     parse_reinforcement,
@@ -6,6 +6,7 @@ use crate::prompts::consolidation::{
 use crate::traits::{ChatMessage, LlmRequest};
 use crate::types::*;
 use crate::{string_similarity, Error, Result};
+use std::sync::Arc;
 
 pub(super) async fn consolidate_once(
     e: &Engine,
@@ -20,6 +21,8 @@ pub(super) async fn consolidate_once(
         return Ok(0);
     }
     let now = e.clock.now_ms();
+    let llm = Arc::clone(&e.llm);
+    let embed = Arc::clone(&e.embed);
     let mut updated = 0usize;
     // (observation id, text) pairs awaiting the embedding backfill below.
     // Tracking ids (not just texts) means each observation gets its own
@@ -43,16 +46,14 @@ pub(super) async fn consolidate_once(
             continue;
         }
         let (system, user) = build_consolidation_prompt(&entity.name, &facts, &existing);
-        let resp = e
-            .llm
-            .complete(&LlmRequest {
-                system: Some(system),
-                messages: vec![ChatMessage::user(user)],
-                json_mode: true,
-                temperature: Some(0.0),
-                ..Default::default()
-            })
-            .await?;
+        let request = LlmRequest {
+            system: Some(system),
+            messages: vec![ChatMessage::user(user)],
+            json_mode: true,
+            temperature: Some(0.0),
+            ..Default::default()
+        };
+        let resp = with_retry(e, || llm.complete(&request)).await?;
         let parsed = parse_observations(&resp.content.unwrap_or_default())?;
         // A parse failure above aborts the whole pass via `?` — intentional:
         // dirty rows are only cleared after a successful pass, so the next
@@ -148,16 +149,14 @@ pub(super) async fn consolidate_once(
             }
             let (system, user) =
                 build_opinion_reinforcement_prompt(&op.text, op.confidence, &new_facts);
-            let resp = e
-                .llm
-                .complete(&LlmRequest {
-                    system: Some(system),
-                    messages: vec![ChatMessage::user(user)],
-                    json_mode: true,
-                    temperature: Some(0.0),
-                    ..Default::default()
-                })
-                .await?;
+            let request = LlmRequest {
+                system: Some(system),
+                messages: vec![ChatMessage::user(user)],
+                json_mode: true,
+                temperature: Some(0.0),
+                ..Default::default()
+            };
+            let resp = with_retry(e, || llm.complete(&request)).await?;
             if let Some((text, confidence)) =
                 parse_reinforcement(&resp.content.unwrap_or_default())?
             {
@@ -178,7 +177,7 @@ pub(super) async fn consolidate_once(
 
     if !obs_pending.is_empty() {
         let texts: Vec<String> = obs_pending.iter().map(|(_, t)| t.clone()).collect();
-        let embeddings = e.embed.embed(texts).await?;
+        let embeddings = with_retry(e, || embed.embed(texts.clone())).await?;
         for ((id, _), emb) in obs_pending.into_iter().zip(embeddings) {
             e.store.set_observation_embedding(&id, Some(emb))?;
         }

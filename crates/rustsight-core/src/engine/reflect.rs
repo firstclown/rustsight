@@ -1,4 +1,4 @@
-use crate::engine::Engine;
+use crate::engine::{with_retry, Engine};
 use crate::entity::{combined_score, normalize_name, string_similarity};
 use crate::prompts::reflect::{
     build_opinion_extraction_prompt, build_reflect_system, parse_opinions, reflect_tools,
@@ -7,6 +7,7 @@ use crate::traits::{ChatMessage, LlmRequest, LlmResponse, Role, ToolCall};
 use crate::types::*;
 use crate::{Error, Result};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 pub(super) async fn reflect(e: &Engine, bank_id: &str, query: &str) -> Result<ReflectResponse> {
     if query.trim().is_empty() {
@@ -25,19 +26,18 @@ pub(super) async fn reflect(e: &Engine, bank_id: &str, query: &str) -> Result<Re
     let mut answer: Option<String> = None;
     let mut citations: Vec<String> = vec![];
     let mut rounds = 0usize;
+    let llm = Arc::clone(&e.llm);
 
     while rounds < e.config.reflect_max_rounds {
         rounds += 1;
-        let resp = e
-            .llm
-            .complete(&LlmRequest {
-                system: Some(system.clone()),
-                messages: messages.clone(),
-                tools: reflect_tools(),
-                temperature: Some(0.2),
-                ..Default::default()
-            })
-            .await?;
+        let request = LlmRequest {
+            system: Some(system.clone()),
+            messages: messages.clone(),
+            tools: reflect_tools(),
+            temperature: Some(0.2),
+            ..Default::default()
+        };
+        let resp = with_retry(e, || llm.complete(&request)).await?;
 
         if let Some(call) = resp.tool_calls.first().cloned() {
             messages.push(ChatMessage {
@@ -87,11 +87,14 @@ pub(super) async fn reflect(e: &Engine, bank_id: &str, query: &str) -> Result<Re
                         .to_string();
                     let target = normalize_name(&name);
                     let ents = e.store.entities_for_bank(bank_id)?;
-                    let text = ents
-                        .iter()
-                        .find(|en| normalize_name(&en.name) == target)
-                        .map(|en| {
+                    let text = match ents.iter().find(|en| normalize_name(&en.name) == target) {
+                        Some(en) => {
                             let obs = e.store.observations_for_entity(&en.id).unwrap_or_default();
+                            // Only observations actually surfaced to the model
+                            // are citable — never the whole bank.
+                            for o in &obs {
+                                retrieved.insert(o.id.clone());
+                            }
                             if obs.is_empty() {
                                 format!("(no observations for {})", en.name)
                             } else {
@@ -105,11 +108,9 @@ pub(super) async fn reflect(e: &Engine, bank_id: &str, query: &str) -> Result<Re
                                     .collect::<Vec<_>>()
                                     .join("\n")
                             }
-                        })
-                        .unwrap_or_else(|| format!("(unknown entity {name})"));
-                    for o in e.store.observations_for_bank(bank_id)? {
-                        retrieved.insert(o.id.clone());
-                    }
+                        }
+                        None => format!("(unknown entity {name})"),
+                    };
                     messages.push(ChatMessage::tool_result(call.id.clone(), text));
                 }
                 "finish" => {
@@ -173,16 +174,15 @@ pub(super) async fn reflect(e: &Engine, bank_id: &str, query: &str) -> Result<Re
 
 async fn form_opinions(e: &Engine, bank_id: &str, question: &str, answer: &str) -> Result<usize> {
     let (system, user) = build_opinion_extraction_prompt(question, answer);
-    let resp = e
-        .llm
-        .complete(&LlmRequest {
-            system: Some(system),
-            messages: vec![ChatMessage::user(user)],
-            json_mode: true,
-            temperature: Some(0.0),
-            ..Default::default()
-        })
-        .await?;
+    let llm = Arc::clone(&e.llm);
+    let request = LlmRequest {
+        system: Some(system),
+        messages: vec![ChatMessage::user(user)],
+        json_mode: true,
+        temperature: Some(0.0),
+        ..Default::default()
+    };
+    let resp = with_retry(e, || llm.complete(&request)).await?;
     let parsed = parse_opinions(&resp.content.unwrap_or_default())?;
     if parsed.is_empty() {
         return Ok(0);
@@ -228,8 +228,9 @@ async fn form_opinions(e: &Engine, bank_id: &str, question: &str, answer: &str) 
         }
     }
     if !new_opinions.is_empty() {
+        let embed = Arc::clone(&e.embed);
         let texts: Vec<String> = new_opinions.iter().map(|(t, _, _)| t.clone()).collect();
-        let embeddings = e.embed.embed(texts).await?;
+        let embeddings = with_retry(e, || embed.embed(texts.clone())).await?;
         for ((text, confidence, entity_ids), emb) in new_opinions.into_iter().zip(embeddings) {
             let o = Opinion {
                 id: uuid::Uuid::new_v4().to_string(),

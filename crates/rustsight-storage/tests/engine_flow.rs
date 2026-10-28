@@ -387,6 +387,97 @@ async fn reflect_loop_with_scripted_tools() {
 }
 
 #[tokio::test]
+async fn reflect_citations_limited_to_read_observations() {
+    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let mk_engine = |llm: Arc<dyn LlmProvider>| {
+        Engine::new(
+            store.clone(),
+            llm,
+            Arc::new(MockEmbed::default()),
+            Arc::new(MockRerank),
+            Arc::new(SimpleTokenEstimator),
+            Arc::new(FixedClock::new(1_800_000_000_000)),
+        )
+    };
+    // Seed two entities (2 facts each so consolidation synthesizes for both),
+    // then consolidate to give each entity an observation.
+    let seed = MockLlm::script(vec![
+        facts_resp(&[
+            ("Hana leads the design team.", "Hana"),
+            ("Hana mentors junior designers.", "Hana"),
+            ("Ivan runs the infrastructure group.", "Ivan"),
+            ("Ivan automates deploys.", "Ivan"),
+        ]),
+        LlmResponse {
+            content: Some(
+                r#"{"observations":[{"text":"Leads and mentors.","evidence":[{"fact_index":0,"quote":""}]}]}"#
+                    .into(),
+            ),
+            tool_calls: vec![],
+        },
+        LlmResponse {
+            content: Some(
+                r#"{"observations":[{"text":"Runs infrastructure.","evidence":[{"fact_index":0,"quote":""}]}]}"#
+                    .into(),
+            ),
+            tool_calls: vec![],
+        },
+    ]);
+    let seeder = mk_engine(Arc::new(seed));
+    retain(
+        &seeder,
+        "cl",
+        "Hana leads the design team. Hana mentors junior designers. \
+         Ivan runs the infrastructure group. Ivan automates deploys.",
+    )
+    .await;
+    seeder.consolidate_once("cl", 10).await.unwrap();
+
+    let obs_id_for = |name: &str| {
+        let ent = seeder
+            .store
+            .entities_for_bank("cl")
+            .unwrap()
+            .into_iter()
+            .find(|x| x.name == name)
+            .unwrap_or_else(|| panic!("no entity {name}"))
+            .id;
+        seeder
+            .store
+            .observations_for_entity(&ent)
+            .unwrap()
+            .first()
+            .unwrap_or_else(|| panic!("no observations for {name}"))
+            .id
+            .clone()
+    };
+    let hana_obs = obs_id_for("Hana");
+    let ivan_obs = obs_id_for("Ivan");
+
+    // reflect reads only Hana's observations, then tries to cite both
+    // Hana's and Ivan's; the never-read one must be filtered out.
+    let script = MockLlm::script(vec![
+        tool_call("1", "read_observation", json!({"entity": "Hana"})),
+        tool_call(
+            "2",
+            "finish",
+            json!({"answer": "Hana leads design.", "citations": [ivan_obs, hana_obs.clone()]}),
+        ),
+        LlmResponse {
+            content: Some(r#"{"opinions":[]}"#.into()),
+            tool_calls: vec![],
+        },
+    ]);
+    let e = mk_engine(Arc::new(script));
+    let resp = e.reflect("cl", "What about Hana?").await.unwrap();
+    assert_eq!(
+        resp.citations,
+        vec![hana_obs],
+        "only observations actually read may be cited: {resp:?}"
+    );
+}
+
+#[tokio::test]
 async fn reflect_forms_and_stores_opinions() {
     let store = SqliteStore::open_in_memory().unwrap();
     let script = MockLlm::script(vec![
@@ -803,6 +894,64 @@ async fn retain_fails_fast_on_permanent_llm_error() {
         matches!(err, Error::LlmStatus { status: 400, .. }),
         "expected typed 400, got: {err:?}"
     );
+}
+
+#[tokio::test]
+async fn reflect_retries_transient_llm_failure() {
+    // No retain first: the reflect loop's first turn is then the first LLM
+    // call, so the single flaky 429 lands on the reflect path (not retain's).
+    let inner = MockLlm::script(vec![
+        tool_call("1", "recall", json!({"query": "anything"})),
+        tool_call("2", "finish", json!({"answer": "Fine."})),
+        LlmResponse {
+            content: Some(r#"{"opinions":[]}"#.into()),
+            tool_calls: vec![],
+        },
+    ]);
+    let e = Engine::new(
+        Arc::new(SqliteStore::open_in_memory().unwrap()),
+        Arc::new(FlakyLlm::new(Arc::new(inner), 1, 429)),
+        Arc::new(MockEmbed::default()),
+        Arc::new(MockRerank),
+        Arc::new(SimpleTokenEstimator),
+        Arc::new(FixedClock::new(1_800_000_000_000)),
+    )
+    .with_config(EngineConfig {
+        retry_max_attempts: 3,
+        retry_base_delay_ms: 1,
+        ..Default::default()
+    });
+    let resp = e.reflect("rtr", "How are things?").await.unwrap();
+    assert_eq!(resp.answer, "Fine.");
+}
+
+#[tokio::test]
+async fn reflect_retries_transient_recall_embed_failure() {
+    // Same shape, but the flaky failure lands on recall's query-embed call
+    // triggered by the reflect loop's `recall` tool turn.
+    let inner = MockLlm::script(vec![
+        tool_call("1", "recall", json!({"query": "anything"})),
+        tool_call("2", "finish", json!({"answer": "Fine."})),
+        LlmResponse {
+            content: Some(r#"{"opinions":[]}"#.into()),
+            tool_calls: vec![],
+        },
+    ]);
+    let e = Engine::new(
+        Arc::new(SqliteStore::open_in_memory().unwrap()),
+        Arc::new(inner),
+        Arc::new(FlakyEmbed::new(Arc::new(MockEmbed::default()), 1, 429)),
+        Arc::new(MockRerank),
+        Arc::new(SimpleTokenEstimator),
+        Arc::new(FixedClock::new(1_800_000_000_000)),
+    )
+    .with_config(EngineConfig {
+        retry_max_attempts: 3,
+        retry_base_delay_ms: 1,
+        ..Default::default()
+    });
+    let resp = e.reflect("rte", "How are things?").await.unwrap();
+    assert_eq!(resp.answer, "Fine.");
 }
 
 #[tokio::test]
