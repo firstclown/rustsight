@@ -923,3 +923,69 @@ async fn retain_parses_upstream_shaped_extraction_response() {
     assert_eq!(causal[0].b_id, joined.id);
     assert_eq!(causal[0].label.as_deref(), Some("caused_by"));
 }
+
+/// CR-4: an LLM that stalls mid-consolidation must hit the
+/// `consolidate_timeout_secs` wall instead of holding the single-flight
+/// consolidation lock forever. Delegates the first `stall_after` calls to
+/// the demo mock, then never resolves on every later call.
+struct StallAfterCallsLlm {
+    inner: MockLlm,
+    stall_after: usize,
+    calls: std::sync::Mutex<usize>,
+}
+
+#[async_trait]
+impl LlmProvider for StallAfterCallsLlm {
+    async fn complete(&self, req: &LlmRequest) -> Result<LlmResponse> {
+        let call = {
+            let mut c = self.calls.lock().unwrap();
+            *c += 1;
+            *c
+        };
+        if call > self.stall_after {
+            std::future::pending::<()>().await;
+            unreachable!("stalled LLM call must be cancelled by the consolidation timeout");
+        }
+        self.inner.complete(req).await
+    }
+}
+
+#[tokio::test]
+async fn consolidation_pass_is_bounded_by_timeout() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let llm = Arc::new(StallAfterCallsLlm {
+        inner: MockLlm::demo(),
+        // call 1 = retain extraction; call 2 = consolidation observation
+        // synthesis, which must stall into the timeout
+        stall_after: 1,
+        calls: std::sync::Mutex::new(0),
+    });
+    let e = Engine::new(
+        Arc::new(store),
+        llm,
+        Arc::new(MockEmbed::default()),
+        Arc::new(NoopRerank),
+        Arc::new(SimpleTokenEstimator),
+        Arc::new(FixedClock::new(1_800_000_000_000)),
+    )
+    .with_config(EngineConfig {
+        consolidate_timeout_secs: 1,
+        ..Default::default()
+    });
+    retain(
+        &e,
+        "t",
+        "Alice joined Google. Alice works on search infrastructure.",
+    )
+    .await;
+
+    let err = e.consolidate_once("t", 10).await.unwrap_err();
+    assert!(err.to_string().contains("timed out"), "{err:?}");
+
+    // dirty rows survive the aborted pass so the next tick retries them
+    let dirty = e.store.list_dirty_entities("t", 10).unwrap();
+    assert!(
+        !dirty.is_empty(),
+        "aborted pass must leave dirty rows intact: {dirty:?}"
+    );
+}

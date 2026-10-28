@@ -618,8 +618,9 @@ pub const REFLECT_FINAL_LANGUAGE_RULE: &str = r#"## LANGUAGE
 - If a directive above specifies a response language, follow the directive — it takes precedence over this default."#;
 
 /// Upstream `reflect` prompt text block.
-pub const REFLECT_DEFAULT_ROLE: &str = r#"You are a reflection agent that answers questions by reasoning over retrieved memories."#;
+pub const REFLECT_DEFAULT_ROLE: &str =
+    r#"You are a reflection agent that answers questions by reasoning over retrieved memories."#;
 
 /// Upstream `reflect` prompt text block.
-pub const REFLECT_DEFAULT_FINAL_ROLE: &str = r#"You are a thoughtful assistant that synthesizes answers from retrieved memories."#;
-
+pub const REFLECT_DEFAULT_FINAL_ROLE: &str =
+    r#"You are a thoughtful assistant that synthesizes answers from retrieved memories."#;

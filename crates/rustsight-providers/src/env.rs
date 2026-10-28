@@ -2,6 +2,19 @@ use crate::mock::{MockEmbed, MockLlm, MockRerank};
 use crate::openai::{ApiRerank, NoopRerank, OpenAiCompat, OpenAiEmbed};
 use rustsight_core::traits::{EmbedProvider, LlmProvider, RerankProvider};
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Shared HTTP client for all provider calls. Bounded connect + total
+/// timeouts so a stalled provider connection can never hang retain/recall
+/// — or hold the single-flight consolidation lock — forever. One client
+/// across LLM/embed/rerank also gives a shared connection pool.
+fn http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(|e| format!("http client: {e}"))
+}
 
 /// Default HuggingFace repo for CPU runs of the local reranker: an int8
 /// dynamic-quant export of bge-reranker-v2-m3 in a single ~544 MB
@@ -200,14 +213,15 @@ pub type Providers = (
 /// the paper attributes a significant share of its benchmark lead to
 /// cross-encoder reranking (RS-4).
 pub async fn build_providers(env: &ProviderEnv) -> Result<Providers, String> {
+    let client = http_client()?;
     let llm = Arc::new(OpenAiCompat {
-        client: reqwest::Client::new(),
+        client: client.clone(),
         base_url: env.llm_base_url.clone(),
         api_key: env.llm_api_key.clone(),
         model: env.llm_model.clone(),
     });
     let embed = Arc::new(OpenAiEmbed {
-        client: reqwest::Client::new(),
+        client: client.clone(),
         base_url: env.embed_base_url.clone(),
         api_key: env.embed_api_key.clone(),
         model: env.embed_model.clone(),
@@ -215,10 +229,10 @@ pub async fn build_providers(env: &ProviderEnv) -> Result<Providers, String> {
     });
     let rerank: Arc<dyn RerankProvider> = match env.rerank_mode {
         RerankMode::Off => Arc::new(NoopRerank),
-        RerankMode::Api => api_rerank(env)?,
+        RerankMode::Api => api_rerank(env, &client)?,
         RerankMode::Local => local_rerank(env).await?,
         RerankMode::Auto => match (&env.rerank_url, &env.rerank_model_path) {
-            (Some(_), _) => api_rerank(env)?,
+            (Some(_), _) => api_rerank(env, &client)?,
             (None, Some(_)) => local_rerank(env).await?,
             (None, None) => {
                 warn_no_reranker();
@@ -229,13 +243,16 @@ pub async fn build_providers(env: &ProviderEnv) -> Result<Providers, String> {
     Ok((llm, embed, rerank))
 }
 
-fn api_rerank(env: &ProviderEnv) -> Result<Arc<dyn RerankProvider>, String> {
+fn api_rerank(
+    env: &ProviderEnv,
+    client: &reqwest::Client,
+) -> Result<Arc<dyn RerankProvider>, String> {
     let url = env.rerank_url.clone().ok_or(
         "RUSTSIGHT_RERANK=api but RUSTSIGHT_RERANK_URL is not set (an HTTP /rerank \
          endpoint, Jina/Cohere-shaped)",
     )?;
     Ok(Arc::new(ApiRerank {
-        client: reqwest::Client::new(),
+        client: client.clone(),
         url,
         api_key: env.rerank_api_key.clone(),
         model: env.rerank_model.clone(),

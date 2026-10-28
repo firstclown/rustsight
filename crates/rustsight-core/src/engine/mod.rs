@@ -8,7 +8,7 @@ mod retain;
 use crate::prompts::extraction::ExtractionConfig;
 use crate::traits::{Clock, EmbedProvider, LlmProvider, RerankProvider, TokenEstimator};
 use crate::types::*;
-use crate::{MemoryStore, ResolverConfig, Result};
+use crate::{Error, MemoryStore, ResolverConfig, Result};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
@@ -36,6 +36,12 @@ pub struct EngineConfig {
     pub retry_max_attempts: usize,
     /// Backoff base for retries; attempt N waits `base * 2^(N-1)` ms.
     pub retry_base_delay_ms: u64,
+    /// Hard wall (seconds) for one consolidation pass. A stalled provider
+    /// call inside a pass would otherwise hold the single-flight
+    /// consolidation lock forever, wedging background consolidation for
+    /// every bank. Timed-out passes abort with an error; dirty rows
+    /// survive (cleared only after success) and are retried next tick.
+    pub consolidate_timeout_secs: u64,
 }
 
 impl Default for EngineConfig {
@@ -54,6 +60,7 @@ impl Default for EngineConfig {
             chunk_overlap_tokens: 200,
             retry_max_attempts: 3,
             retry_base_delay_ms: 400,
+            consolidate_timeout_secs: 600,
         }
     }
 }
@@ -120,9 +127,23 @@ impl Engine {
     /// double-processing the same dirty entities. Dirty rows are only cleared
     /// at the end of a successful pass, so a caller that arrives after a
     /// completed pass simply finds an empty queue and returns `0`.
+    ///
+    /// The pass itself is bounded by `consolidate_timeout_secs`; a timed-out
+    /// pass drops its in-flight work (dirty rows survive, retried next tick)
+    /// so a wedged provider can never hold the single-flight lock forever.
     pub async fn consolidate_once(&self, bank_id: &str, max_entities: usize) -> Result<usize> {
         let _guard = self.consolidate_lock.lock().await;
-        consolidate::consolidate_once(self, bank_id, max_entities).await
+        let pass = tokio::time::timeout(
+            Duration::from_secs(self.config.consolidate_timeout_secs.max(1)),
+            consolidate::consolidate_once(self, bank_id, max_entities),
+        );
+        match pass.await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(Error::Llm(format!(
+                "consolidation pass for bank {bank_id} timed out after {}s",
+                self.config.consolidate_timeout_secs
+            ))),
+        }
     }
 
     /// Wake the background worker without blocking (used by `retain`).

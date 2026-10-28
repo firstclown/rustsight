@@ -28,6 +28,7 @@ use rustsight_core::{Error, Result};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 use tokenizers::{Tokenizer, TruncationParams, TruncationStrategy};
 
 /// How to locate the ONNX model + tokenizer for [`OrtRerank`].
@@ -525,13 +526,25 @@ fn hf_token() -> Option<String> {
     std::env::var("HF_TOKEN").ok().filter(|t| !t.is_empty())
 }
 
+/// HuggingFace HTTP client with a bounded connect timeout and a per-read
+/// `read_timeout` (each byte gap, not the transfer total) so stalled
+/// requests fail instead of hanging provider setup or the download loop.
+fn hf_client(read_timeout: Duration) -> std::result::Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .read_timeout(read_timeout)
+        .build()
+        .map_err(|e| format!("http client: {e}"))
+}
+
 async fn hf_file_exists(
     repo: &str,
     file: &str,
     token: Option<&str>,
 ) -> std::result::Result<bool, String> {
     let url = format!("https://huggingface.co/{repo}/resolve/main/{file}");
-    let client = reqwest::Client::new();
+    // Bounded so an unreachable HuggingFace can't wedge provider setup.
+    let client = hf_client(Duration::from_secs(30))?;
     let mut req = client.head(&url);
     if let Some(token) = token {
         req = req.bearer_auth(token);
@@ -567,7 +580,10 @@ async fn download_hf_file(
     }
     let url = format!("https://huggingface.co/{repo}/resolve/main/{file}");
     eprintln!("rustsight: downloading {url} -> {}", dest.display());
-    let client = reqwest::Client::new();
+    // No total timeout (multi-GB models on slow links are legitimate), but a
+    // bounded connect + per-read timeout so a stalled transfer fails instead
+    // of hanging forever.
+    let client = hf_client(Duration::from_secs(120))?;
     let mut req = client.get(&url);
     if let Some(token) = hf_token {
         req = req.bearer_auth(token);
