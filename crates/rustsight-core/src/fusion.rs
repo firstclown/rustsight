@@ -59,7 +59,7 @@ pub fn apply_token_budget(
     for it in items {
         let cost = est.count(&it.text) + 4;
         if used + cost > budget {
-            break;
+            continue;
         }
         used += cost;
         out.push(it);
@@ -108,11 +108,25 @@ mod tests {
     fn budget_cuts_greedily() {
         let items = vec![mem("a", &"x".repeat(400)), mem("b", &"y".repeat(20))];
         let out = apply_token_budget(items, 50, &Div4);
-        assert!(out.is_empty() || out[0].id == "b");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "b");
         let items2 = vec![mem("a", &"y".repeat(20)), mem("b", &"x".repeat(400))];
         let out2 = apply_token_budget(items2, 50, &Div4);
         assert_eq!(out2.len(), 1);
         assert_eq!(out2[0].id, "a");
+    }
+
+    #[test]
+    fn budget_skips_oversized_and_fills() {
+        let items = vec![
+            mem("a", &"x".repeat(400)),
+            mem("b", &"y".repeat(20)),
+            mem("c", &"z".repeat(400)),
+            mem("d", &"w".repeat(20)),
+        ];
+        let out = apply_token_budget(items, 50, &Div4);
+        let ids: Vec<&str> = out.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "d"]);
     }
 
     #[test]

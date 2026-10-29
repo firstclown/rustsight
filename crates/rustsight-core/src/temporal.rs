@@ -30,23 +30,29 @@ fn month_index(name: &str) -> Option<u32> {
     None
 }
 
-fn parse_date(s: &str) -> Option<NaiveDate> {
-    let s = s
+fn parse_date(s: &str, today: &NaiveDate, explicit_year: Option<i32>) -> Option<NaiveDate> {
+    let first = s
         .split_whitespace()
         .next()
         .unwrap_or(s)
         .trim_matches(|c: char| !c.is_alphanumeric() && c != '-');
-    if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+    if let Ok(d) = NaiveDate::parse_from_str(first, "%Y-%m-%d") {
         return Some(d);
     }
-    if let Ok(d) = NaiveDate::parse_from_str(s, "%Y/%m/%d") {
+    if let Ok(d) = NaiveDate::parse_from_str(first, "%Y/%m/%d") {
         return Some(d);
     }
     let parts: Vec<&str> = s.split_whitespace().collect();
-    if parts.len() == 2 {
-        if let Some(m) = month_index(parts[0]) {
+    if parts.len() >= 2 {
+        if let Some(m) = month_index(parts[0].trim_matches(|c: char| !c.is_alphanumeric())) {
             let day: u32 = parts[1].trim_end_matches(',').parse().ok()?;
-            let year = 1970;
+            let year = explicit_year.unwrap_or_else(|| {
+                let mut y = today.year();
+                if m > today.month() {
+                    y -= 1;
+                }
+                y
+            });
             return NaiveDate::from_ymd_opt(year, m, day);
         }
     }
@@ -70,12 +76,13 @@ pub fn parse_window(query: &str, now_ms: i64) -> Option<(i64, i64)> {
     let today = now.date_naive();
     let ql = query.to_lowercase();
     let tokens: Vec<&str> = ql.split_whitespace().collect();
+    let explicit_year = find_year(&tokens);
 
     if let Some(pos) = ql.find("between") {
         let rest = &ql[pos + "between".len()..];
         if let Some(mid) = rest.find(" and ") {
-            let a = parse_date(rest[..mid].trim());
-            let b = parse_date(rest[mid + 5..].trim());
+            let a = parse_date(rest[..mid].trim(), &today, explicit_year);
+            let b = parse_date(rest[mid + 5..].trim(), &today, explicit_year);
             if let (Some(a), Some(b)) = (a, b) {
                 let (s, e) = if a <= b { (a, b) } else { (b, a) };
                 return Some((date_ms(s), date_ms(e + Duration::days(1))));
@@ -85,7 +92,7 @@ pub fn parse_window(query: &str, now_ms: i64) -> Option<(i64, i64)> {
 
     if let Some(pos) = ql.find("since ") {
         let rest = ql[pos + 6..].trim();
-        if let Some(d) = parse_date(rest) {
+        if let Some(d) = parse_date(rest, &today, explicit_year) {
             return Some((date_ms(d), now_ms));
         }
         if let Ok(y) = rest.trim().parse::<i32>() {
@@ -229,5 +236,55 @@ mod tests {
             chrono::DateTime::from_timestamp_millis(s).unwrap().year(),
             2024
         );
+    }
+
+    #[test]
+    fn between_month_day_defaults_to_recent_year() {
+        let (s, e) = parse_window("between March 5 and April 10 anything?", now()).unwrap();
+        let start = chrono::DateTime::from_timestamp_millis(s)
+            .unwrap()
+            .date_naive();
+        let end = chrono::DateTime::from_timestamp_millis(e)
+            .unwrap()
+            .date_naive();
+        assert_eq!(start, chrono::NaiveDate::from_ymd_opt(2026, 3, 5).unwrap());
+        assert_eq!(end, chrono::NaiveDate::from_ymd_opt(2026, 4, 11).unwrap());
+    }
+
+    #[test]
+    fn between_month_day_spans_year_boundary() {
+        let (s, e) = parse_window("between December 5 and January 10", now()).unwrap();
+        let start = chrono::DateTime::from_timestamp_millis(s)
+            .unwrap()
+            .date_naive();
+        let end = chrono::DateTime::from_timestamp_millis(e)
+            .unwrap()
+            .date_naive();
+        assert_eq!(start, chrono::NaiveDate::from_ymd_opt(2025, 12, 5).unwrap());
+        assert_eq!(end, chrono::NaiveDate::from_ymd_opt(2026, 1, 11).unwrap());
+    }
+
+    #[test]
+    fn between_month_day_honors_explicit_year() {
+        let (s, e) = parse_window("between March 5 2024 and April 10 2024", now()).unwrap();
+        let start = chrono::DateTime::from_timestamp_millis(s)
+            .unwrap()
+            .date_naive();
+        let end = chrono::DateTime::from_timestamp_millis(e)
+            .unwrap()
+            .date_naive();
+        assert_eq!(start, chrono::NaiveDate::from_ymd_opt(2024, 3, 5).unwrap());
+        assert_eq!(end, chrono::NaiveDate::from_ymd_opt(2024, 4, 11).unwrap());
+    }
+
+    #[test]
+    fn since_month_day_uses_recent_year() {
+        let n = now();
+        let (s, e) = parse_window("everything since March 5", n).unwrap();
+        let start = chrono::DateTime::from_timestamp_millis(s)
+            .unwrap()
+            .date_naive();
+        assert_eq!(start, chrono::NaiveDate::from_ymd_opt(2026, 3, 5).unwrap());
+        assert_eq!(e, n);
     }
 }

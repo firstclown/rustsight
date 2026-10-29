@@ -112,7 +112,8 @@ fn default_db() -> PathBuf {
 }
 
 async fn build_engine(db: &PathBuf, mock: bool) -> Arc<Engine> {
-    let store = SqliteStore::open(db).unwrap_or_else(|e| {
+    let clock = Arc::new(SystemClock);
+    let store = SqliteStore::open_with_clock(db, clock.clone()).unwrap_or_else(|e| {
         eprintln!("failed to open database {}: {e}", db.display());
         std::process::exit(1);
     });
@@ -143,7 +144,7 @@ async fn build_engine(db: &PathBuf, mock: bool) -> Arc<Engine> {
         embed,
         rerank,
         Arc::new(SimpleTokenEstimator),
-        Arc::new(SystemClock),
+        clock,
     ))
 }
 

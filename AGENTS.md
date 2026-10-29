@@ -15,7 +15,7 @@ for a desktop harness. From-scratch Rust reimplementation of the architecture in
 ```bash
 cargo build                              # debug build (workspace)
 cargo build --release                    # release build (thin LTO); binary at target/release/rustsight
-cargo test                               # all 85 tests; fully offline, mock providers, no API key needed
+cargo test                               # all 121 tests; fully offline, mock providers, no API key needed
 cargo test -p rustsight-storage --test engine_flow   # just the end-to-end integration suite
 cargo test -p rustsight-core --test upstream_prompt_parity   # upstream prompt parity suite (35 cases)
 cargo fmt --check                        # formatting check (must pass; no rustfmt.toml, defaults only)
@@ -62,7 +62,7 @@ Every change is complete only when **all** of the following pass locally:
      `crates/rustsight-core/src/fusion.rs`, `temporal.rs`, `prompts/*.rs`).
    - Engine-level/integration tests go in
      `crates/rustsight-storage/tests/engine_flow.rs` (in-memory SQLite +
-     scripted mocks; 16 tests there today).
+     scripted mocks; 25 tests there today).
 4. Docs touched where relevant: README sections for user-facing behavior/env
    vars, `NEXT_STEPS.md` checkboxes if a ticket's scope changed.
 5. No secrets/API keys committed; `.gitignore` already covers `*.db*`.

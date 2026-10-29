@@ -84,7 +84,14 @@ fn http_err(e: Error) -> (StatusCode, String) {
         Error::BadInput(_) | Error::Parse(_) => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    (status, e.to_string())
+    let body = match &e {
+        Error::NotFound(_) | Error::BadInput(_) | Error::Parse(_) => e.to_string(),
+        _ => {
+            eprintln!("rustsight http: internal error: {e}");
+            "internal error".to_string()
+        }
+    };
+    (status, body)
 }
 
 async fn healthz() -> Json<serde_json::Value> {
@@ -379,5 +386,33 @@ mod tests {
         let r = test_router(ApiAuth::None);
         let resp = get(r, "/banks", None).await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn http_err_hides_internal_detail() {
+        let (status, body) = http_err(Error::Store("no such table: memories".into()));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, "internal error");
+        let (status, body) = http_err(Error::Llm("upstream said secret-token".into()));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, "internal error");
+        let (status, _) = http_err(Error::LlmStatus {
+            status: 429,
+            message: "rate limited".into(),
+        });
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn http_err_keeps_caller_facing_messages() {
+        let (status, body) = http_err(Error::NotFound("bank demo".into()));
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body, "not found: bank demo");
+        let (status, body) = http_err(Error::BadInput("empty query".into()));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, "invalid input: empty query");
+        let (status, body) = http_err(Error::Parse("bad json".into()));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, "parse error: bad json");
     }
 }

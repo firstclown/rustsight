@@ -213,6 +213,8 @@ MCP (stdio)
 -----------
     rustsight mcp --bank demo
     tools: retain(bank_id?, content), recall(bank_id?, query), reflect(bank_id?, query)
+    JSON-RPC over newline-delimited stdin; malformed lines get a -32700
+    parse error, lines over 10 MiB a -32600 and are discarded
 
 Roadmap
 -------

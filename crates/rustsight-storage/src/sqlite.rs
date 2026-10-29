@@ -1,6 +1,6 @@
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 use rustsight_core::types::*;
-use rustsight_core::{Error, MemoryStore, Result};
+use rustsight_core::{Clock, Error, MemoryStore, Result, SystemClock};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -11,6 +11,7 @@ fn store_err(e: rusqlite::Error) -> Error {
 
 pub struct SqliteStore {
     conn: Arc<Mutex<Connection>>,
+    clock: Arc<dyn Clock>,
 }
 
 const SCHEMA: &str = r#"
@@ -142,7 +143,7 @@ fn placeholders(n: usize) -> String {
 }
 
 impl SqliteStore {
-    fn init(conn: Connection) -> Result<Self> {
+    fn init(conn: Connection, clock: Arc<dyn Clock>) -> Result<Self> {
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(store_err)?;
         conn.pragma_update(None, "synchronous", "NORMAL")
@@ -152,10 +153,15 @@ impl SqliteStore {
         conn.execute_batch(SCHEMA).map_err(store_err)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            clock,
         })
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_clock(path, Arc::new(SystemClock))
+    }
+
+    pub fn open_with_clock(path: impl AsRef<Path>, clock: Arc<dyn Clock>) -> Result<Self> {
         if let Some(parent) = path.as_ref().parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)
@@ -163,12 +169,24 @@ impl SqliteStore {
             }
         }
         let conn = Connection::open(path).map_err(store_err)?;
-        Self::init(conn)
+        Self::init(conn, clock)
     }
 
     pub fn open_in_memory() -> Result<Self> {
+        Self::open_in_memory_with_clock(Arc::new(SystemClock))
+    }
+
+    pub fn open_in_memory_with_clock(clock: Arc<dyn Clock>) -> Result<Self> {
         let conn = Connection::open_in_memory().map_err(store_err)?;
-        Self::init(conn)
+        Self::init(conn, clock)
+    }
+
+    /// Deliberate poisoning-recovery policy: SQLite's real state lives in the
+    /// database file, not in the guard, so a panic mid-query leaves the
+    /// `Connection` usable and we take the lock anyway instead of failing
+    /// every subsequent store call.
+    fn lock_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     fn row_memory(r: &Row) -> rusqlite::Result<Memory> {
@@ -219,11 +237,8 @@ impl SqliteStore {
 
 impl MemoryStore for SqliteStore {
     fn ensure_bank(&self, bank: &Bank) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
+        let conn = self.lock_conn();
+        let now = self.clock.now_ms();
         conn.execute(
             "INSERT OR IGNORE INTO banks(id, mission, directives, background, skepticism, literalism, empathy, bias_strength, created_at_ms, updated_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
@@ -244,7 +259,7 @@ impl MemoryStore for SqliteStore {
     }
 
     fn get_bank(&self, bank_id: &str) -> Result<Option<Bank>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.query_row(
             "SELECT id, mission, directives, background, skepticism, literalism, empathy, bias_strength FROM banks WHERE id = ?1",
             params![bank_id],
@@ -268,7 +283,7 @@ impl MemoryStore for SqliteStore {
     }
 
     fn update_bank(&self, bank: &Bank) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.execute(
             "UPDATE banks SET mission=?2, directives=?3, background=?4, skepticism=?5, literalism=?6, empathy=?7, bias_strength=?8, updated_at_ms=?9 WHERE id=?1",
             params![
@@ -280,7 +295,7 @@ impl MemoryStore for SqliteStore {
                 bank.disposition.literalism,
                 bank.disposition.empathy,
                 bank.disposition.bias_strength,
-                chrono_now_ms()
+                self.clock.now_ms()
             ],
         )
         .map_err(store_err)?;
@@ -288,7 +303,7 @@ impl MemoryStore for SqliteStore {
     }
 
     fn list_banks(&self) -> Result<Vec<Bank>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut stmt = conn
             .prepare("SELECT id, mission, directives, background, skepticism, literalism, empathy, bias_strength FROM banks ORDER BY id")
             .map_err(store_err)?;
@@ -316,8 +331,8 @@ impl MemoryStore for SqliteStore {
     }
 
     fn insert_memories(&self, bank_id: &str, items: &[NewMemoryRecord]) -> Result<Vec<Memory>> {
-        let mut conn = self.conn.lock().unwrap();
-        let now = chrono_now_ms();
+        let mut conn = self.lock_conn();
+        let now = self.clock.now_ms();
         let mut out = vec![];
         let tx = conn.transaction().map_err(store_err)?;
         for item in items {
@@ -364,7 +379,7 @@ impl MemoryStore for SqliteStore {
     }
 
     fn get_memory(&self, id: &MemoryId) -> Result<Option<Memory>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.query_row(
             "SELECT id, bank_id, kind, text, confidence, occurred_start_ms, occurred_end_ms, mentioned_at_ms, source, context FROM memories WHERE id = ?1",
             params![id],
@@ -375,7 +390,7 @@ impl MemoryStore for SqliteStore {
     }
 
     fn recent_memories(&self, bank_id: &str, limit: usize) -> Result<Vec<Memory>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut stmt = conn
             .prepare(
                 "SELECT id, bank_id, kind, text, confidence, occurred_start_ms, occurred_end_ms, mentioned_at_ms, source, context FROM memories WHERE bank_id=?1 ORDER BY mentioned_at_ms DESC, id LIMIT ?2",
@@ -392,7 +407,7 @@ impl MemoryStore for SqliteStore {
     }
 
     fn list_memories(&self, bank_id: &str, limit: usize) -> Result<Vec<Memory>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut stmt = conn
             .prepare(
                 "SELECT id, bank_id, kind, text, confidence, occurred_start_ms, occurred_end_ms, mentioned_at_ms, source, context FROM memories WHERE bank_id=?1 ORDER BY created_at_ms DESC, id LIMIT ?2",
@@ -409,7 +424,7 @@ impl MemoryStore for SqliteStore {
     }
 
     fn all_embeddings(&self, bank_id: &str) -> Result<Vec<(MemoryId, MemoryKind, Vec<f32>)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut out = vec![];
         let mut stmt = conn
             .prepare("SELECT id, kind, embedding FROM memories WHERE bank_id=?1 AND embedding IS NOT NULL")
@@ -480,7 +495,7 @@ impl MemoryStore for SqliteStore {
         if query.is_empty() {
             return Ok(vec![]);
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut stmt = conn
             .prepare(
                 "SELECT ref_id, kind, bm25(texts_fts) AS b FROM texts_fts WHERE texts_fts MATCH ?1 AND bank_id = ?2 ORDER BY b LIMIT ?3",
@@ -512,7 +527,7 @@ impl MemoryStore for SqliteStore {
         end_ms: i64,
         limit: usize,
     ) -> Result<Vec<Memory>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut stmt = conn
             .prepare(
                 "SELECT id, bank_id, kind, text, confidence, occurred_start_ms, occurred_end_ms, mentioned_at_ms, source, context FROM memories
@@ -536,7 +551,7 @@ impl MemoryStore for SqliteStore {
         if ids.is_empty() {
             return Ok(vec![]);
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut map: HashMap<String, MemoryRef> = HashMap::new();
         for chunk in ids.chunks(400) {
             let ph = placeholders(chunk.len());
@@ -657,7 +672,7 @@ impl MemoryStore for SqliteStore {
         if seeds.is_empty() {
             return Ok(vec![]);
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut visited: HashSet<String> = seeds.iter().cloned().collect();
         let mut frontier: Vec<String> = seeds.to_vec();
         for _ in 0..hops {
@@ -698,9 +713,9 @@ impl MemoryStore for SqliteStore {
     }
 
     fn create_entity(&self, e: &NewEntity) -> Result<Entity> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let id = uuid::Uuid::new_v4().to_string();
-        let now = chrono_now_ms();
+        let now = self.clock.now_ms();
         conn.execute(
             "INSERT INTO entities(id, bank_id, name, etype, last_mentioned_ms, created_at_ms) VALUES (?1,?2,?3,?4,?5,?5)",
             params![id, e.bank_id, e.name, e.etype.as_str(), now],
@@ -721,7 +736,7 @@ impl MemoryStore for SqliteStore {
     }
 
     fn get_entity(&self, id: &str) -> Result<Option<Entity>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.query_row(
             "SELECT id, bank_id, name, etype, last_mentioned_ms FROM entities WHERE id = ?1",
             params![id],
@@ -732,7 +747,7 @@ impl MemoryStore for SqliteStore {
     }
 
     fn find_by_alias(&self, bank_id: &str, alias: &str) -> Result<Option<Entity>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.query_row(
             "SELECT e.id, e.bank_id, e.name, e.etype, e.last_mentioned_ms FROM entity_aliases a JOIN entities e ON e.id = a.entity_id WHERE a.bank_id = ?1 AND a.alias = ?2",
             params![bank_id, alias],
@@ -743,7 +758,7 @@ impl MemoryStore for SqliteStore {
     }
 
     fn entities_for_bank(&self, bank_id: &str) -> Result<Vec<Entity>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut stmt = conn
             .prepare("SELECT id, bank_id, name, etype, last_mentioned_ms FROM entities WHERE bank_id=?1 ORDER BY name")
             .map_err(store_err)?;
@@ -758,7 +773,7 @@ impl MemoryStore for SqliteStore {
     }
 
     fn add_alias(&self, bank_id: &str, alias: &str, entity_id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.execute(
             "INSERT OR IGNORE INTO entity_aliases(bank_id, alias, entity_id) VALUES (?1, ?2, ?3)",
             params![bank_id, alias, entity_id],
@@ -768,8 +783,8 @@ impl MemoryStore for SqliteStore {
     }
 
     fn link_memory_entities(&self, memory_id: &MemoryId, links: &[(String, String)]) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
-        let now = chrono_now_ms();
+        let mut conn = self.lock_conn();
+        let now = self.clock.now_ms();
         let tx = conn.transaction().map_err(store_err)?;
         for (entity_id, mention) in links {
             tx.execute(
@@ -787,7 +802,7 @@ impl MemoryStore for SqliteStore {
     }
 
     fn memory_entity_ids(&self, memory_id: &MemoryId) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut stmt = conn
             .prepare("SELECT entity_id FROM memory_entities WHERE memory_id = ?1")
             .map_err(store_err)?;
@@ -802,7 +817,7 @@ impl MemoryStore for SqliteStore {
     }
 
     fn coentities(&self, entity_id: &str, limit: usize) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut stmt = conn
             .prepare(
                 "SELECT DISTINCT me2.entity_id FROM memory_entities me1 JOIN memory_entities me2 ON me1.memory_id = me2.memory_id WHERE me1.entity_id = ?1 AND me2.entity_id != ?1 LIMIT ?2",
@@ -827,7 +842,7 @@ impl MemoryStore for SqliteStore {
         if entity_ids.is_empty() {
             return Ok(out);
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         for chunk in entity_ids.chunks(400) {
             let ph = placeholders(chunk.len());
             let sql = format!(
@@ -856,7 +871,7 @@ impl MemoryStore for SqliteStore {
     }
 
     fn facts_for_entity(&self, entity_id: &str, limit: usize) -> Result<Vec<Memory>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut stmt = conn
             .prepare(
                 "SELECT m.id, m.bank_id, m.kind, m.text, m.confidence, m.occurred_start_ms, m.occurred_end_ms, m.mentioned_at_ms, m.source, m.context
@@ -883,7 +898,7 @@ impl MemoryStore for SqliteStore {
         if entity_ids.is_empty() || per_entity_limit == 0 {
             return Ok(out);
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         for chunk in entity_ids.chunks(400) {
             let ph = placeholders(chunk.len());
             // ROW_NUMBER caps each entity's rows at per_entity_limit,
@@ -922,7 +937,7 @@ impl MemoryStore for SqliteStore {
     }
 
     fn add_edges(&self, edges: &[Edge]) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_conn();
         let tx = conn.transaction().map_err(store_err)?;
         for e in edges {
             tx.execute(
@@ -935,7 +950,7 @@ impl MemoryStore for SqliteStore {
     }
 
     fn edges_for_bank(&self, bank_id: &str, limit: usize) -> Result<Vec<Edge>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut stmt = conn
             .prepare(
                 "SELECT bank_id, a_id, b_id, kind, label, weight FROM edges WHERE bank_id = ?1 LIMIT ?2",
@@ -967,8 +982,8 @@ impl MemoryStore for SqliteStore {
         entity_ids: &[String],
         reason: &str,
     ) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
-        let now = chrono_now_ms();
+        let mut conn = self.lock_conn();
+        let now = self.clock.now_ms();
         let tx = conn.transaction().map_err(store_err)?;
         for id in entity_ids {
             tx.execute(
@@ -981,7 +996,7 @@ impl MemoryStore for SqliteStore {
     }
 
     fn list_dirty_entities(&self, bank_id: &str, limit: usize) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut stmt = conn
             .prepare("SELECT entity_id FROM dirty_entities WHERE bank_id = ?1 ORDER BY marked_at_ms LIMIT ?2")
             .map_err(store_err)?;
@@ -996,7 +1011,7 @@ impl MemoryStore for SqliteStore {
     }
 
     fn clear_dirty_entities(&self, bank_id: &str, entity_ids: &[String]) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         for chunk in entity_ids.chunks(400) {
             let ph = placeholders(chunk.len());
             let sql =
@@ -1013,7 +1028,7 @@ impl MemoryStore for SqliteStore {
     }
 
     fn banks_with_dirty(&self) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut stmt = conn
             .prepare("SELECT DISTINCT bank_id FROM dirty_entities ORDER BY bank_id")
             .map_err(store_err)?;
@@ -1028,7 +1043,7 @@ impl MemoryStore for SqliteStore {
     }
 
     fn upsert_observation(&self, o: &Observation) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_conn();
         let tx = conn.transaction().map_err(store_err)?;
         tx.execute(
             "INSERT INTO observations(id, bank_id, entity_id, text, evidence_json, proof_count, history_json, embedding, updated_at_ms, created_at_ms)
@@ -1053,7 +1068,7 @@ impl MemoryStore for SqliteStore {
     }
 
     fn observations_for_entity(&self, entity_id: &str) -> Result<Vec<Observation>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut stmt = conn
             .prepare("SELECT id, bank_id, entity_id, text, evidence_json, proof_count, history_json, embedding, updated_at_ms, created_at_ms FROM observations WHERE entity_id = ?1 ORDER BY updated_at_ms DESC")
             .map_err(store_err)?;
@@ -1068,7 +1083,7 @@ impl MemoryStore for SqliteStore {
     }
 
     fn observations_for_bank(&self, bank_id: &str) -> Result<Vec<Observation>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut stmt = conn
             .prepare("SELECT id, bank_id, entity_id, text, evidence_json, proof_count, history_json, embedding, updated_at_ms, created_at_ms FROM observations WHERE bank_id = ?1 ORDER BY updated_at_ms DESC")
             .map_err(store_err)?;
@@ -1083,7 +1098,7 @@ impl MemoryStore for SqliteStore {
     }
 
     fn set_observation_embedding(&self, id: &str, embedding: Option<Vec<f32>>) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.execute(
             "UPDATE observations SET embedding = ?2 WHERE id = ?1",
             params![id, embedding.as_deref().map(emb_to_blob)],
@@ -1093,7 +1108,7 @@ impl MemoryStore for SqliteStore {
     }
 
     fn upsert_opinion(&self, o: &Opinion) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_conn();
         let tx = conn.transaction().map_err(store_err)?;
         tx.execute(
             "INSERT INTO opinions(id, bank_id, text, confidence, evidence_json, history_json, embedding, created_at_ms, updated_at_ms)
@@ -1124,7 +1139,7 @@ impl MemoryStore for SqliteStore {
     }
 
     fn list_opinions(&self, bank_id: &str) -> Result<Vec<Opinion>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut stmt = conn
             .prepare("SELECT id, bank_id, text, confidence, evidence_json, history_json, embedding, created_at_ms, updated_at_ms FROM opinions WHERE bank_id = ?1 ORDER BY updated_at_ms DESC")
             .map_err(store_err)?;
@@ -1196,7 +1211,7 @@ impl MemoryStore for SqliteStore {
     }
 
     fn upsert_mental_model(&self, m: &MentalModel) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.execute(
             "INSERT INTO mental_models(id, bank_id, question, path, content, last_refreshed_ms, created_at_ms)
              VALUES (?1,?2,?3,?4,?5,?6,?7)
@@ -1208,7 +1223,7 @@ impl MemoryStore for SqliteStore {
     }
 
     fn list_mental_models(&self, bank_id: &str) -> Result<Vec<MentalModel>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut stmt = conn
             .prepare("SELECT id, bank_id, question, path, content, last_refreshed_ms, created_at_ms FROM mental_models WHERE bank_id = ?1 ORDER BY created_at_ms")
             .map_err(store_err)?;
@@ -1233,7 +1248,7 @@ impl MemoryStore for SqliteStore {
     }
 
     fn delete_mental_model(&self, id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.execute("DELETE FROM mental_models WHERE id = ?1", params![id])
             .map_err(store_err)?;
         Ok(())
@@ -1259,19 +1274,41 @@ impl SqliteStore {
     }
 }
 
-fn chrono_now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn store() -> SqliteStore {
         SqliteStore::open_in_memory().unwrap()
+    }
+
+    #[test]
+    fn store_uses_injected_clock_for_write_timestamps() {
+        use rustsight_core::FixedClock;
+        let s = SqliteStore::open_in_memory_with_clock(Arc::new(FixedClock::new(1234))).unwrap();
+        let b = Bank {
+            id: "b1".into(),
+            mission: None,
+            directives: None,
+            background: None,
+            disposition: Disposition::default(),
+        };
+        s.ensure_bank(&b).unwrap();
+        s.insert_memories("b1", &[new_mem("hello", 1234)]).unwrap();
+        let conn = s.lock_conn();
+        let bank_created: i64 = conn
+            .query_row("SELECT created_at_ms FROM banks WHERE id = 'b1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let mem_created: i64 = conn
+            .query_row("SELECT created_at_ms FROM memories LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        drop(conn);
+        assert_eq!(bank_created, 1234);
+        assert_eq!(mem_created, 1234);
     }
 
     fn new_mem(text: &str, t: i64) -> NewMemoryRecord {
