@@ -19,6 +19,8 @@ rustsight-storage = { path = "crates/rustsight-storage" }
 rustsight-providers = { path = "crates/rustsight-providers" }
 rustsight-server = { path = "crates/rustsight-server" }
 async-trait = "0.1"
+# Bounded-concurrency chunk extraction in retain (CR-19)
+futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

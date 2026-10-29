@@ -1,5 +1,6 @@
 use crate::types::*;
 use crate::Result;
+use std::collections::HashMap;
 
 pub trait MemoryStore: Send + Sync {
     fn ensure_bank(&self, bank: &Bank) -> Result<()>;
@@ -43,7 +44,25 @@ pub trait MemoryStore: Send + Sync {
     fn link_memory_entities(&self, memory_id: &MemoryId, links: &[(String, String)]) -> Result<()>;
     fn memory_entity_ids(&self, memory_id: &MemoryId) -> Result<Vec<String>>;
     fn coentities(&self, entity_id: &str, limit: usize) -> Result<Vec<String>>;
+    /// Batched [`MemoryStore::coentities`]: co-occurring entity ids for
+    /// every requested entity in one pass, so a retain resolves fuzzy
+    /// mentions without firing a point query (and taking the connection
+    /// mutex) per candidate. Entities without co-occurrences may be absent
+    /// from the map; look up with `unwrap_or_default` semantics.
+    fn coentities_batch(
+        &self,
+        entity_ids: &[String],
+        limit: usize,
+    ) -> Result<HashMap<String, Vec<String>>>;
     fn facts_for_entity(&self, entity_id: &str, limit: usize) -> Result<Vec<Memory>>;
+    /// Batched [`MemoryStore::facts_for_entity`]: each entity's
+    /// `per_entity_limit` most recently mentioned linked memories, in one
+    /// pass. Within each entity the order matches `facts_for_entity`.
+    fn facts_for_entities(
+        &self,
+        entity_ids: &[String],
+        per_entity_limit: usize,
+    ) -> Result<HashMap<String, Vec<Memory>>>;
 
     fn add_edges(&self, edges: &[Edge]) -> Result<()>;
     fn edges_for_bank(&self, bank_id: &str, limit: usize) -> Result<Vec<Edge>>;

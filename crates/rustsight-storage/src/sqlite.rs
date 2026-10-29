@@ -818,6 +818,43 @@ impl MemoryStore for SqliteStore {
         Ok(out)
     }
 
+    fn coentities_batch(
+        &self,
+        entity_ids: &[String],
+        limit: usize,
+    ) -> Result<HashMap<String, Vec<String>>> {
+        let mut out: HashMap<String, Vec<String>> = HashMap::new();
+        if entity_ids.is_empty() {
+            return Ok(out);
+        }
+        let conn = self.conn.lock().unwrap();
+        for chunk in entity_ids.chunks(400) {
+            let ph = placeholders(chunk.len());
+            let sql = format!(
+                "SELECT DISTINCT me1.entity_id, me2.entity_id FROM memory_entities me1
+                 JOIN memory_entities me2 ON me1.memory_id = me2.memory_id
+                 WHERE me1.entity_id IN ({ph}) AND me2.entity_id != me1.entity_id"
+            );
+            let mut stmt = conn.prepare(&sql).map_err(store_err)?;
+            let rows = stmt
+                .query_map(params_from_iter(chunk.iter()), |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(store_err)?;
+            for r in rows {
+                let (a, b) = r.map_err(store_err)?;
+                // Truncate in Rust: per-entity LIMIT inside the IN-query has
+                // no meaningful ordering to key on (matching the arbitrary
+                // truncation of the per-id variant).
+                let list = out.entry(a).or_default();
+                if list.len() < limit {
+                    list.push(b);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     fn facts_for_entity(&self, entity_id: &str, limit: usize) -> Result<Vec<Memory>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
@@ -833,6 +870,53 @@ impl MemoryStore for SqliteStore {
         let mut out = vec![];
         for r in rows {
             out.push(r.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
+    fn facts_for_entities(
+        &self,
+        entity_ids: &[String],
+        per_entity_limit: usize,
+    ) -> Result<HashMap<String, Vec<Memory>>> {
+        let mut out: HashMap<String, Vec<Memory>> = HashMap::new();
+        if entity_ids.is_empty() || per_entity_limit == 0 {
+            return Ok(out);
+        }
+        let conn = self.conn.lock().unwrap();
+        for chunk in entity_ids.chunks(400) {
+            let ph = placeholders(chunk.len());
+            // ROW_NUMBER caps each entity's rows at per_entity_limit,
+            // reproducing facts_for_entity's per-id
+            // `ORDER BY mentioned_at_ms DESC LIMIT ?` in one query.
+            let sql = format!(
+                "SELECT m.id, m.bank_id, m.kind, m.text, m.confidence, m.occurred_start_ms, m.occurred_end_ms, m.mentioned_at_ms, m.source, m.context, sub.eid
+                 FROM (
+                   SELECT me.entity_id AS eid, me.memory_id AS mid,
+                          ROW_NUMBER() OVER (PARTITION BY me.entity_id ORDER BY m2.mentioned_at_ms DESC) AS rn
+                   FROM memory_entities me JOIN memories m2 ON m2.id = me.memory_id
+                   WHERE me.entity_id IN ({ph})
+                 ) sub
+                 JOIN memories m ON m.id = sub.mid
+                 WHERE sub.rn <= ?
+                 ORDER BY sub.eid, m.mentioned_at_ms DESC"
+            );
+            let mut stmt = conn.prepare(&sql).map_err(store_err)?;
+            // Value mixes TEXT ids and the INTEGER limit in one iterator.
+            let mut bind: Vec<rusqlite::types::Value> = chunk
+                .iter()
+                .map(|id| rusqlite::types::Value::Text(id.clone()))
+                .collect();
+            bind.push(rusqlite::types::Value::Integer(per_entity_limit as i64));
+            let rows = stmt
+                .query_map(params_from_iter(bind), |r| {
+                    Ok((Self::row_memory(r)?, r.get::<_, String>(10)?))
+                })
+                .map_err(store_err)?;
+            for r in rows {
+                let (m, eid) = r.map_err(store_err)?;
+                out.entry(eid).or_default().push(m);
+            }
         }
         Ok(out)
     }
@@ -1639,5 +1723,97 @@ mod tests {
         );
         assert_eq!(by("op2").entity_ids, vec!["e2".to_string()]);
         assert!(by("op3").entity_ids.is_empty());
+    }
+
+    /// CR-14: the batched entity queries return the same results as their
+    /// per-id counterparts on the same fixture.
+    #[test]
+    fn batched_entity_queries_match_per_id() {
+        let s = store();
+        s.ensure_bank(&Bank {
+            id: "b".into(),
+            mission: None,
+            directives: None,
+            background: None,
+            disposition: Disposition::default(),
+        })
+        .unwrap();
+        let alice = s
+            .create_entity(&NewEntity {
+                bank_id: "b".into(),
+                name: "Alice".into(),
+                etype: EntityType::Person,
+            })
+            .unwrap();
+        let bob = s
+            .create_entity(&NewEntity {
+                bank_id: "b".into(),
+                name: "Bob".into(),
+                etype: EntityType::Person,
+            })
+            .unwrap();
+
+        let m0 = s
+            .insert_memories("b", &[new_mem("Alice met Bob", 10)])
+            .unwrap();
+        let m1 = s
+            .insert_memories("b", &[new_mem("Alice fact one", 20)])
+            .unwrap();
+        let m2 = s
+            .insert_memories("b", &[new_mem("Alice fact two", 30)])
+            .unwrap();
+        let m3 = s
+            .insert_memories("b", &[new_mem("Alice fact three", 40)])
+            .unwrap();
+        s.link_memory_entities(
+            &m0[0].id,
+            &[
+                (alice.id.clone(), "Alice".into()),
+                (bob.id.clone(), "Bob".into()),
+            ],
+        )
+        .unwrap();
+        for m in [&m1, &m2, &m3] {
+            s.link_memory_entities(&m[0].id, &[(alice.id.clone(), "Alice".into())])
+                .unwrap();
+        }
+
+        let texts = |v: &[Memory]| v.iter().map(|m| m.text.clone()).collect::<Vec<_>>();
+        let batch = s
+            .facts_for_entities(&[alice.id.clone(), bob.id.clone()], 2)
+            .unwrap();
+        assert_eq!(batch.len(), 2);
+        assert_eq!(
+            texts(&batch[&alice.id]),
+            texts(&s.facts_for_entity(&alice.id, 2).unwrap()),
+            "batch must match the per-id query (newest first, per-entity limit)"
+        );
+        assert_eq!(batch[&alice.id][0].text, "Alice fact three");
+        assert_eq!(batch[&alice.id][1].text, "Alice fact two");
+        assert_eq!(
+            texts(&batch[&bob.id]),
+            vec!["Alice met Bob".to_string()],
+            "bob only co-occurs via m0"
+        );
+
+        let co = s
+            .coentities_batch(&[alice.id.clone(), bob.id.clone()], 50)
+            .unwrap();
+        assert_eq!(co[&alice.id], s.coentities(&alice.id, 50).unwrap());
+        assert_eq!(co[&bob.id], s.coentities(&bob.id, 50).unwrap());
+        assert_eq!(co[&alice.id], vec![bob.id.clone()]);
+        assert_eq!(co[&bob.id], vec![alice.id.clone()]);
+
+        // empty input and unknown ids are well-behaved
+        assert!(s.facts_for_entities(&[], 5).unwrap().is_empty());
+        assert!(s.coentities_batch(&[], 50).unwrap().is_empty());
+        assert!(s
+            .facts_for_entities(&["ghost".into()], 5)
+            .unwrap()
+            .is_empty());
+        assert!(s
+            .coentities_batch(&["ghost".into()], 50)
+            .unwrap()
+            .is_empty());
     }
 }
