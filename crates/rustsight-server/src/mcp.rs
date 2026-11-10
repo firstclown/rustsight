@@ -184,7 +184,12 @@ async fn call_tool(
                         .get("token_budget")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(1000) as usize,
-                    top_k_per_arm: 10,
+                    top_k_per_arm: engine.config.recall_budget.resolve(
+                        None,
+                        args.get("token_budget")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(1000) as usize,
+                    ),
                     kinds: None,
                 })
                 .await

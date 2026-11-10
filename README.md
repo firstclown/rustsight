@@ -11,12 +11,16 @@ Architecture
 Four memory networks, three operations:
 
 - retain: LLM narrative fact extraction (temporal ranges, typed entities,
-  causal links) -> entity resolution (string + co-occurrence + temporal
-  proximity scoring) -> typed graph edges (entity / temporal / semantic /
-  causal) -> dirty-entity queue
+  causal links) -> entity resolution (upstream v1.1.0's exact fuzzy model:
+  pg_trgm trigram floor + word-by-word gate, 0.5·name + 0.3·co-occurrence +
+  0.2·7-day-recency vs 0.6, plus in-batch clustering of new names) ->
+  typed graph edges (entity / temporal / semantic / causal) -> dirty-entity
+  queue
 - recall: four parallel retrieval arms (vector cosine, FTS5 BM25, 2-hop graph
   traversal, parsed temporal window) -> reciprocal rank fusion -> cross-encoder
-  rerank -> greedy token-budget cut
+  rerank with combined scoring (recency + proof-count boosts) -> greedy
+  token-budget cut; reflect's pool width is budget-driven (fixed MID = 300
+  per arm, upstream defaults)
 - reflect: agentic tool loop (recall / read_observation / finish) shaped by the
   bank's mission, directives, and disposition traits (skepticism, literalism,
   empathy, bias strength); opinions are formed with confidence and reinforced
@@ -49,6 +53,11 @@ Configuration (non-mock mode)
     RUSTSIGHT_LLM_MODEL       default gpt-4o-mini
     RUSTSIGHT_EMBED_BASE_URL  defaults to RUSTSIGHT_LLM_BASE_URL
     RUSTSIGHT_EMBED_MODEL     default text-embedding-3-small
+    RUSTSIGHT_HTTP_TIMEOUT_SECS  total wall for one provider HTTP round trip,
+                              connect through last body byte (default 300,
+                              clamped 5-3600). Transport-level failures
+                              (dropped connection, timeout) are retried like
+                              429/5xx
     RUSTSIGHT_RERANK          local | api | off | auto (default auto; see below)
     RUSTSIGHT_RERANK_URL      optional; any /rerank endpoint (Jina/Cohere style)
     RUSTSIGHT_RERANK_MODEL_PATH  pre-placed ONNX model (file or dir); skips download
@@ -74,9 +83,14 @@ Reranking (accuracy-critical)
 -----------------------------
 Recall fuses four retrieval arms with RRF and then reranks with a
 cross-encoder — the paper attributes a significant share of its benchmark
-lead to that reranking step. With no reranker configured, real (non-mock)
-runs print a loud warning and fall back to raw RRF ordering; set
-`RUSTSIGHT_RERANK=off` to silence the warning and accept the accuracy hit.
+lead to that reranking step. Rerank scores are normalized (calibrated [0,1]
+scores pass through; logits go through a sigmoid) and modulated by
+multiplicative recency and proof-count boosts (upstream's combined
+scoring). With no reranker configured, real (non-mock) runs print a loud
+warning and fall back to a passthrough reranker — RRF rank order seeded as
+the relevance base, still modulated by the boosts (upstream's slim
+deployment behavior); set `RUSTSIGHT_RERANK=off` to silence the warning
+and accept the accuracy hit.
 
 Three reranker backends:
 
@@ -94,8 +108,8 @@ Three reranker backends:
   model's hash. `RUSTSIGHT_RERANK_MODEL_PATH` points at
   a pre-placed model for offline hosts. Query/doc pairs are scored in
   batches (`RUSTSIGHT_RERANK_BATCH`, default 16; 16-64 is the sweet spot),
-  truncated at `RUSTSIGHT_RERANK_MAX_LEN` tokens (default 512). Recall caps
-  rerank input at min(50, refs) candidates.
+  truncated at `RUSTSIGHT_RERANK_MAX_LEN` tokens (default 512). Rerank
+  scores the whole fused pool (uncapped by default, matching upstream).
 - `api`: `RUSTSIGHT_RERANK_URL` (+ optional `RUSTSIGHT_RERANK_API_KEY`,
   `RUSTSIGHT_RERANK_MODEL`) pointing at a Jina/Cohere-style `/rerank`
   endpoint.
@@ -167,6 +181,70 @@ chunk's extraction output fails to parse (e.g. JSON truncated by an output
 token limit), the chunk is re-asked once at half size before the error
 surfaces.
 
+Evaluation (LongMemEval-S)
+--------------------------
+`rustsight-eval` (RS-6) runs the paper's LongMemEval-S protocol end-to-end
+against any OpenAI-compatible provider stack: retain each conversation's
+sessions into a per-conversation bank (backdated via synthesized session
+timestamps), consolidate, answer the 500 questions with `reflect`, and score
+with a binary LLM judge (`\boxed{yes}`/`\boxed{no}`, temperature 0;
+abstention questions get a dedicated unanswerable-question prompt).
+
+    cargo run -p rustsight-eval -- download                     # ~265MB from HuggingFace
+    cargo run -p rustsight-eval -- --dataset longmemeval-s --out results/
+    cargo run -p rustsight-eval -- analyze --run results/       # failure clusters
+    cargo run -p rustsight-eval -- compare --run results/       # vs Hindsight, per question
+    scripts/fullstack-smoke                                      # 1-bank real-stack smoke first
+
+Notes:
+
+- Full-stack smoke before any long run: `scripts/fullstack-smoke` drives the
+  committed fixture (one bank, 12 sessions, 7 questions across all five
+  abilities) through retain → consolidate → reflect → judge against the
+  real provider stack; it rotates its output dir so every run is fresh
+  (`--mock` works offline).
+- Long-run observability: per-conversation outcome lines print as they
+  finish, plus a `--heartbeat-secs` (default 60) stderr heartbeat with
+  phase counters. Parallelism: `--conversations` (default 2) across banks,
+  `--consolidate-concurrency` (default 4) entities per consolidation pass.
+  A bank whose consolidation stalls is kept partially consolidated (still
+  answerable, flagged `partial` in state.json) instead of failing the run.
+
+- Judge env (required for real runs, all three):
+  `RUSTSIGHT_EVAL_JUDGE_BASE_URL`, `RUSTSIGHT_EVAL_JUDGE_API_KEY`,
+  `RUSTSIGHT_EVAL_JUDGE_MODEL` — e.g. GPT-OSS-120b via OpenRouter. The
+  judge never silently falls back to the extraction model.
+- The engine stack reuses the production env vars (`RUSTSIGHT_LLM_*`,
+  `RUSTSIGHT_EMBED_*`, `RUSTSIGHT_RERANK*`). Embeddings need any
+  OpenAI-compatible `/embeddings` endpoint: OpenRouter (upstream Hindsight
+  uses it as an embeddings gateway), OpenAI direct, Gemini's OpenAI-compat
+  endpoint, or local Ollama/TEI/vLLM. Not Groq — no embeddings endpoint.
+  Keep one embed model per run directory (mixing models breaks cosine
+  similarity); see `evals/RESULTS.md` for details.
+- Runs are resumable at every unit boundary (conversations, questions):
+  rerun the same command and completed work is skipped. Banks live in
+  `<out>/banks.db`, never the default rustsight DB.
+- Staged runs: `--limit-questions 5` first (~$0.10) to calibrate extraction
+  density before the full 500-question run (~$1–4 on 20B-class pricing via
+  OpenRouter; see `evals/RESULTS.md` for the cost model).
+- `--mock` runs the entire harness offline with mock providers and a fixed
+  judge — that's what the integration tests exercise.
+- Per-question traces (hypothesis, citations, all retrieved memory ids,
+  judge verdict + raw output, evidence session ids, timings) land in
+  `<out>/traces/`; `report.md`/`report.json` carry per-ability and overall
+  accuracy against the paper's reference scores (39.0 / 83.6 / 89.0 / 91.4).
+- Hindsight parity record: `compare` joins a run's traces question-by-question
+  against the committed record of upstream Hindsight's own LongMemEval-S run
+  (Agent Memory Benchmark: 473/500 = 94.6%, answer head Gemini-3.1-Pro,
+  judge Gemini-2.5-flash-lite) in
+  `crates/rustsight-eval/fixtures/hindsight_longmemeval_s.json`. It writes
+  `compare.md`/`compare.json` into the run dir: agreement matrix, per-ability
+  deltas, the parity gaps (Hindsight right where rustsight is not — the
+  questions to target), rustsight-only wins, and shared failures. Verdicts
+  come from different judges, so agreement is evidence, not ground truth.
+  `scripts/hindsight-record-sync` refreshes the fixture from the benchmark
+  repo and reports verdict flips.
+
 Offline demo (no API key)
 -------------------------
     rustsight --mock --db /tmp/demo.db retain --bank demo \
@@ -219,7 +297,8 @@ MCP (stdio)
 Roadmap
 -------
 - sqlite-vec / HNSW ANN backend
-- LongMemEval-S evaluation harness
 - knowledge-page fs mount
 - adopt upstream consolidation + reflect prompts end-to-end (see
   prompts/upstream/DIVERGENCES.md)
+- LongMemEval-S baseline run + iteration (harness shipped as `rustsight-eval`;
+  see evals/RESULTS.md)

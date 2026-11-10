@@ -575,6 +575,7 @@ impl MemoryStore for SqliteStore {
                             occurred_end_ms: r.get(4)?,
                             mentioned_at_ms: Some(r.get(5)?),
                             entity_ids: vec![],
+                            proof_count: None,
                         })
                     },
                 )
@@ -585,7 +586,7 @@ impl MemoryStore for SqliteStore {
             }
 
             let sql = format!(
-                "SELECT id, text, entity_id, updated_at_ms FROM observations WHERE bank_id = ? AND id IN ({ph})"
+                "SELECT id, text, entity_id, updated_at_ms, proof_count FROM observations WHERE bank_id = ? AND id IN ({ph})"
             );
             let mut stmt = conn.prepare(&sql).map_err(store_err)?;
             let rows = stmt
@@ -603,6 +604,7 @@ impl MemoryStore for SqliteStore {
                             occurred_end_ms: None,
                             mentioned_at_ms: Some(r.get(3)?),
                             entity_ids: vec![r.get(2)?],
+                            proof_count: Some(r.get(4)?),
                         })
                     },
                 )
@@ -631,6 +633,7 @@ impl MemoryStore for SqliteStore {
                             occurred_end_ms: None,
                             mentioned_at_ms: Some(r.get(2)?),
                             entity_ids: vec![],
+                            proof_count: None,
                         })
                     },
                 )
@@ -782,9 +785,13 @@ impl MemoryStore for SqliteStore {
         Ok(())
     }
 
-    fn link_memory_entities(&self, memory_id: &MemoryId, links: &[(String, String)]) -> Result<()> {
+    fn link_memory_entities(
+        &self,
+        memory_id: &MemoryId,
+        links: &[(String, String)],
+        at_ms: i64,
+    ) -> Result<()> {
         let mut conn = self.lock_conn();
-        let now = self.clock.now_ms();
         let tx = conn.transaction().map_err(store_err)?;
         for (entity_id, mention) in links {
             tx.execute(
@@ -794,7 +801,7 @@ impl MemoryStore for SqliteStore {
             .map_err(store_err)?;
             tx.execute(
                 "UPDATE entities SET last_mentioned_ms = MAX(last_mentioned_ms, ?2) WHERE id = ?1",
-                params![entity_id, now],
+                params![entity_id, at_ms],
             )
             .map_err(store_err)?;
         }
@@ -868,6 +875,62 @@ impl MemoryStore for SqliteStore {
             }
         }
         Ok(out)
+    }
+
+    fn cooccurrence_index(&self, bank_id: &str) -> Result<CooccurrenceIndex> {
+        // Every directed pair of entities sharing a stored memory, with both
+        // canonical names — the same pair set upstream persists in
+        // `entity_cooccurrences` (one row per fact's entity pair), computed
+        // here from the per-memory links. Degree is counted over ALL
+        // partners of an entity, exactly like upstream's index build.
+        let conn = self.lock_conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT me1.entity_id, e1.name, me2.entity_id, e2.name
+                 FROM memory_entities me1
+                 JOIN memory_entities me2
+                      ON me1.memory_id = me2.memory_id AND me1.entity_id != me2.entity_id
+                 JOIN entities e1 ON e1.id = me1.entity_id
+                 JOIN entities e2 ON e2.id = me2.entity_id
+                 WHERE e1.bank_id = ?1",
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![bank_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(store_err)?;
+        let mut neighbours: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut partners_by_entity: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut name_by_entity: HashMap<String, String> = HashMap::new();
+        for r in rows {
+            let (eid, name, other_id, other_name) = r.map_err(store_err)?;
+            neighbours.entry(eid.clone()).or_default().insert(other_id);
+            partners_by_entity
+                .entry(eid.clone())
+                .or_default()
+                .insert(other_name.to_lowercase());
+            name_by_entity
+                .entry(eid)
+                .or_insert_with(|| name.to_lowercase());
+        }
+        let mut degree_by_name: HashMap<String, usize> = HashMap::new();
+        for (eid, name) in &name_by_entity {
+            let degree = neighbours.get(eid).map(|s| s.len()).unwrap_or(0);
+            // Same name from two ids can only happen mid-merge; keep the
+            // larger degree (upstream does the same).
+            let slot = degree_by_name.entry(name.clone()).or_insert(0);
+            *slot = (*slot).max(degree);
+        }
+        Ok(CooccurrenceIndex {
+            partners_by_entity,
+            degree_by_name,
+        })
     }
 
     fn facts_for_entity(&self, entity_id: &str, limit: usize) -> Result<Vec<Memory>> {
@@ -1008,6 +1071,17 @@ impl MemoryStore for SqliteStore {
             out.push(r.map_err(store_err)?);
         }
         Ok(out)
+    }
+
+    fn count_dirty_entities(&self, bank_id: &str) -> Result<usize> {
+        let conn = self.lock_conn();
+        conn.query_row(
+            "SELECT COUNT(*) FROM dirty_entities WHERE bank_id = ?1",
+            params![bank_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n as usize)
+        .map_err(store_err)
     }
 
     fn clear_dirty_entities(&self, bank_id: &str, entity_ids: &[String]) -> Result<()> {
@@ -1808,11 +1882,16 @@ mod tests {
                 (alice.id.clone(), "Alice".into()),
                 (bob.id.clone(), "Bob".into()),
             ],
+            10,
         )
         .unwrap();
-        for m in [&m1, &m2, &m3] {
-            s.link_memory_entities(&m[0].id, &[(alice.id.clone(), "Alice".into())])
-                .unwrap();
+        for (i, m) in [&m1, &m2, &m3].iter().enumerate() {
+            s.link_memory_entities(
+                &m[0].id,
+                &[(alice.id.clone(), "Alice".into())],
+                20 + i as i64,
+            )
+            .unwrap();
         }
 
         let texts = |v: &[Memory]| v.iter().map(|m| m.text.clone()).collect::<Vec<_>>();

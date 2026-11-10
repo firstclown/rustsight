@@ -2,3 +2,5 @@
 *.db
 *.db-wal
 *.db-shm
+/evals/
+CODE_REVIEW.md

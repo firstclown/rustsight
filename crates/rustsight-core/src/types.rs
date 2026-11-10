@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 
 pub type MemoryId = String;
 
@@ -241,6 +242,23 @@ pub struct MemoryRef {
     pub occurred_end_ms: Option<i64>,
     pub mentioned_at_ms: Option<i64>,
     pub entity_ids: Vec<String>,
+    /// Observation evidence strength, `None` for non-observation kinds —
+    /// feeds the proof-count boost in rerank combined scoring.
+    pub proof_count: Option<usize>,
+}
+
+/// Co-occurrence facts the entity-resolution scoring pass needs, built once
+/// per retain batch from the bank's per-fact entity links (upstream
+/// `_CooccurrenceIndex`, backed there by the persisted
+/// `entity_cooccurrences` table).
+#[derive(Debug, Default, Clone)]
+pub struct CooccurrenceIndex {
+    /// entity id → lowercased canonical names of the entities it has
+    /// co-occurred with on a stored fact.
+    pub partners_by_entity: HashMap<String, HashSet<String>>,
+    /// lowercased entity name → how many distinct entities that entity has
+    /// co-occurred with (its degree; hubs get damped votes).
+    pub degree_by_name: HashMap<String, usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -280,6 +298,9 @@ pub struct ReflectResponse {
     pub citations: Vec<MemoryId>,
     pub rounds: usize,
     pub retrieved: usize,
+    /// Every memory id surfaced to the model across all rounds (deduped,
+    /// sorted) — the superset citations are validated against.
+    pub retrieved_ids: Vec<MemoryId>,
     pub opinions_formed: usize,
 }
 

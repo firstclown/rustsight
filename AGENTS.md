@@ -15,7 +15,7 @@ for a desktop harness. From-scratch Rust reimplementation of the architecture in
 ```bash
 cargo build                              # debug build (workspace)
 cargo build --release                    # release build (thin LTO); binary at target/release/rustsight
-cargo test                               # all 121 tests; fully offline, mock providers, no API key needed
+cargo test                               # all 189 tests; fully offline, mock providers, no API key needed
 cargo test -p rustsight-storage --test engine_flow   # just the end-to-end integration suite
 cargo test -p rustsight-core --test upstream_prompt_parity   # upstream prompt parity suite (35 cases)
 cargo fmt --check                        # formatting check (must pass; no rustfmt.toml, defaults only)
@@ -42,6 +42,18 @@ cargo run -p rustsight-cli -- serve --addr 127.0.0.1:8888   # HTTP API (needs AP
 cargo run -p rustsight-cli -- mcp --bank demo                # stdio MCP server
 ```
 
+Eval harness (RS-6, offline smoke):
+
+```bash
+cargo run -p rustsight-eval -- --mock --dataset-path <fixture.json> --out /tmp/eval-smoke/
+cargo run -p rustsight-eval -- analyze --run /tmp/eval-smoke/          # failure clusters
+cargo run -p rustsight-eval -- compare --run /tmp/eval-smoke/          # per-question parity vs Hindsight
+cargo run -p rustsight-eval -- download                                # real dataset (network)
+scripts/fullstack-smoke [--mock]        # full stack front-to-back on the committed fixture
+                                        # (real providers + judge by default; rotates its out dir)
+scripts/hindsight-record-sync           # refresh the committed Hindsight LongMemEval-S record
+```
+
 Smoke-test HTTP by hand:
 
 ```bash
@@ -62,7 +74,7 @@ Every change is complete only when **all** of the following pass locally:
      `crates/rustsight-core/src/fusion.rs`, `temporal.rs`, `prompts/*.rs`).
    - Engine-level/integration tests go in
      `crates/rustsight-storage/tests/engine_flow.rs` (in-memory SQLite +
-     scripted mocks; 25 tests there today).
+     scripted mocks; 30 tests there today).
 4. Docs touched where relevant: README sections for user-facing behavior/env
    vars, `NEXT_STEPS.md` checkboxes if a ticket's scope changed.
 5. No secrets/API keys committed; `.gitignore` already covers `*.db*`.
@@ -72,7 +84,8 @@ the gate, so run them before declaring done.
 
 ## Workspace layout
 
-Five crates; dependency flow: `core` ← `storage`/`providers` ← `server` ← `cli`.
+Six crates; dependency flow: `core` ← `storage`/`providers` ← `server` ←
+`cli`, and `core`/`storage`/`providers` ← `eval`.
 
 | Crate | Path | Role |
 |---|---|---|
@@ -81,6 +94,7 @@ Five crates; dependency flow: `core` ← `storage`/`providers` ← `server` ← 
 | rustsight-providers | `crates/rustsight-providers` | `OpenAiCompat` LLM/embeddings over HTTP, `ApiRerank` (Jina/Cohere-style `/rerank`), `NoopRerank`, and all mocks (`MockLlm`, `MockEmbed`, `MockRerank`, `SimpleTokenEstimator`) |
 | rustsight-server | `crates/rustsight-server` | axum HTTP router (`http.rs`) + stdio JSON-RPC MCP server (`mcp.rs`); both spawn the consolidation worker |
 | rustsight-cli | `crates/rustsight-cli` | Binary `rustsight`: serve/mcp/retain/recall/reflect/consolidate/inspect/banks/bank-set/mental-model |
+| rustsight-eval | `crates/rustsight-eval` | LongMemEval-S harness (RS-6): dataset ingest, bank-per-conversation retain with synthesized timestamps, fixed-clock reflect, `\boxed{yes/no}` LLM judge, resumable state, reports + failure analysis |
 
 Key source map:
 
@@ -92,8 +106,9 @@ Key source map:
   — the five pipelines. Retain chunks content (`engine/chunks.rs`: token
   split with overlap, causal-index remap, overlap-dedup at similarity >= 0.9,
   half-size re-ask on parse failure) and retries transient provider errors
-  (`with_retry` in `engine/mod.rs`, 429/5xx only — typed `Error::LlmStatus`/
-  `EmbedStatus`).
+  (`with_retry` in `engine/mod.rs` — HTTP 429/5xx typed `Error::LlmStatus`/
+  `EmbedStatus`, plus transport-level drops/timeouts as `Error::LlmTransport`/
+  `EmbedTransport`).
 - `crates/rustsight-core/src/store.rs` — the `MemoryStore` trait (swap-in point
   for Postgres/ANN backends).
 - `crates/rustsight-core/src/traits.rs` — `LlmProvider`, `EmbedProvider`,
@@ -115,9 +130,12 @@ Key source map:
   across an LLM call.** The store is sync; take the lock only for short queries
   between async provider calls, or retain/recall latency blocks.
 - **Consolidation is single-flight.** `Engine::consolidate_once` serializes via
-  `consolidate_lock`; dirty-entity rows are only cleared *after* a successful
-  pass so crashes are safe (work is re-discovered next tick). Keep that
-  ordering.
+  `consolidate_lock`; each dirty entity's row is cleared only after *that
+  entity's* observations are written and embedded (per-entity progress — a
+  pass that errors, stalls, or hits its soft deadline keeps every finished
+  entity's work; `consolidate_timeout_secs` stops starting new entities and
+  the hard wall at 2x only cuts wedged in-flight calls). Keep those
+  semantics.
 - **Retain/recall response paths never wait on consolidation.** Retain enqueues
   dirty entities and notifies the worker (`wakeup: Notify`); the worker
   debounces bursts, then consolidates every bank from `banks_with_dirty()`.
@@ -127,8 +145,12 @@ Key source map:
   reinforce them; the linkage flows through entity resolution
   (`entity.rs` aliases), not free-text matching.
 - Recall = four parallel arms (vector cosine, FTS5 BM25, 2-hop graph, parsed
-  temporal window) → RRF fuse (`fusion.rs`) → rerank (capped at
-  `min(50, refs.len())`) → greedy token-budget cut. RRF `k=60` and other knobs
+  temporal window) → RRF fuse (`fusion.rs`) → rerank (whole fused pool;
+  `reranker_max_candidates` 0 = uncapped) → combined scoring (sigmoid/passthrough
+  CE normalization × recency/proof-count boosts, `engine/scoring.rs`) → greedy
+  token-budget cut. Reflect's pool width comes from `recall_budget`
+  (fixed MID = 300/arm, upstream `_resolve_thinking_budget`); graph seeds = 20
+  (`GRAPH_SEED_LIMIT`). RRF `k=60` and other knobs
   live in `EngineConfig`.
 - Timestamps are ms-epoch i64 everywhere; embeddings are LE f32 BLOBs.
 
@@ -155,6 +177,9 @@ Env vars, read in `crates/rustsight-providers/src/env.rs`:
   (default `gpt-4o-mini`)
 - `RUSTSIGHT_EMBED_BASE_URL`/`RUSTSIGHT_EMBED_API_KEY`/`RUSTSIGHT_EMBED_MODEL`
   (default to the LLM values / `text-embedding-3-small`)
+- `RUSTSIGHT_HTTP_TIMEOUT_SECS` (default 300, clamped 5–3600; total wall for
+  one provider HTTP round trip, connect through last body byte; invalid
+  values fall back to default with a warning)
 - `RUSTSIGHT_RERANK_URL` optional (Jina/Cohere-style `/rerank`); unset →
   `NoopRerank` (raw RRF ordering — accuracy caveat, RS-4 tracks a local ONNX
   reranker)
@@ -164,6 +189,9 @@ Env vars, read in `crates/rustsight-providers/src/env.rs`:
 - `RUSTSIGHT_API_TOKEN` / `RUSTSIGHT_API_TOKEN_FILE` (optional; bearer-token
   auth for the HTTP API — without one, `serve` refuses non-loopback binds
   unless `--allow-unauth`. MCP stdio needs no auth.)
+- `RUSTSIGHT_EVAL_JUDGE_BASE_URL`/`_API_KEY`/`_MODEL` (eval harness only,
+  all three required for real judge runs — read in
+  `crates/rustsight-eval/src/judge.rs`, no fallback to the LLM provider)
 
 ## Conventions
 
@@ -174,7 +202,8 @@ Env vars, read in `crates/rustsight-providers/src/env.rs`:
   `RS-2: add background consolidation worker`. Never commit without an explicit
   request.
 - `NEXT_STEPS.md` is the roadmap (RS-1..RS-12, P0..P3, each with need-to-know
-  facts and its own DoD). RS-1 and RS-2 are done. Read the relevant ticket
+  facts and its own DoD). RS-1..RS-5 are done; RS-6's harness is done (its
+  hosted baseline run + iteration are pending). Read the relevant ticket
   before touching engine code — it records upstream-pinned facts (tag `v1.1.0`,
   commit `a5a619b5`) you'd otherwise have to rediscover.
 - License is MIT; upstream material keeps MIT headers and a `NOTICE` entry.

@@ -57,10 +57,24 @@ struct RawObservation {
     evidence: Option<Vec<RawEvidence>>,
 }
 
+/// One element of the model's "observations" array. Most models emit
+/// objects; some (seen from gpt-oss-20b via OpenRouter in the first
+/// fullstack smoke run) interleave bare strings, which used to fail the
+/// whole response with "invalid type: string, expected struct
+/// RawObservation" and cost a consolidation pass. Strings parse as
+/// observations with no evidence — the engine backfills evidence from
+/// the entity's first fact when an observation cites none.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawObservationItem {
+    Obj(RawObservation),
+    Text(String),
+}
+
 #[derive(Debug, Deserialize)]
 struct RawRoot {
     #[serde(default)]
-    observations: Option<Vec<RawObservation>>,
+    observations: Option<Vec<RawObservationItem>>,
 }
 
 fn json_slice(raw: &str) -> &str {
@@ -77,20 +91,25 @@ pub fn parse_observations(raw: &str) -> Result<Vec<ParsedObservation>> {
         .observations
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|o| {
-            let text = o.text?.trim().to_string();
+        .filter_map(|item| {
+            let (text, evidence) = match item {
+                RawObservationItem::Obj(o) => (
+                    o.text,
+                    o.evidence
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|ev| {
+                            let idx = ev.fact_index?;
+                            Some((idx, ev.quote.unwrap_or_default()))
+                        })
+                        .collect(),
+                ),
+                RawObservationItem::Text(text) => (Some(text), vec![]),
+            };
+            let text = text?.trim().to_string();
             if text.is_empty() {
                 return None;
             }
-            let evidence = o
-                .evidence
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|ev| {
-                    let idx = ev.fact_index?;
-                    Some((idx, ev.quote.unwrap_or_default()))
-                })
-                .collect();
             Some(ParsedObservation { text, evidence })
         })
         .collect())
@@ -157,6 +176,29 @@ mod tests {
         assert_eq!(obs.len(), 1);
         assert_eq!(obs[0].evidence.len(), 2);
         assert_eq!(obs[0].evidence[1].1, "");
+    }
+
+    /// Regression: gpt-oss-20b returned a bare string inside
+    /// "observations" and the whole pass failed with "invalid type:
+    /// string, expected struct RawObservation". Strings must parse as
+    /// observations with empty evidence, not kill the response.
+    #[test]
+    fn parse_obs_accepts_bare_string_elements() {
+        let raw = r#"{"observations":["Alice works at Google.",{"text":"Bob joined Acme.","evidence":[{"fact_index":1,"quote":"Bob joined Acme"}]},"  "]}"#;
+        let obs = parse_observations(raw).unwrap();
+        assert_eq!(obs.len(), 2);
+        assert_eq!(obs[0].text, "Alice works at Google.");
+        assert!(obs[0].evidence.is_empty());
+        assert_eq!(obs[1].evidence, vec![(1, "Bob joined Acme".to_string())]);
+    }
+
+    /// A bare-string-only response parses too (no objects at all).
+    #[test]
+    fn parse_obs_accepts_all_string_observations() {
+        let obs = parse_observations(r#"{"observations":["Only text."]}"#).unwrap();
+        assert_eq!(obs.len(), 1);
+        assert_eq!(obs[0].text, "Only text.");
+        assert!(obs[0].evidence.is_empty());
     }
 
     #[test]

@@ -1,9 +1,16 @@
+use crate::engine::scoring::{
+    combined_score, normalize_ce_scores, recency_for_ref, seed_ce_from_rrf,
+};
 use crate::engine::{with_retry, Engine};
 use crate::types::*;
 use crate::{
     apply_token_budget, bm25_terms, cosine, parse_window, rrf_fuse, Error, MemoryStore, Result,
 };
 use std::sync::Arc;
+
+/// How many of the fused arms' top hits seed the graph arm's link expansion
+/// — its entry points into the edge graph (upstream `GRAPH_SEED_LIMIT`).
+const GRAPH_SEED_LIMIT: usize = 20;
 
 pub(super) async fn recall(e: &Engine, req: RecallRequest) -> Result<RecallResponse> {
     let now = e.clock.now_ms();
@@ -32,7 +39,7 @@ pub(super) async fn recall(e: &Engine, req: RecallRequest) -> Result<RecallRespo
     // Arm behavior (filters, truncation, `strategies_used` assembly) is
     // unchanged — this is purely an execution-order change.
     let (sem, bm) = tokio::join!(
-        arm_semantic(e, &req.bank_id, &qemb, &kinds, k),
+        arm_semantic(e, &req.bank_id, &qemb, &kinds, k.max(GRAPH_SEED_LIMIT)),
         arm_bm25(e, &req.bank_id, &req.query, &kinds, k),
     );
     let sem = sem?;
@@ -58,7 +65,11 @@ pub(super) async fn recall(e: &Engine, req: RecallRequest) -> Result<RecallRespo
         used.push("temporal".into());
     }
 
-    let fused = rrf_fuse(&[sem, bm, graph, temp_arm], e.config.rrf_k);
+    // The semantic arm returns at least GRAPH_SEED_LIMIT rows (when the bank
+    // has them) so the graph arm's entry points exist even for a tight `k`;
+    // fusion still consumes only the first `k`.
+    let sem_fused: Vec<String> = sem.iter().take(k).cloned().collect();
+    let fused = rrf_fuse(&[sem_fused, bm, graph, temp_arm], e.config.rrf_k);
     let ids: Vec<String> = fused.iter().map(|(id, _)| id.clone()).collect();
     if ids.is_empty() {
         return Ok(RecallResponse {
@@ -74,27 +85,88 @@ pub(super) async fn recall(e: &Engine, req: RecallRequest) -> Result<RecallRespo
         r.score = *f;
     }
 
+    // Rerank the whole fused pool (upstream reranks every candidate; the
+    // `reranker_max_candidates` cap defaults to 0 = unlimited).
     let docs: Vec<String> = refs.iter().map(|r| r.text.clone()).collect();
     let rerank = Arc::clone(&e.rerank);
     let query = req.query.clone();
-    let top_k = refs.len().min(50);
+    let top_k = if e.config.reranker_max_candidates > 0 {
+        refs.len().min(e.config.reranker_max_candidates)
+    } else {
+        refs.len()
+    };
     let rr = with_retry(e, || rerank.rerank(&query, &docs, top_k)).await?;
+
+    // Combined scoring (upstream `apply_combined_scoring`): the normalized
+    // cross-encoder score modulated by multiplicative recency and
+    // proof-count boosts, then a stable re-sort — ties keep the CE order,
+    // which itself kept the fused (RRF) order.
+    let mut ce_norm: Vec<Option<f32>> = vec![None; refs.len()];
     if !rr.is_empty() {
-        let mut scored: Vec<(f32, MemoryRef)> = rr
+        let raw: Vec<f32> = (0..refs.len())
+            .map(|i| {
+                rr.iter()
+                    .find(|(idx, _)| *idx == i)
+                    .map(|(_, s)| *s)
+                    .unwrap_or(f32::NAN)
+            })
+            .collect();
+        let normalized = normalize_ce_scores(&raw);
+        for (slot, n) in ce_norm.iter_mut().zip(normalized) {
+            *slot = Some(n);
+        }
+    } else if rerank.is_passthrough() {
+        // A passthrough reranker provides no relevance signal; seed the
+        // normalized scores from RRF rank so the boosts modulate a
+        // meaningful base instead of replacing it.
+        let seeded = seed_ce_from_rrf(refs.len());
+        for (slot, n) in ce_norm.iter_mut().zip(seeded) {
+            *slot = Some(n);
+        }
+    }
+    if ce_norm.iter().any(|s| s.is_some()) {
+        // First pass: order by normalized CE (stable over fused order)…
+        let mut order: Vec<usize> = (0..refs.len()).collect();
+        order.sort_by(|&a, &b| {
+            let sa = ce_norm[a].unwrap_or(f32::NAN);
+            let sb = ce_norm[b].unwrap_or(f32::NAN);
+            sb.partial_cmp(&sa)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.cmp(&b))
+        });
+        // …apply the boosts, then stable re-sort by combined score. Unscaled
+        // candidates (index absent from the reranker's answer) sit at the
+        // tail behind the scored ones, keeping their pre-rerank order.
+        let mut scored: Vec<(usize, f32)> = order
             .into_iter()
-            .filter_map(|(i, s)| {
-                refs.get(i).cloned().map(|mut r| {
-                    r.score = s;
-                    (s, r)
-                })
+            .map(|i| {
+                let combined = match ce_norm[i] {
+                    Some(n) => combined_score(
+                        n,
+                        recency_for_ref(&refs[i], now, &e.config.scoring),
+                        // rustsight's temporal arm yields window membership,
+                        // not proximity — the signal stays neutral.
+                        0.5,
+                        refs[i].proof_count,
+                    ),
+                    None => f32::NEG_INFINITY,
+                };
+                (i, combined)
             })
             .collect();
         scored.sort_by(|a, b| {
-            b.0.partial_cmp(&a.0)
+            b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.1.id.cmp(&b.1.id))
+                .then_with(|| a.0.cmp(&b.0))
         });
-        refs = scored.into_iter().map(|(_, r)| r).collect();
+        refs = scored
+            .into_iter()
+            .map(|(i, s)| {
+                let mut r = refs[i].clone();
+                r.score = if s == f32::NEG_INFINITY { 0.0 } else { s };
+                r
+            })
+            .collect();
     }
 
     let memories = apply_token_budget(refs, req.token_budget.max(1), e.tokens.as_ref());
@@ -188,8 +260,17 @@ async fn arm_graph(
     bm: &[String],
     k: usize,
 ) -> Result<Vec<String>> {
-    let mut seeds: Vec<String> = sem.iter().chain(bm.iter()).cloned().collect();
-    seeds.truncate(5);
+    // Seeds: the graph arm's entry points — up to GRAPH_SEED_LIMIT of the
+    // top semantic hits (upstream derives its seeds from the dense rows),
+    // falling back to BM25 hits when the semantic arm came up empty.
+    let mut seeds: Vec<String> = sem
+        .iter()
+        .take(GRAPH_SEED_LIMIT)
+        .chain(bm.iter().take(GRAPH_SEED_LIMIT))
+        .cloned()
+        .collect();
+    seeds.dedup();
+    seeds.truncate(GRAPH_SEED_LIMIT);
     if seeds.is_empty() {
         return Ok(vec![]);
     }

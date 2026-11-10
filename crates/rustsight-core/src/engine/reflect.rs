@@ -1,5 +1,7 @@
 use crate::engine::{with_retry, Engine};
-use crate::entity::{combined_score, normalize_name, string_similarity};
+use crate::entity::{
+    collapse_ws, normalize_name, score_candidate, string_similarity, ResolverConfig,
+};
 use crate::prompts::reflect::{
     build_opinion_extraction_prompt, build_reflect_system, parse_opinions, reflect_tools,
 };
@@ -26,6 +28,10 @@ pub(super) async fn reflect(e: &Engine, bank_id: &str, query: &str) -> Result<Re
     let mut answer: Option<String> = None;
     let mut citations: Vec<String> = vec![];
     let mut rounds = 0usize;
+    // Consecutive responses with neither content nor tool calls. One
+    // nudge is allowed per streak; a second consecutive empty response
+    // fails the call.
+    let mut empty_streak = 0usize;
     let llm = Arc::clone(&e.llm);
 
     while rounds < e.config.reflect_max_rounds {
@@ -39,128 +45,163 @@ pub(super) async fn reflect(e: &Engine, bank_id: &str, query: &str) -> Result<Re
         };
         let resp = with_retry(e, || llm.complete(&request)).await?;
 
-        if let Some(call) = resp.tool_calls.first().cloned() {
+        if !resp.tool_calls.is_empty() {
+            empty_streak = 0;
+            // Echo the whole batched turn back, then answer each call
+            // with its own tool result — models that emit `recall` +
+            // `finish` together (gpt-oss does this routinely) complete
+            // in one round instead of having the `finish` dropped on
+            // the floor by a first-call-only handler.
             messages.push(ChatMessage {
                 role: Role::Assistant,
                 content: String::new(),
-                tool_call_id: Some(call.id.clone()),
-                tool_calls: vec![call.clone()],
+                tool_call_id: None,
+                tool_calls: resp.tool_calls.clone(),
             });
-            match call.name.as_str() {
-                "recall" => {
-                    let q = call
-                        .arguments
-                        .get("query")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(query)
-                        .to_string();
-                    let budget = call
-                        .arguments
-                        .get("token_budget")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(2000) as usize;
-                    let r = e
-                        .recall(RecallRequest {
-                            bank_id: bank_id.to_string(),
-                            query: q,
-                            token_budget: budget.min(6000),
-                            top_k_per_arm: 10,
-                            kinds: None,
-                        })
-                        .await?;
-                    let mut text = String::new();
-                    for m in &r.memories {
-                        retrieved.insert(m.id.clone());
-                        text.push_str(&format!("[{}] {}: {}\n", m.kind.as_str(), m.id, m.text));
-                    }
-                    if text.is_empty() {
-                        text = "(no memories found)".to_string();
-                    }
-                    messages.push(ChatMessage::tool_result(call.id.clone(), text));
-                }
-                "read_observation" => {
-                    let name = call
-                        .arguments
-                        .get("entity")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let target = normalize_name(&name);
-                    let ents = e.store.entities_for_bank(bank_id)?;
-                    let text = match ents.iter().find(|en| normalize_name(&en.name) == target) {
-                        Some(en) => {
-                            let obs = e.store.observations_for_entity(&en.id).unwrap_or_default();
-                            // Only observations actually surfaced to the model
-                            // are citable — never the whole bank.
-                            for o in &obs {
-                                retrieved.insert(o.id.clone());
-                            }
-                            if obs.is_empty() {
-                                format!("(no observations for {})", en.name)
-                            } else {
-                                obs.iter()
-                                    .map(|o| {
-                                        format!(
-                                            "[observation] {}: {} (evidence: {})",
-                                            o.id, o.text, o.proof_count
-                                        )
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join("\n")
-                            }
+            let mut finished = false;
+            for call in &resp.tool_calls {
+                match call.name.as_str() {
+                    "recall" => {
+                        let q = call
+                            .arguments
+                            .get("query")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(query)
+                            .to_string();
+                        let budget = call
+                            .arguments
+                            .get("token_budget")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(2000) as usize;
+                        // Pool width comes from the recall budget config
+                        // (upstream `_resolve_thinking_budget`: Budget None →
+                        // MID; fixed function default = 300 per arm).
+                        let top_k = e.config.recall_budget.resolve(None, budget.min(6000));
+                        let r = e
+                            .recall(RecallRequest {
+                                bank_id: bank_id.to_string(),
+                                query: q,
+                                token_budget: budget.min(6000),
+                                top_k_per_arm: top_k,
+                                kinds: None,
+                            })
+                            .await?;
+                        let mut text = String::new();
+                        for m in &r.memories {
+                            retrieved.insert(m.id.clone());
+                            text.push_str(&format!("[{}] {}: {}\n", m.kind.as_str(), m.id, m.text));
                         }
-                        None => format!("(unknown entity {name})"),
-                    };
-                    messages.push(ChatMessage::tool_result(call.id.clone(), text));
-                }
-                "finish" => {
-                    answer = Some(
-                        call.arguments
-                            .get("answer")
+                        if text.is_empty() {
+                            text = "(no memories found)".to_string();
+                        }
+                        messages.push(ChatMessage::tool_result(call.id.clone(), text));
+                    }
+                    "read_observation" => {
+                        let name = call
+                            .arguments
+                            .get("entity")
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
-                            .to_string(),
-                    );
-                    let cited = call
-                        .arguments
-                        .get("citations")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                                .collect::<Vec<String>>()
-                        })
-                        .unwrap_or_default();
-                    let mut valid: Vec<String> = cited
-                        .into_iter()
-                        .filter(|id| retrieved.contains(id))
-                        .collect();
-                    valid.sort();
-                    valid.dedup();
-                    citations = valid;
-                    messages.push(ChatMessage::tool_result(
-                        call.id.clone(),
-                        "answer recorded".to_string(),
-                    ));
+                            .to_string();
+                        let target = normalize_name(&name);
+                        let ents = e.store.entities_for_bank(bank_id)?;
+                        let text = match ents.iter().find(|en| normalize_name(&en.name) == target) {
+                            Some(en) => {
+                                let obs =
+                                    e.store.observations_for_entity(&en.id).unwrap_or_default();
+                                // Only observations actually surfaced to the model
+                                // are citable — never the whole bank.
+                                for o in &obs {
+                                    retrieved.insert(o.id.clone());
+                                }
+                                if obs.is_empty() {
+                                    format!("(no observations for {})", en.name)
+                                } else {
+                                    obs.iter()
+                                        .map(|o| {
+                                            format!(
+                                                "[observation] {}: {} (evidence: {})",
+                                                o.id, o.text, o.proof_count
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join("\n")
+                                }
+                            }
+                            None => format!("(unknown entity {name})"),
+                        };
+                        messages.push(ChatMessage::tool_result(call.id.clone(), text));
+                    }
+                    "finish" => {
+                        answer = Some(
+                            call.arguments
+                                .get("answer")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                        );
+                        let cited = call
+                            .arguments
+                            .get("citations")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                    .collect::<Vec<String>>()
+                            })
+                            .unwrap_or_default();
+                        let mut valid: Vec<String> = cited
+                            .into_iter()
+                            .filter(|id| retrieved.contains(id))
+                            .collect();
+                        valid.sort();
+                        valid.dedup();
+                        citations = valid;
+                        messages.push(ChatMessage::tool_result(
+                            call.id.clone(),
+                            "answer recorded".to_string(),
+                        ));
+                        finished = true;
+                    }
+                    other => {
+                        messages.push(ChatMessage::tool_result(
+                            call.id.clone(),
+                            format!("unknown tool {other}"),
+                        ));
+                    }
+                }
+                if finished {
                     break;
                 }
-                other => {
-                    messages.push(ChatMessage::tool_result(
-                        call.id.clone(),
-                        format!("unknown tool {other}"),
-                    ));
-                }
             }
-        } else if let Some(c) = resp.content {
+            if finished {
+                break;
+            }
+        } else if let Some(c) = resp.content.filter(|c| !c.trim().is_empty()) {
             answer = Some(c);
             break;
         } else {
-            return Err(Error::Llm("reflect loop got an empty response".into()));
+            // Reasoning models behind gateways that strip reasoning
+            // occasionally return a message with neither content nor
+            // tool calls (seen from gpt-oss-20b in the fullstack smoke).
+            // Nudge once before giving up — the retry costs a round,
+            // not the question.
+            empty_streak += 1;
+            if empty_streak > 1 {
+                return Err(Error::Llm("reflect loop got an empty response".into()));
+            }
+            messages.push(ChatMessage::user(
+                "Your previous reply came back empty. Call one of the provided tools \
+                 (recall, read_observation, finish) or reply with your final answer as \
+                 plain text.",
+            ));
         }
     }
 
     let answer = answer.ok_or_else(|| Error::Llm("reflect produced no answer".into()))?;
     let retrieved_count = retrieved.len();
+    let mut retrieved_ids: Vec<String> = retrieved.into_iter().collect();
+    retrieved_ids.sort();
     let opinions_formed = form_opinions(e, bank_id, query, &answer).await?;
 
     Ok(ReflectResponse {
@@ -168,6 +209,7 @@ pub(super) async fn reflect(e: &Engine, bank_id: &str, query: &str) -> Result<Re
         citations,
         rounds,
         retrieved: retrieved_count,
+        retrieved_ids,
         opinions_formed,
     })
 }
@@ -296,18 +338,33 @@ fn fuzzy_match_entity(
     candidates: &[Entity],
     now: i64,
 ) -> Result<Option<Entity>> {
-    let cfg = &e.config.entity;
+    // Same scoring model as retain's resolver, minus the co-occurrence
+    // signal — an opinion's entity mentions carry no same-fact siblings, so
+    // the vote set is empty (exactly upstream's behavior for a mention with
+    // no context: name similarity + recency only).
+    let cfg: &ResolverConfig = &e.config.entity;
     let mut best: Option<(f32, &Entity)> = None;
+    let empty = HashSet::new();
+    let degrees = HashMap::new();
     for c in candidates {
-        let s = string_similarity(display, &c.name);
-        let t = 1.0 - (((now - c.last_mentioned_ms).abs() as f32) / (90.0 * 86_400_000.0)).min(1.0);
-        let score = combined_score(s, 0.0, t, cfg);
+        let Some(score) = score_candidate(
+            &collapse_ws(display).to_lowercase(),
+            &collapse_ws(&c.name).to_lowercase(),
+            &empty,
+            None,
+            &degrees,
+            now,
+            c.last_mentioned_ms,
+            cfg,
+        ) else {
+            continue;
+        };
         if best.as_ref().is_none_or(|(bs, _)| score > *bs) {
             best = Some((score, c));
         }
     }
     if let Some((score, ent)) = best {
-        if score >= cfg.link_threshold {
+        if (score * 1_000_000.0).round() / 1_000_000.0 >= cfg.link_threshold {
             e.store.add_alias(bank_id, norm, &ent.id)?;
             return Ok(Some(ent.clone()));
         }

@@ -1,6 +1,6 @@
 use crate::engine::chunks::{merge_chunk_facts, split_chunks, split_half, OVERLAP_DEDUP_THRESHOLD};
 use crate::engine::{with_retry, Engine, EngineConfig};
-use crate::entity::{combined_score, normalize_name, string_similarity};
+use crate::entity::{collapse_ws, normalize_name, score_candidate};
 use crate::prompts::extraction::{build_extraction_messages, parse_extraction_with_reference};
 use crate::traits::{ChatMessage, LlmRequest};
 use crate::types::*;
@@ -16,9 +16,6 @@ use std::sync::Arc;
 /// `buffer_unordered`) keeps per-chunk results in chunk order — the
 /// causal-index remap in `merge_chunk_facts` depends on it.
 const CHUNK_EXTRACT_CONCURRENCY: usize = 2;
-
-/// Co-occurrence probe window for fuzzy entity-resolution candidates.
-const COENTITY_LIMIT: usize = 50;
 
 /// Boxed per-chunk extraction future; boxing lets retain buffer a bounded
 /// number of chunk extractions concurrently (CR-19) and the recursive
@@ -97,57 +94,142 @@ pub(super) async fn retain(e: &Engine, req: RetainRequest) -> Result<RetainRespo
 
     let mut alias_cache: HashMap<String, Entity> = HashMap::new();
     let mut bank_entities = e.store.entities_for_bank(&bank.id)?;
-    // One co-occurrence snapshot per retain (CR-14): resolution used to
-    // fire `coentities` per candidate per unresolved mention, each taking
-    // the connection mutex. The snapshot runs before any new memories are
-    // linked, exactly when the lazy queries used to run, so a missing key
-    // (entity without co-occurrences) matches the empty per-id result.
-    let co_map = e.store.coentities_batch(
-        &bank_entities
-            .iter()
-            .map(|x| x.id.clone())
-            .collect::<Vec<_>>(),
-        COENTITY_LIMIT,
-    )?;
+    // Whole-bank co-occurrence snapshot (partner names + per-name degrees),
+    // taken before this batch's links land — the same pre-commit view
+    // upstream's resolution reads; this batch's pairs flush with the links.
+    let co_index = e.store.cooccurrence_index(&bank.id)?;
     let mut touched: Vec<String> = vec![];
-    let mut per_fact_entities: Vec<Vec<(Entity, String)>> = Vec::with_capacity(facts.len());
+    // Mentions that failed resolution: (normalized alias key, lowercased
+    // display, extractor type), in mention order; clustered into entities
+    // after the per-mention pass (upstream's in-batch dedup).
+    let mut pending: Vec<(String, String, EntityType)> = vec![];
+    let mut per_fact_entities: Vec<Vec<(Entity, String)>> = vec![vec![]; facts.len()];
 
-    for fact in &facts {
-        let mut resolved = vec![];
+    for (fi, fact) in facts.iter().enumerate() {
+        // The extractor's per-fact entity list is the mention's "nearby"
+        // set (upstream `nearby_entities`): same-fact siblings matched by
+        // name against the candidate's co-occurring partners.
+        let fact_names: HashSet<String> = fact
+            .entities
+            .iter()
+            .map(|em| collapse_ws(&em.name).to_lowercase())
+            .collect();
+        let event_ms = fact.occurred_start_ms.unwrap_or(now);
+
         for em in &fact.entities {
             let norm = normalize_name(&em.name);
             if norm.is_empty() {
                 continue;
             }
-            let ent = if let Some(x) = alias_cache.get(&norm) {
-                x.clone()
+            let mention_lower = collapse_ws(&em.name).to_lowercase();
+            let mut nearby = fact_names.clone();
+            nearby.remove(&mention_lower);
+
+            let hit = if let Some(x) = alias_cache.get(&norm) {
+                Some(x.clone())
             } else {
-                let found = match e.store.find_by_alias(&bank.id, &norm)? {
-                    Some(x) => x,
+                match e.store.find_by_alias(&bank.id, &norm)? {
+                    Some(x) => Some(x),
                     None => resolve_fuzzy(
                         e,
                         &bank.id,
                         &norm,
-                        &em.name,
+                        &mention_lower,
                         &em.etype,
-                        &alias_cache,
+                        &nearby,
                         &bank_entities,
-                        &co_map,
-                        now,
+                        &co_index,
+                        event_ms,
                     )?,
-                };
-                alias_cache.insert(norm, found.clone());
-                if !bank_entities.iter().any(|x| x.id == found.id) {
-                    bank_entities.push(found.clone());
                 }
-                found
             };
+
+            match hit {
+                Some(ent) => {
+                    alias_cache.insert(norm, ent.clone());
+                    if !bank_entities.iter().any(|x| x.id == ent.id) {
+                        bank_entities.push(ent.clone());
+                    }
+                    if !touched.contains(&ent.id) {
+                        touched.push(ent.id.clone());
+                    }
+                    per_fact_entities[fi].push((ent, em.name.clone()));
+                }
+                None => pending.push((norm, mention_lower, em.etype)),
+            }
+        }
+    }
+
+    // Cluster the failed names into canonical spellings and find-or-create
+    // each cluster's entity (upstream `_intrabatch_canonical_map` + the
+    // grouped INSERT's ON CONFLICT semantics: a canonical spelling that
+    // exactly names an existing entity reuses it).
+    if !pending.is_empty() {
+        let display_of = |norm: &str| -> String {
+            facts
+                .iter()
+                .flat_map(|f| f.entities.iter())
+                .map(|em| (normalize_name(&em.name), collapse_ws(&em.name)))
+                .find(|(n, _)| n == norm)
+                .map(|(_, d)| d)
+                .unwrap_or_else(|| norm.to_string())
+        };
+        let names: Vec<(String, usize)> = {
+            let mut counts: HashMap<String, (String, usize)> = HashMap::new();
+            for (norm, _, _) in &pending {
+                let display = display_of(norm);
+                let slot = counts.entry(norm.clone()).or_insert((display, 0));
+                slot.1 += 1;
+            }
+            counts.into_values().collect()
+        };
+        let canonical_by_lower = crate::entity::cluster_new_entity_names(&names, &e.config.entity);
+        for (norm, _lower, etype) in &pending {
+            let display = display_of(norm);
+            let canonical_display = canonical_by_lower.get(&display.to_lowercase()).cloned();
+            let ent = match canonical_display {
+                Some(canonical) if canonical != display => {
+                    // folded into a cluster: find-or-create the canonical
+                    let cnorm = normalize_name(&canonical);
+                    match e.store.find_by_alias(&bank.id, &cnorm)? {
+                        Some(x) => x,
+                        None => e.store.create_entity(&NewEntity {
+                            bank_id: bank.id.clone(),
+                            name: canonical.clone(),
+                            etype: *etype,
+                        })?,
+                    }
+                }
+                _ => match e.store.find_by_alias(&bank.id, norm)? {
+                    Some(x) => x,
+                    None => e.store.create_entity(&NewEntity {
+                        bank_id: bank.id.clone(),
+                        name: display.clone(),
+                        etype: *etype,
+                    })?,
+                },
+            };
+            e.store.add_alias(&bank.id, norm, &ent.id)?;
+            alias_cache.insert(norm.clone(), ent.clone());
             if !touched.contains(&ent.id) {
                 touched.push(ent.id.clone());
             }
-            resolved.push((ent, em.name.clone()));
         }
-        per_fact_entities.push(resolved);
+        // Second pass: fill per_fact_entities for the pending mentions.
+        for (fi, fact) in facts.iter().enumerate() {
+            for em in &fact.entities {
+                let norm = normalize_name(&em.name);
+                if norm.is_empty() {
+                    continue;
+                }
+                if let Some(ent) = alias_cache.get(&norm) {
+                    let already = per_fact_entities[fi].iter().any(|(x, _)| x.id == ent.id);
+                    if !already {
+                        per_fact_entities[fi].push((ent.clone(), em.name.clone()));
+                    }
+                }
+            }
+        }
     }
 
     let records: Vec<NewMemoryRecord> = facts
@@ -166,7 +248,7 @@ pub(super) async fn retain(e: &Engine, req: RetainRequest) -> Result<RetainRespo
         })
         .collect();
     let stored = e.store.insert_memories(&bank.id, &records)?;
-    for (mem, ents) in stored.iter().zip(&per_fact_entities) {
+    for ((mem, ents), fact) in stored.iter().zip(&per_fact_entities).zip(&facts) {
         if ents.is_empty() {
             continue;
         }
@@ -174,7 +256,11 @@ pub(super) async fn retain(e: &Engine, req: RetainRequest) -> Result<RetainRespo
             .iter()
             .map(|(ent, mention)| (ent.id.clone(), mention.clone()))
             .collect();
-        e.store.link_memory_entities(&mem.id, &links)?;
+        // The entity's last_mentioned advances by the fact's effective
+        // date (upstream's last_seen stat flush), not the retain's wall
+        // clock.
+        let at_ms = fact.occurred_start_ms.unwrap_or(now);
+        e.store.link_memory_entities(&mem.id, &links, at_ms)?;
     }
 
     let new_ids: HashSet<String> = stored.iter().map(|m| m.id.clone()).collect();
@@ -468,52 +554,54 @@ fn extract_chunk_at<'a>(e: &'a Engine, args: ChunkExtract<'a>, depth: usize) -> 
     })
 }
 
+/// Fuzzy-resolve one unresolved mention against the bank's entities using
+/// upstream's scoring model (trigram floor + word-compat gate, then
+/// 0.5·name-similarity + 0.3·co-occurrence + 0.2·recency against the 0.6
+/// threshold). Candidates are the bank's whole entity list — upstream's
+/// "full" strategy shape; the gates make the scored set identical to the
+/// trigram-probe strategy's. Returns `None` when no candidate clears the
+/// threshold (the caller queues the name for in-batch clustering).
 #[allow(clippy::too_many_arguments)]
 fn resolve_fuzzy(
     e: &Engine,
     bank_id: &str,
     norm: &str,
-    display: &str,
-    etype: &EntityType,
-    alias_cache: &HashMap<String, Entity>,
+    mention_lower: &str,
+    _etype: &EntityType,
+    nearby: &HashSet<String>,
     candidates: &[Entity],
-    co_map: &HashMap<String, Vec<String>>,
-    now: i64,
-) -> Result<Entity> {
+    co_index: &CooccurrenceIndex,
+    event_ms: i64,
+) -> Result<Option<Entity>> {
     let cfg = &e.config.entity;
-    let siblings: Vec<String> = alias_cache.values().map(|x| x.id.clone()).collect();
     let mut best: Option<(f32, Entity)> = None;
     for c in candidates {
-        let s = string_similarity(display, &c.name);
-        let co = if siblings.is_empty() {
-            0.0
-        } else {
-            let co = co_map.get(&c.id).map(Vec::as_slice).unwrap_or(&[]);
-            let hits = co
-                .iter()
-                .filter(|id| siblings.iter().any(|s| s == *id))
-                .count() as f32;
-            hits / siblings.len() as f32
-        };
-        let t = 1.0 - (((now - c.last_mentioned_ms).abs() as f32) / (90.0 * 86_400_000.0)).min(1.0);
-        let score = combined_score(s, co, t, cfg);
-        if best.as_ref().is_none_or(|(bs, _)| score > *bs) {
-            best = Some((score, c.clone()));
+        let candidate_lower = collapse_ws(&c.name).to_lowercase();
+        if let Some(score) = score_candidate(
+            mention_lower,
+            &candidate_lower,
+            nearby,
+            co_index.partners_by_entity.get(&c.id),
+            &co_index.degree_by_name,
+            event_ms,
+            c.last_mentioned_ms,
+            cfg,
+        ) {
+            if best.as_ref().is_none_or(|(bs, _)| score > *bs) {
+                best = Some((score, c.clone()));
+            }
         }
     }
     if let Some((score, ent)) = best {
-        if score >= cfg.link_threshold {
+        // Inclusive threshold on a score rounded to 6 decimal places, so
+        // compositions that sum to exactly the threshold compare equal
+        // regardless of which signals produced them.
+        if (score * 1_000_000.0).round() / 1_000_000.0 >= cfg.link_threshold {
             e.store.add_alias(bank_id, norm, &ent.id)?;
-            return Ok(ent);
+            return Ok(Some(ent));
         }
     }
-    let ne = e.store.create_entity(&NewEntity {
-        bank_id: bank_id.to_string(),
-        name: display.to_string(),
-        etype: *etype,
-    })?;
-    e.store.add_alias(bank_id, norm, &ne.id)?;
-    Ok(ne)
+    Ok(None)
 }
 
 #[cfg(test)]

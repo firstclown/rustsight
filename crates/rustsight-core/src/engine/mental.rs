@@ -19,7 +19,8 @@ pub(super) async fn refresh(
             bank_id: bank_id.to_string(),
             query: question.to_string(),
             token_budget: 1500,
-            top_k_per_arm: 10,
+            // Mental-model refresh runs at the default (MID) recall budget.
+            top_k_per_arm: e.config.recall_budget.resolve(None, 1500),
             kinds: None,
         })
         .await?;

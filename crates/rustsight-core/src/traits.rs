@@ -96,6 +96,15 @@ pub trait EmbedProvider: Send + Sync {
 pub trait RerankProvider: Send + Sync {
     async fn rerank(&self, query: &str, docs: &[String], top_k: usize)
         -> Result<Vec<(usize, f32)>>;
+
+    /// Whether this provider scores anything at all. A passthrough (the
+    /// no-op cross-encoder of slim deployments) provides no relevance
+    /// signal; the engine then seeds the normalized scores from RRF rank so
+    /// recency/proof boosts modulate a meaningful base instead of replacing
+    /// it (upstream's `is_passthrough_reranker` handling).
+    fn is_passthrough(&self) -> bool {
+        false
+    }
 }
 
 pub trait TokenEstimator: Send + Sync {

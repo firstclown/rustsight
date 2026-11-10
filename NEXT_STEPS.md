@@ -306,15 +306,105 @@ transcript, answer the 500 questions via `reflect`, score with an LLM judge.
   goal behind a flag — text-only first.
 
 ### Definition of done
-- [ ] `rustsight-eval` crate with `cargo run -p rustsight-eval -- --dataset
+- [x] `rustsight-eval` crate with `cargo run -p rustsight-eval -- --dataset
       longmemeval-s --out results/` that ingests, retains, answers, judges.
-- [ ] Per-category and overall accuracy report (markdown + JSON), including
+- [x] Per-category and overall accuracy report (markdown + JSON), including
       abstention handling; resumable runs; per-question traces (retrieved
       ids, citations, answer) written for failure analysis.
 - [ ] One completed baseline run recorded in `evals/RESULTS.md` with
       model/config/cost, compared against the paper's table.
 - [ ] At least one iteration informed by the failure traces (prompt or fusion
       tweak) with measured delta.
+
+Harness done Oct 2026 (remaining two boxes are the hosted baseline run +
+iteration, which need API keys/money, not code). Facts for the run:
+
+- Dataset is `longmemeval_s.json` from HF `xiaowu0162/longmemeval` — the
+  ticket's `xiamen-unity/LongMemEval` is a deprecated mirror (decision:
+  original variant only; `longmemeval-cleaned` deliberately not supported).
+  The remote file is extensionless (`longmemeval_s`, 265 MB) and embeds raw
+  newlines inside JSON strings, so ingest goes through a streaming sanitizer
+  (`dataset::SanitizingReader`); 1,230 zero-turn placeholder sessions are
+  dropped at ingest. Sessions carry no timestamps; the harness synthesizes
+  them (1-day spacing default) ending at the latest `question_date` and
+  passes them as retain `timestamp_ms`. Questions sharing a haystack share
+  one bank (`lmes-<hash>`), so ~50 conversations are retained once each.
+- Judge prompts follow paper App. A.4 / the LongMemEval convention:
+  binary `\boxed{yes}`/`\boxed{no}` at temperature 0, abstention scored
+  via an unanswerable-question variant; judge env is dedicated
+  (`RUSTSIGHT_EVAL_JUDGE_BASE_URL/_API_KEY/_MODEL`, no silent fallback to
+  the extraction model). Core `ReflectResponse` gained `retrieved_ids`
+  (all memory ids surfaced across reflect rounds) to satisfy the trace DoD.
+- The engine clock in eval runs is a `FixedClock` set to each question's
+  `question_date`, anchoring temporal parsing; reflect queries carry a
+  date prefix for the query-generation LLM.
+- Consolidation runs via explicit `consolidate_once` loops until the dirty
+  queue drains (bounded by pass limit + no-progress detection), not the
+  background worker — deterministic and resumable. A bank whose
+  consolidation stalls is kept *partially consolidated* (still answerable,
+  `partial: true` in state.json) instead of failing the conversation. Cost
+  model + launch procedure live in `evals/RESULTS.md` (~$1–4 for the full
+  run via OpenRouter).
+
+Postmortem (2026-10-31, first hosted attempt): the run retained 79/500
+banks over 21h and completed zero. Three compounding flaws, all fixed:
+
+1. `consolidate_once` was all-or-nothing — one malformed synthesis
+   response, exhausted retry, or the 600s wall aborted the pass and threw
+   away every entity's work; the eval loop treated that as a dead
+   conversation. Now each entity is isolated: its observations are written,
+   embedded, and its dirty row cleared per entity; failures leave only that
+   entity dirty for the next pass (`engine/consolidate.rs`).
+2. Passes ran per-entity LLM calls sequentially under a hard timeout, so
+   slow batches predictably crossed the wall. `consolidate_timeout_secs` is
+   now a soft deadline that stops *starting* entities (hard wall at 2x for
+   wedged calls only), and `consolidate_concurrency` (default 4) fans
+   synthesis out like retain's chunk extraction.
+3. The runner deferred all outcome logging until every bank had been
+   spawned, so 21h of failures printed nothing. Outcomes (and errors) now
+   print the moment a conversation finishes, plus a `--heartbeat-secs`
+   counter line.
+
+Procedure change: before any full LongMemEval attempt, run
+`scripts/fullstack-smoke` — a committed one-bank fixture (12 sessions, 7
+questions across all five abilities) through the real provider stack
+front-to-back (~minutes, ~cents). Green smoke first, then the hosted run.
+
+Smoke postmortem (2026-11-04, first real-provider run, gpt-oss-20b via
+OpenRouter): 5/7 correct, 0 partial — but three model-shape failures, all
+fixed same day:
+
+1. Consolidation parse: the model returned bare strings inside
+   `observations` (not objects), failing the pass with "invalid type:
+   string, expected struct RawObservation"; the dirty-row retry drained it
+   on pass 3 anyway. `parse_observations` now takes strings as
+   observations with default evidence (engine backfills from the first
+   fact) — no pass wasted.
+2. Reflect dropped batched tool calls: gpt-oss emits `recall` + `finish`
+   in one turn; the first-call-only handler dropped the `finish` and the
+   question died with "reflect produced no answer". The loop now executes
+   every call in a turn (finish wins, same-batch recall results citable).
+3. Reflect empty responses: gateway-stripped reasoning sometimes comes
+   back as neither content nor tool calls ("reflect loop got an empty
+   response"). The loop now nudges once with a user message (whitespace
+   content counts as empty too); two consecutive empties still fail. The
+   eval runner additionally retries a failed reflect once per question —
+   in that smoke, 2/7 questions were permanent errors from flaws 2–3.
+
+Parity reference (added Nov 2026): the per-question record of upstream
+Hindsight's own LongMemEval-S run is committed at
+`crates/rustsight-eval/fixtures/hindsight_longmemeval_s.json` (Agent Memory
+Benchmark output: 473/500 = 94.6%, answer head `gemini-3.1-pro-preview`,
+judge `gemini-2.5-flash-lite`, mode `rag`; query ids are the dataset's
+`question_id`s, verified 500/500 against AMB's ingested split). After any
+run, `cargo run -p rustsight-eval -- compare --run <dir>` writes
+`compare.md`/`compare.json`: agreement matrix, per-ability deltas, parity
+gaps (Hindsight right where rustsight is not — the iteration targets),
+rustsight-only wins, shared failures. Hindsight's known weak spot in that
+record: single-session-preference 23/30 and aggregate "how many/how much"
+multi-session questions. `scripts/hindsight-record-sync` refreshes the
+record. Cross-judge caveat: their verdicts came from a different judge than
+ours, so agreement is evidence, not ground truth.
 
 ---
 
@@ -512,6 +602,84 @@ Small quality items that keep getting deferred; do them opportunistically.
 - [ ] Each sub-item landed with its named artifact green.
 
 ---
+
+## RS-14 — Upstream-parity entity resolution + recall pool (done) · P0 · M
+
+### Description
+
+The fullstack smoke run failed its only knowledge-update question
+(`fss_q4_update`: answered Globex, gold Anthropic). Postmortem: the person
+fragmented into three entities (`Alice Chen` / `Alice` / `Dr. Chen`) because
+rustsight's old resolver math could never link a given-name mention to a
+full-name entity (`0.6·str + 0.2·co + 0.2·temp` vs threshold 0.82 caps
+"Alice"→"Alice Chen" at 0.76), and the job-change fact then never reached
+reflect (top-10-per-arm pool, graph arm unreachable across entities). Fix =
+exact port of upstream v1.1.0's resolver and pool sizing, no invented
+constants.
+
+### Need-to-know facts
+
+- Upstream resolver (`memories/pg/entity_resolver.py`, verified at the pin):
+  trigram floor 0.3 → word-compat gate (prefix/seq≥0.6 per token, numbers
+  rule) → `0.5·SequenceMatcher + 0.3·co-occurrence(1/√degree-damped,
+  per-fact nearby) + 0.2·recency(7-day window)` vs inclusive 0.6 (round 6);
+  identical trigram sets score 1.0; in-batch union-find clustering of new
+  names at 0.5 + word-compat, canonical = most-mentioned→shortest→lex,
+  cap 250; co-occurrence matched by name against per-fact sibling sets.
+- Replaying that exact math on the smoke fixture still fragments (≈0.56 <
+  0.6 — one damped shared partner isn't enough corroboration); upstream
+  answers this question class through recall robustness: reflect's recall
+  pool is budget-driven (None → MID → fixed 300 per method per fact_type,
+  `GRAPH_SEED_LIMIT` 20) and reranked with combined scoring (sigmoid CE ×
+  ±10% recency × ±5% proof-count, linear 365-day decay, 0.1 floor). Both
+  ported here.
+- `string_similarity` (Levenshtein) is NOT part of the resolver anymore but
+  stays: chunk overlap dedup (0.9) and consolidation observation dedup
+  (0.85) use it.
+
+### Definition of done
+
+- [x] `trigram.rs` port (pg_trgm word trigrams, Jaccard) with upstream's
+      calibration cases pinned in tests.
+- [x] `entity.rs`: difflib `SequenceMatcher.ratio` port (unit-tested against
+      Python-generated values), token gates, `score_candidate`,
+      `cluster_new_entity_names`.
+- [x] `retain.rs`: per-fact nearby scope (kills alias-cache order
+      dependence), whole-bank `CooccurrenceIndex` snapshot pre-link,
+      in-batch clustering with find-or-create canonicals,
+      `link_memory_entities(…, at_ms)` advancing last-seen by the fact's
+      event date.
+- [x] Recall: `RecallBudgetConfig` (fixed/adaptive, upstream defaults),
+      graph seeds 20, uncapped rerank (`reranker_max_candidates` 0),
+      `apply_combined_scoring` port incl. passthrough RRF seeding
+      (`RerankProvider::is_passthrough`; `NoopRerank` returns no scores).
+- [x] Tests: upstream resolver cases (John/Jane Smith, Tigran/Iran, UA123/
+      124, Wren emoji, Merrivale typo, degree damping, 7-day cutoff) +
+      engine_flow merge-positive and fragment+wide-pool integration tests.
+- [x] Offline `--mock` fullstack smoke 7/7; real run pending (user).
+
+## RS-15 — Full TEMR recall parity · P1 · L
+
+Upstream recall is a budget-driven pipeline across per-fact_type arms with
+strategy boosts, min-score floors, `interleave`/`rrf`/`cross_encoder`
+reranking modes, recency decay config plumbing, and per-level
+`reranker_max_candidates`. rustsight's recall is one pool per arm across all
+kinds. Port the structure (per-kind per-arm limits, budget levels plumbed
+through the reflect tool schema, decision-reranker hook) — see
+`memories/pg/recall.py`, `search/retrieval.py`, `search/fusion.py`,
+`memory_engine.py` at the pin. Includes aligning reflect's recall kind
+filter (upstream: world/experience only; observations come from
+`search_observations`).
+
+## RS-16 — Entity merge/alias repair API (upstream #3216) · P2 · M
+
+Neither rustsight nor upstream (issue #3216, open) can repair an already
+fragmented bank: a desktop bank retained before RS-14 keeps its duplicate
+entities forever. Add a merge verb (canonical entity absorbs another's
+aliases, memory links, observations, co-occurrences; dirty queue re-runs
+consolidation) plus `inspect` reporting of likely duplicate pairs
+(`cluster_new_entity_names` on existing entities as the candidate
+generator).
 
 ## Appendix — facts referenced by multiple tickets
 

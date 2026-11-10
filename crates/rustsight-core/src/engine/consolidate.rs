@@ -6,7 +6,34 @@ use crate::prompts::consolidation::{
 use crate::traits::{ChatMessage, LlmRequest};
 use crate::types::*;
 use crate::{string_similarity, Error, Result};
+use futures::StreamExt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+
+/// Boxed per-entity consolidation future; boxing lets a pass buffer a
+/// bounded number of entities concurrently (mirroring retain's chunk
+/// extraction, CR-19).
+type EntityFut<'a> = Pin<Box<dyn Future<Output = EntityStep> + Send + 'a>>;
+
+/// What happened to one dirty entity inside a pass.
+enum EntityStep {
+    /// Observations were written and embedded; the entity's dirty row was
+    /// cleared.
+    Done {
+        entity_id: String,
+        observations: usize,
+    },
+    /// Fewer than two facts and no existing observations — nothing to
+    /// synthesize; the dirty row was cleared (new facts re-dirty it).
+    Ineligible,
+    /// The soft pass deadline elapsed before this entity started; the
+    /// dirty row survives and the next pass picks the entity up.
+    Deadline,
+    /// Synthesis failed for this entity (LLM error after retries, malformed
+    /// response, store error); the dirty row survives for the next pass.
+    Failed { entity_id: String, error: Error },
+}
 
 pub(super) async fn consolidate_once(
     e: &Engine,
@@ -20,30 +47,191 @@ pub(super) async fn consolidate_once(
     if dirty.is_empty() {
         return Ok(0);
     }
-    let now = e.clock.now_ms();
-    let llm = Arc::clone(&e.llm);
-    let embed = Arc::clone(&e.embed);
-    let mut updated = 0usize;
-    // (observation id, text) pairs awaiting the embedding backfill below.
-    // Tracking ids (not just texts) means each observation gets its own
-    // embedding even when two observations share identical text.
-    let mut obs_pending: Vec<(String, String)> = vec![];
+    // Soft deadline: no NEW entity work starts once the pass budget
+    // elapses; the caller (background worker or eval loop) immediately
+    // starts a fresh pass, so a slow-but-progressing queue keeps making
+    // durable progress instead of being killed mid-flight. The hard wall
+    // in `Engine::consolidate_once` still aborts a pass whose in-flight
+    // provider call truly wedges.
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs(e.config.consolidate_timeout_secs.max(1));
     // One opinion snapshot for the whole pass (CR-6): `list_opinions` reads
     // the entire bank, so re-reading it per dirty entity made consolidation
-    // quadratic in bank size. Reinforced opinions are written back into the
-    // snapshot so later entities in this pass still see fresh
-    // confidence/timestamps, exactly as the per-entity re-fetch did.
+    // quadratic in bank size. Reinforcement runs sequentially after the
+    // synthesis fan-out below and writes updates back into the snapshot so
+    // later entities still see fresh confidence/timestamps, exactly as the
+    // per-entity re-fetch did.
     let mut opinions = e.store.list_opinions(bank_id)?;
 
+    let mut futs: Vec<EntityFut<'_>> = Vec::with_capacity(dirty.len());
     for eid in &dirty {
-        let entity = match e.store.get_entity(eid)? {
-            Some(x) => x,
-            None => continue,
+        futs.push(consolidate_entity(e, bank_id, eid, deadline));
+    }
+
+    let mut updated = 0usize;
+    let mut failed = 0usize;
+    let mut deadline_skips = 0usize;
+    let mut done: Vec<String> = vec![];
+    // `buffered` (not `buffer_unordered`): per-entity results stay in dirty
+    // order, which keeps scripted-provider tests deterministic at any
+    // concurrency and gives the reinforcement loop a stable sequence.
+    let mut steps = futures::stream::iter(futs).buffered(e.config.consolidate_concurrency.max(1));
+    while let Some(step) = steps.next().await {
+        match step {
+            EntityStep::Done {
+                entity_id,
+                observations,
+            } => {
+                updated += observations;
+                done.push(entity_id);
+            }
+            EntityStep::Ineligible => {}
+            EntityStep::Deadline => deadline_skips += 1,
+            EntityStep::Failed { entity_id, error } => {
+                failed += 1;
+                eprintln!("rustsight: consolidating {entity_id} in bank {bank_id} failed: {error}");
+            }
+        }
+    }
+    if failed > 0 {
+        eprintln!(
+            "rustsight: consolidation pass for bank {bank_id} left {failed} entities dirty \
+             (reported above); they retry on the next pass"
+        );
+    }
+    if deadline_skips > 0 {
+        eprintln!(
+            "rustsight: consolidation pass for bank {bank_id} hit its deadline with {deadline_skips} \
+             entities left queued; they retry on the next pass"
+        );
+    }
+
+    // ---- Reinforcement: sequential over the entities this pass completed,
+    // sharing the snapshot taken above (see CR-6 note). ----
+    if !opinions.is_empty() {
+        for eid in &done {
+            let matching: Vec<usize> = opinions
+                .iter()
+                .enumerate()
+                .filter(|(_, o)| o.entity_ids.iter().any(|id| id == eid))
+                .map(|(i, _)| i)
+                .collect();
+            if matching.is_empty() {
+                continue;
+            }
+            let facts = match e.store.facts_for_entity(eid, 60) {
+                Ok(f) => f,
+                Err(err) => {
+                    eprintln!("rustsight: reading facts for {eid} in bank {bank_id} failed: {err}");
+                    continue;
+                }
+            };
+            for i in matching {
+                let op = opinions[i].clone();
+                let new_facts: Vec<Memory> = facts
+                    .iter()
+                    .filter(|f| f.mentioned_at_ms > op.updated_at_ms)
+                    .cloned()
+                    .collect();
+                if new_facts.is_empty() {
+                    continue;
+                }
+                let now = e.clock.now_ms();
+                let (system, user) =
+                    build_opinion_reinforcement_prompt(&op.text, op.confidence, &new_facts);
+                let request = LlmRequest {
+                    system: Some(system),
+                    messages: vec![ChatMessage::user(user)],
+                    json_mode: true,
+                    temperature: Some(0.0),
+                    ..Default::default()
+                };
+                let llm = Arc::clone(&e.llm);
+                let resp = match with_retry(e, || llm.complete(&request)).await {
+                    Ok(r) => r,
+                    Err(err) => {
+                        eprintln!(
+                            "rustsight: reinforcing opinion for {eid} in bank {bank_id} failed: {err}"
+                        );
+                        continue;
+                    }
+                };
+                let verdict = match parse_reinforcement(&resp.content.unwrap_or_default()) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        eprintln!(
+                            "rustsight: reinforcing opinion for {eid} in bank {bank_id} failed: {err}"
+                        );
+                        continue;
+                    }
+                };
+                if let Some((text, confidence)) = verdict {
+                    let mut upd = op.clone();
+                    upd.history.push(ConfidencePoint {
+                        confidence: op.confidence,
+                        at_ms: now,
+                        reason: "reinforced by consolidation".into(),
+                    });
+                    upd.text = text;
+                    upd.confidence = confidence;
+                    upd.updated_at_ms = now;
+                    e.store.upsert_opinion(&upd)?;
+                    opinions[i] = upd;
+                }
+            }
+        }
+    }
+
+    Ok(updated)
+}
+
+/// Consolidate one dirty entity: synthesize (or refine) its observations,
+/// embed them, then clear the entity's dirty row. Every failure isolates to
+/// this entity — its dirty row survives and the next pass retries it — so
+/// one malformed provider response can no longer discard the rest of a
+/// pass's work.
+fn consolidate_entity<'a>(
+    e: &'a Engine,
+    bank_id: &'a str,
+    eid: &'a str,
+    deadline: tokio::time::Instant,
+) -> EntityFut<'a> {
+    Box::pin(async move {
+        if tokio::time::Instant::now() >= deadline {
+            return EntityStep::Deadline;
+        }
+        let entity = match e.store.get_entity(eid) {
+            Ok(Some(x)) => x,
+            // Entity vanished (nothing references it anymore): nothing to
+            // synthesize, clear the stale dirty row.
+            Ok(None) => return clear_ineligible(e, bank_id, eid),
+            Err(error) => {
+                return EntityStep::Failed {
+                    entity_id: eid.to_string(),
+                    error,
+                }
+            }
         };
-        let facts = e.store.facts_for_entity(eid, 60)?;
-        let existing = e.store.observations_for_entity(eid)?;
+        let facts = match e.store.facts_for_entity(eid, 60) {
+            Ok(f) => f,
+            Err(error) => {
+                return EntityStep::Failed {
+                    entity_id: eid.to_string(),
+                    error,
+                }
+            }
+        };
+        let existing = match e.store.observations_for_entity(eid) {
+            Ok(f) => f,
+            Err(error) => {
+                return EntityStep::Failed {
+                    entity_id: eid.to_string(),
+                    error,
+                }
+            }
+        };
         if facts.len() < 2 && existing.is_empty() {
-            continue;
+            return clear_ineligible(e, bank_id, eid);
         }
         let (system, user) = build_consolidation_prompt(&entity.name, &facts, &existing);
         let request = LlmRequest {
@@ -53,11 +241,31 @@ pub(super) async fn consolidate_once(
             temperature: Some(0.0),
             ..Default::default()
         };
-        let resp = with_retry(e, || llm.complete(&request)).await?;
-        let parsed = parse_observations(&resp.content.unwrap_or_default())?;
-        // A parse failure above aborts the whole pass via `?` — intentional:
-        // dirty rows are only cleared after a successful pass, so the next
-        // worker tick re-discovers and retries this entity.
+        let llm = Arc::clone(&e.llm);
+        let resp = match with_retry(e, || llm.complete(&request)).await {
+            Ok(r) => r,
+            Err(error) => {
+                return EntityStep::Failed {
+                    entity_id: eid.to_string(),
+                    error,
+                }
+            }
+        };
+        let parsed = match parse_observations(&resp.content.unwrap_or_default()) {
+            Ok(p) => p,
+            Err(error) => {
+                return EntityStep::Failed {
+                    entity_id: eid.to_string(),
+                    error,
+                }
+            }
+        };
+        let now = e.clock.now_ms();
+        // (observation id, text) pairs awaiting the embedding backfill
+        // below. Tracking ids (not just texts) means each observation gets
+        // its own embedding even when two observations share identical text.
+        let mut obs_pending: Vec<(String, String)> = vec![];
+        let mut wrote = 0usize;
         for p in parsed {
             let mut evidence: Vec<Evidence> = vec![];
             for (idx, quote) in &p.evidence {
@@ -108,14 +316,19 @@ pub(super) async fn consolidate_once(
                     if upd.embedding.is_none() {
                         obs_pending.push((upd.id.clone(), upd.text.clone()));
                     }
-                    e.store.upsert_observation(&upd)?;
-                    updated += 1;
+                    if let Err(error) = e.store.upsert_observation(&upd) {
+                        return EntityStep::Failed {
+                            entity_id: eid.to_string(),
+                            error,
+                        };
+                    }
+                    wrote += 1;
                 }
                 None => {
                     let o = Observation {
                         id: uuid::Uuid::new_v4().to_string(),
                         bank_id: bank_id.to_string(),
-                        entity_id: eid.clone(),
+                        entity_id: eid.to_string(),
                         text: p.text.clone(),
                         evidence,
                         proof_count,
@@ -125,64 +338,64 @@ pub(super) async fn consolidate_once(
                         embedding: None,
                     };
                     obs_pending.push((o.id.clone(), o.text.clone()));
-                    e.store.upsert_observation(&o)?;
-                    updated += 1;
+                    if let Err(error) = e.store.upsert_observation(&o) {
+                        return EntityStep::Failed {
+                            entity_id: eid.to_string(),
+                            error,
+                        };
+                    }
+                    wrote += 1;
                 }
             }
         }
 
-        let matching: Vec<usize> = opinions
-            .iter()
-            .enumerate()
-            .filter(|(_, o)| o.entity_ids.iter().any(|id| id == eid))
-            .map(|(i, _)| i)
-            .collect();
-        for i in matching {
-            let op = opinions[i].clone();
-            let new_facts: Vec<Memory> = facts
-                .iter()
-                .filter(|f| f.mentioned_at_ms > op.updated_at_ms)
-                .cloned()
-                .collect();
-            if new_facts.is_empty() {
-                continue;
+        if !obs_pending.is_empty() {
+            let embed = Arc::clone(&e.embed);
+            let texts: Vec<String> = obs_pending.iter().map(|(_, t)| t.clone()).collect();
+            match with_retry(e, || embed.embed(texts.clone())).await {
+                Ok(embeddings) => {
+                    for ((id, _), emb) in obs_pending.into_iter().zip(embeddings) {
+                        if let Err(error) = e.store.set_observation_embedding(&id, Some(emb)) {
+                            return EntityStep::Failed {
+                                entity_id: eid.to_string(),
+                                error,
+                            };
+                        }
+                    }
+                }
+                Err(error) => {
+                    // Observations are stored but unembeddable for now; the
+                    // None-embedding check re-queues them on the next pass.
+                    return EntityStep::Failed {
+                        entity_id: eid.to_string(),
+                        error,
+                    };
+                }
             }
-            let (system, user) =
-                build_opinion_reinforcement_prompt(&op.text, op.confidence, &new_facts);
-            let request = LlmRequest {
-                system: Some(system),
-                messages: vec![ChatMessage::user(user)],
-                json_mode: true,
-                temperature: Some(0.0),
-                ..Default::default()
+        }
+
+        // Success: clear just this entity's dirty row. Completed entities
+        // survive a later crash or hard-wall abort of the pass.
+        if let Err(error) = e.store.clear_dirty_entities(bank_id, &[eid.to_string()]) {
+            return EntityStep::Failed {
+                entity_id: eid.to_string(),
+                error,
             };
-            let resp = with_retry(e, || llm.complete(&request)).await?;
-            if let Some((text, confidence)) =
-                parse_reinforcement(&resp.content.unwrap_or_default())?
-            {
-                let mut upd = op.clone();
-                upd.history.push(ConfidencePoint {
-                    confidence: op.confidence,
-                    at_ms: now,
-                    reason: "reinforced by consolidation".into(),
-                });
-                upd.text = text;
-                upd.confidence = confidence;
-                upd.updated_at_ms = now;
-                e.store.upsert_opinion(&upd)?;
-                opinions[i] = upd;
-            }
         }
-    }
-
-    if !obs_pending.is_empty() {
-        let texts: Vec<String> = obs_pending.iter().map(|(_, t)| t.clone()).collect();
-        let embeddings = with_retry(e, || embed.embed(texts.clone())).await?;
-        for ((id, _), emb) in obs_pending.into_iter().zip(embeddings) {
-            e.store.set_observation_embedding(&id, Some(emb))?;
+        EntityStep::Done {
+            entity_id: eid.to_string(),
+            observations: wrote,
         }
-    }
+    })
+}
 
-    e.store.clear_dirty_entities(bank_id, &dirty)?;
-    Ok(updated)
+/// Clear a dirty row for an entity with nothing to synthesize.
+fn clear_ineligible(e: &Engine, bank_id: &str, eid: &str) -> EntityStep {
+    match e.store.clear_dirty_entities(bank_id, &[eid.to_string()]) {
+        Ok(()) => EntityStep::Ineligible,
+        Err(error) => EntityStep::Failed {
+            entity_id: eid.to_string(),
+            error,
+        },
+    }
 }

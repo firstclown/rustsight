@@ -196,8 +196,8 @@ async fn main() {
             .recall(RecallRequest {
                 bank_id: bank,
                 query,
+                top_k_per_arm: engine.config.recall_budget.resolve(None, budget),
                 token_budget: budget,
-                top_k_per_arm: 10,
                 kinds: None,
             })
             .await

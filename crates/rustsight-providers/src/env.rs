@@ -8,10 +8,18 @@ use std::time::Duration;
 /// timeouts so a stalled provider connection can never hang retain/recall
 /// — or hold the single-flight consolidation lock — forever. One client
 /// across LLM/embed/rerank also gives a shared connection pool.
-fn http_client() -> Result<reqwest::Client, String> {
+///
+/// The total timeout covers connect through the last body byte: a slow
+/// provider that streams a long completion past the wall dies as a
+/// transient transport error (retried by the engine). Defaults to 300s
+/// because large extraction calls on cheap providers routinely exceed two
+/// minutes end-to-end; override with `RUSTSIGHT_HTTP_TIMEOUT_SECS`
+/// (clamped to 5–3600, invalid values fall back with a warning).
+pub fn http_client() -> Result<reqwest::Client, String> {
+    let timeout_secs = var_num("RUSTSIGHT_HTTP_TIMEOUT_SECS", 300, 5, 3600);
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(120))
+        .timeout(Duration::from_secs(timeout_secs as u64))
         .build()
         .map_err(|e| format!("http client: {e}"))
 }

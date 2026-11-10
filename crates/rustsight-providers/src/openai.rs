@@ -18,6 +18,21 @@ fn truncate(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
+/// Formats an error with its full cause chain. reqwest's own Display stops
+/// at the first layer — "error decoding response body" — hiding whether the
+/// body died to a timeout, a dropped connection, or bad bytes, exactly the
+/// distinction that decides retry-vs-abort upstream.
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut src = e.source();
+    while let Some(s) = src {
+        out.push_str(": ");
+        out.push_str(&s.to_string());
+        src = s.source();
+    }
+    out
+}
+
 fn map_req(req: &LlmRequest) -> Vec<Value> {
     let mut messages: Vec<Value> = vec![];
     if let Some(s) = &req.system {
@@ -92,9 +107,12 @@ impl LlmProvider for OpenAiCompat {
             .json(&body)
             .send()
             .await
-            .map_err(|e| Error::Llm(e.to_string()))?;
+            .map_err(|e| Error::LlmTransport(error_chain(&e)))?;
         let status = resp.status();
-        let text = resp.text().await.map_err(|e| Error::Llm(e.to_string()))?;
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| Error::LlmTransport(error_chain(&e)))?;
         if !status.is_success() {
             return Err(Error::LlmStatus {
                 status: status.as_u16(),
@@ -163,9 +181,12 @@ impl EmbedProvider for OpenAiEmbed {
             .json(&json!({"model": self.model, "input": texts}))
             .send()
             .await
-            .map_err(|e| Error::Embed(e.to_string()))?;
+            .map_err(|e| Error::EmbedTransport(error_chain(&e)))?;
         let status = resp.status();
-        let text = resp.text().await.map_err(|e| Error::Embed(e.to_string()))?;
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| Error::EmbedTransport(error_chain(&e)))?;
         if !status.is_success() {
             return Err(Error::EmbedStatus {
                 status: status.as_u16(),
@@ -231,12 +252,12 @@ impl RerankProvider for ApiRerank {
             }))
             .send()
             .await
-            .map_err(|e| Error::Rerank(e.to_string()))?;
+            .map_err(|e| Error::Rerank(error_chain(&e)))?;
         let status = resp.status();
         let text = resp
             .text()
             .await
-            .map_err(|e| Error::Rerank(e.to_string()))?;
+            .map_err(|e| Error::Rerank(error_chain(&e)))?;
         if !status.is_success() {
             return Err(Error::Rerank(format!(
                 "{}: {}",
@@ -253,6 +274,9 @@ impl RerankProvider for ApiRerank {
     }
 }
 
+/// The no-op reranker: no model, no relevance signal. Returns no scores;
+/// the engine detects `is_passthrough()` and seeds the combined-scoring
+/// base from RRF rank (upstream's `RRFPassthroughCrossEncoder`).
 pub struct NoopRerank;
 
 #[async_trait]
@@ -260,15 +284,58 @@ impl RerankProvider for NoopRerank {
     async fn rerank(
         &self,
         _query: &str,
-        docs: &[String],
-        top_k: usize,
+        _docs: &[String],
+        _top_k: usize,
     ) -> Result<Vec<(usize, f32)>> {
-        Ok((0..docs.len().min(top_k))
-            .map(|i| (i, 1.0 - i as f32 * 0.001))
-            .collect())
+        Ok(vec![])
+    }
+
+    fn is_passthrough(&self) -> bool {
+        true
     }
 }
 
 pub fn chat_message_debug(m: &ChatMessage) -> String {
     format!("{:?}: {}", m.role, m.content)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct Nest(&'static str, Option<Box<Nest>>);
+
+    impl std::fmt::Display for Nest {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for Nest {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1
+                .as_deref()
+                .map(|inner| inner as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    /// The chain must surface the layers reqwest's Display hides: a bare
+    /// "error decoding response body" says nothing about retryability,
+    /// while its cause ("operation timed out") decides it.
+    #[test]
+    fn error_chain_includes_every_cause_layer() {
+        let err = Nest(
+            "error decoding response body",
+            Some(Box::new(Nest(
+                "request or response body error",
+                Some(Box::new(Nest("operation timed out", None))),
+            ))),
+        );
+        assert_eq!(
+            error_chain(&err),
+            "error decoding response body: request or response body error: operation timed out"
+        );
+        assert_eq!(error_chain(&Nest("flat", None)), "flat");
+    }
 }

@@ -6,6 +6,7 @@ members = [
     "crates/rustsight-providers",
     "crates/rustsight-server",
     "crates/rustsight-cli",
+    "crates/rustsight-eval",
 ]
 
 [workspace.package]

@@ -41,7 +41,15 @@ pub trait MemoryStore: Send + Sync {
     fn find_by_alias(&self, bank_id: &str, alias: &str) -> Result<Option<Entity>>;
     fn entities_for_bank(&self, bank_id: &str) -> Result<Vec<Entity>>;
     fn add_alias(&self, bank_id: &str, alias: &str, entity_id: &str) -> Result<()>;
-    fn link_memory_entities(&self, memory_id: &MemoryId, links: &[(String, String)]) -> Result<()>;
+    /// Link a stored memory to resolved entities and advance each entity's
+    /// `last_mentioned_ms` to `at_ms` (the fact's effective date — upstream
+    /// advances its `last_seen` stat by the mention's event date).
+    fn link_memory_entities(
+        &self,
+        memory_id: &MemoryId,
+        links: &[(String, String)],
+        at_ms: i64,
+    ) -> Result<()>;
     fn memory_entity_ids(&self, memory_id: &MemoryId) -> Result<Vec<String>>;
     fn coentities(&self, entity_id: &str, limit: usize) -> Result<Vec<String>>;
     /// Batched [`MemoryStore::coentities`]: co-occurring entity ids for
@@ -54,6 +62,11 @@ pub trait MemoryStore: Send + Sync {
         entity_ids: &[String],
         limit: usize,
     ) -> Result<HashMap<String, Vec<String>>>;
+    /// Whole-bank co-occurrence snapshot for entity resolution: partner
+    /// *names* per entity id plus per-name degrees, taken before the batch's
+    /// new links land (upstream's resolution reads the co-occurrence table
+    /// pre-commit and flushes this batch's pairs afterwards).
+    fn cooccurrence_index(&self, bank_id: &str) -> Result<CooccurrenceIndex>;
     fn facts_for_entity(&self, entity_id: &str, limit: usize) -> Result<Vec<Memory>>;
     /// Batched [`MemoryStore::facts_for_entity`]: each entity's
     /// `per_entity_limit` most recently mentioned linked memories, in one
@@ -70,6 +83,10 @@ pub trait MemoryStore: Send + Sync {
     fn mark_entities_dirty(&self, bank_id: &str, entity_ids: &[String], reason: &str)
         -> Result<()>;
     fn list_dirty_entities(&self, bank_id: &str, limit: usize) -> Result<Vec<String>>;
+    /// Dirty-entity count for a bank, without pulling the ids — progress
+    /// tracking for the background worker and the eval harness's
+    /// no-progress detection.
+    fn count_dirty_entities(&self, bank_id: &str) -> Result<usize>;
     fn clear_dirty_entities(&self, bank_id: &str, entity_ids: &[String]) -> Result<()>;
     fn banks_with_dirty(&self) -> Result<Vec<String>>;
 

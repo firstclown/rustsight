@@ -207,7 +207,9 @@ async fn recall(
             bank_id,
             query: body.query,
             token_budget: body.token_budget.unwrap_or(1000),
-            top_k_per_arm: body.top_k_per_arm.unwrap_or(10),
+            top_k_per_arm: body
+                .top_k_per_arm
+                .unwrap_or_else(|| engine.config.recall_budget.resolve(None, 1000)),
             kinds: None,
         })
         .await

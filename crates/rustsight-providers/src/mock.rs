@@ -338,7 +338,15 @@ impl TokenEstimator for SimpleTokenEstimator {
 pub struct FlakyLlm {
     inner: Arc<dyn LlmProvider>,
     failures_left: AtomicUsize,
-    status: u16,
+    failure: Failure,
+}
+
+/// What a flaky provider fails with.
+enum Failure {
+    /// Transient HTTP status (429/5xx).
+    Status(u16),
+    /// Transport-level failure (dropped connection, timeout).
+    Transport,
 }
 
 impl FlakyLlm {
@@ -346,7 +354,17 @@ impl FlakyLlm {
         Self {
             inner,
             failures_left: AtomicUsize::new(fail_calls),
-            status,
+            failure: Failure::Status(status),
+        }
+    }
+
+    /// Fails the first `fail_calls` calls with `Error::LlmTransport` instead
+    /// of an HTTP status — the shape a reqwest send/body error maps to.
+    pub fn new_transport(inner: Arc<dyn LlmProvider>, fail_calls: usize) -> Self {
+        Self {
+            inner,
+            failures_left: AtomicUsize::new(fail_calls),
+            failure: Failure::Transport,
         }
     }
 }
@@ -357,9 +375,16 @@ impl LlmProvider for FlakyLlm {
         let left = self.failures_left.load(Ordering::SeqCst);
         if left > 0 {
             self.failures_left.store(left - 1, Ordering::SeqCst);
-            return Err(Error::LlmStatus {
-                status: self.status,
-                message: "simulated transient failure".into(),
+            return Err(match self.failure {
+                Failure::Status(status) => Error::LlmStatus {
+                    status,
+                    message: "simulated transient failure".into(),
+                },
+                Failure::Transport => Error::LlmTransport(
+                    "error decoding response body: request or response body error: operation \
+                     timed out"
+                        .into(),
+                ),
             });
         }
         self.inner.complete(req).await

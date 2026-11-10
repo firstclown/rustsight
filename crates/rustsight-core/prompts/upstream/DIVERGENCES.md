@@ -63,6 +63,42 @@ the *engine* intentionally deviates from upstream, and what was not ported.
    (`_current_utc_datetime`, minute precision for prompt caching); the Rust
    builders take `current_datetime: &str` so tests are deterministic. Rendered
    text is identical for identical timestamps.
+7. **Entity resolution is an exact port; candidate generation is upstream's
+   "full" strategy shape.** `engine/retain.rs` + `entity.rs` + `trigram.rs`
+   port the scoring model of upstream `memories/pg/entity_resolver.py` (tag
+   v1.1.0) verbatim: pg_trgm trigram machinery, the 0.3 `merge_min_similarity`
+   floor, the `_tokens_are_compatible` word-by-word gate (with the numbers
+   rule and single-word exemption), the identical-trigram short-circuit to
+   1.0, the `0.5·SequenceMatcher-ratio + 0.3·damped-co-occurrence +
+   0.2·7-day-recency` score against the inclusive 0.6 threshold (rounded to
+   6dp), and the in-batch union-find clustering of new names (0.5 trigram
+   bar, most-mentioned→shortest→lexicographic canonical, 250-name cap). Two
+   structural simplifications, neither observable in the scored set: (a)
+   candidates are the bank's whole entity list — upstream's `full` strategy
+   — rather than a trigram-index probe (upstream's own perf path; the 0.3
+   floor gates identically afterwards); (b) co-occurrence pairs are computed
+   from `memory_entities` at resolve time instead of a persisted
+   `entity_cooccurrences` table (same pair set, same degrees, same
+   pre-batch snapshot timing). Name keys use rustsight's punctuation-stripped
+   `normalize_name` aliases (storage-layer parity, see item 3); scoring
+   inputs are whitespace-collapsed lowercased display strings exactly as
+   upstream compares them. difflib's `SequenceMatcher.ratio` is ported
+   bit-compatibly (unit-tested against Python-generated values).
+8. **Recall pool width + rerank combined scoring ported; recall is still not
+   TEMR.** reflect/mental recall derive their per-arm limit from
+   `RecallBudgetConfig` (upstream `_resolve_thinking_budget`: None → MID,
+   fixed 100/300/1000, adaptive 0.025/0.075/0.25 clamped [20, 2000]); the
+   graph arm seeds from 20 hits (upstream `GRAPH_SEED_LIMIT`) instead of 5;
+   rerank scores the whole fused pool (`reranker_max_candidates` 0 =
+   unlimited) and is followed by upstream's `apply_combined_scoring`
+   (sigmoid/passthrough CE normalization, `RRFPassthroughCrossEncoder`
+   seeding from RRF rank for no-op rerankers, linear 365-day recency decay
+   with the 0.1 floor and coarse-period handling, log-normalized proof-count
+   boost; temporal boost carried at neutral). rustsight's recall remains
+   structurally simpler than upstream's TEMR pipeline — the per-arm limit
+   spans all memory kinds rather than per fact_type (upstream's reflect
+   recall filters to world/experience), and rustsight's reflect keeps its
+   own tool loop (see item 5); full TEMR parity is ticketed as RS-15.
 
 ## Not ported (no parity claim)
 

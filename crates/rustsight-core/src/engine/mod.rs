@@ -4,11 +4,13 @@ mod mental;
 mod recall;
 mod reflect;
 mod retain;
+mod scoring;
 
 use crate::prompts::extraction::ExtractionConfig;
 use crate::traits::{Clock, EmbedProvider, LlmProvider, RerankProvider, TokenEstimator};
 use crate::types::*;
 use crate::{Error, MemoryStore, ResolverConfig, Result};
+pub use scoring::{Budget, BudgetFunction, RecallBudgetConfig, ScoringConfig};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
@@ -25,6 +27,18 @@ pub struct EngineConfig {
     pub semantic_edge_cap: usize,
     pub extract: ExtractionConfig,
     pub reflect_max_rounds: usize,
+    /// Recall-pool sizing (upstream `recall_budget_*`): the per-arm limit a
+    /// reflect/recall tool call uses, derived from the budget level and —
+    /// for the adaptive function — the caller's token budget. Defaults to
+    /// upstream's fixed MID = 300.
+    pub recall_budget: RecallBudgetConfig,
+    /// Rerank combined-scoring knobs (upstream `apply_combined_scoring`
+    /// defaults: recency/temporal ±10%, proof-count ±5%, linear recency
+    /// decay over 365 days).
+    pub scoring: ScoringConfig,
+    /// Cap on the number of candidates handed to the reranker; 0 = no cap
+    /// (upstream `reranker_max_candidates`, default 0 = unlimited).
+    pub reranker_max_candidates: usize,
     /// Target size of retain content chunks, measured with the configured
     /// `TokenEstimator`. Content at or below this size is extracted in one
     /// request.
@@ -32,16 +46,25 @@ pub struct EngineConfig {
     /// Token overlap between consecutive retain chunks; the overlap usually
     /// re-extracts boundary facts, which are deduped on merge.
     pub chunk_overlap_tokens: usize,
-    /// Total attempts for transient (HTTP 429/5xx) provider failures.
+    /// Total attempts for transient provider failures (HTTP 429/5xx and
+    /// transport-level drops/timeouts).
     pub retry_max_attempts: usize,
     /// Backoff base for retries; attempt N waits `base * 2^(N-1)` ms.
     pub retry_base_delay_ms: u64,
-    /// Hard wall (seconds) for one consolidation pass. A stalled provider
-    /// call inside a pass would otherwise hold the single-flight
-    /// consolidation lock forever, wedging background consolidation for
-    /// every bank. Timed-out passes abort with an error; dirty rows
-    /// survive (cleared only after success) and are retried next tick.
+    /// Consolidation pass budget, in seconds. Doubles as (a) a soft
+    /// deadline — once it elapses a pass stops *starting* new entities and
+    /// returns the progress it made, so a slow-but-progressing queue keeps
+    /// moving instead of being killed mid-flight — and (b) the base for the
+    /// hard wall at twice the budget that aborts a pass whose in-flight
+    /// provider call truly wedges (a wedged call would otherwise hold the
+    /// single-flight consolidation lock forever). Per-entity dirty rows are
+    /// cleared as each entity completes, so both early returns keep every
+    /// finished entity's work.
     pub consolidate_timeout_secs: u64,
+    /// How many dirty entities a consolidation pass synthesizes
+    /// concurrently. Bounded on purpose: each entity is one LLM round
+    /// trip, and an unbounded fan-out would trip provider rate limits.
+    pub consolidate_concurrency: usize,
 }
 
 impl Default for EngineConfig {
@@ -56,11 +79,15 @@ impl Default for EngineConfig {
             semantic_edge_cap: 10,
             extract: ExtractionConfig::default(),
             reflect_max_rounds: 8,
+            recall_budget: RecallBudgetConfig::default(),
+            scoring: ScoringConfig::default(),
+            reranker_max_candidates: 0,
             chunk_size_tokens: 3000,
             chunk_overlap_tokens: 200,
             retry_max_attempts: 3,
             retry_base_delay_ms: 400,
             consolidate_timeout_secs: 600,
+            consolidate_concurrency: 4,
         }
     }
 }
@@ -124,24 +151,38 @@ impl Engine {
     ///
     /// Serialized by an engine-level single-flight guard: concurrent callers
     /// (background worker, HTTP endpoint, CLI) queue up instead of
-    /// double-processing the same dirty entities. Dirty rows are only cleared
-    /// at the end of a successful pass, so a caller that arrives after a
-    /// completed pass simply finds an empty queue and returns `0`.
+    /// double-processing the same dirty entities. Dirty rows are cleared as
+    /// each entity completes, so a caller that arrives after a completed
+    /// pass simply finds an empty queue and returns `0`.
     ///
-    /// The pass itself is bounded by `consolidate_timeout_secs`; a timed-out
-    /// pass drops its in-flight work (dirty rows survive, retried next tick)
-    /// so a wedged provider can never hold the single-flight lock forever.
+    /// The pass is bounded two ways (see `consolidate_timeout_secs`): a soft
+    /// deadline stops starting new entities — the pass then returns the
+    /// progress it made, and the caller starts a fresh pass for the rest —
+    /// and a hard wall aborts a pass with a wedged in-flight provider call
+    /// so it can never hold the single-flight lock forever. Both paths keep
+    /// every completed entity's work; unfinished entities stay dirty and
+    /// retry on the next pass.
     pub async fn consolidate_once(&self, bank_id: &str, max_entities: usize) -> Result<usize> {
         let _guard = self.consolidate_lock.lock().await;
+        // The hard wall fires at twice the pass budget: entities stop
+        // *starting* at the budget (see `consolidate_timeout_secs`), and the
+        // extra budget of grace lets those in-flight calls land instead of
+        // being cancelled mid-request. Only a truly wedged provider call —
+        // one that ignores even that window — is cut off so it cannot hold
+        // the single-flight lock forever.
+        let wall = self
+            .config
+            .consolidate_timeout_secs
+            .max(1)
+            .saturating_mul(2);
         let pass = tokio::time::timeout(
-            Duration::from_secs(self.config.consolidate_timeout_secs.max(1)),
+            Duration::from_secs(wall),
             consolidate::consolidate_once(self, bank_id, max_entities),
         );
         match pass.await {
             Ok(result) => result,
             Err(_elapsed) => Err(Error::Llm(format!(
-                "consolidation pass for bank {bank_id} timed out after {}s",
-                self.config.consolidate_timeout_secs
+                "consolidation pass for bank {bank_id} timed out after {wall}s"
             ))),
         }
     }
@@ -207,10 +248,12 @@ impl Engine {
     }
 }
 
-/// Run a provider call, retrying transient failures (HTTP 429/5xx surfaced as
-/// typed statuses) with exponential backoff: attempt N waits
-/// `retry_base_delay_ms * 2^(N-1)` before firing, up to
-/// `retry_max_attempts` total attempts. Non-transient errors surface
+/// Run a provider call, retrying transient failures — HTTP 429/5xx (typed
+/// statuses) and transport-level failures like a dropped connection or
+/// timeout (`Error::LlmTransport`/`EmbedTransport`, where the call never
+/// got a protocol answer and is safe to re-issue) — with exponential
+/// backoff: attempt N waits `retry_base_delay_ms * 2^(N-1)` before firing,
+/// up to `retry_max_attempts` total attempts. Non-transient errors surface
 /// immediately after the first attempt.
 pub(crate) async fn with_retry<T, F, Fut>(e: &Engine, op: F) -> Result<T>
 where

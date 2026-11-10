@@ -81,6 +81,7 @@ mod tests {
             occurred_end_ms: None,
             mentioned_at_ms: None,
             entity_ids: vec![],
+            proof_count: None,
         }
     }
 
