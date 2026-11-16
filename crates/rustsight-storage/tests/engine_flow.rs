@@ -6,7 +6,7 @@ use rustsight_providers::{
 };
 use rustsight_storage::SqliteStore;
 use serde_json::json;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -33,6 +33,7 @@ async fn retain(e: &Engine, bank: &str, content: &str) -> RetainResponse {
         content: content.into(),
         context: None,
         timestamp_ms: None,
+        ..Default::default()
     })
     .await
     .unwrap()
@@ -58,6 +59,7 @@ async fn retain_extracts_and_recall_finds() {
             token_budget: 500,
             top_k_per_arm: 10,
             kinds: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -98,6 +100,7 @@ async fn temporal_window_recall() {
         content: "CONTENT marker: Alice visited Rome.".into(),
         context: None,
         timestamp_ms: Some(1_683_648_000_000),
+        ..Default::default()
     })
     .await
     .unwrap();
@@ -108,6 +111,7 @@ async fn temporal_window_recall() {
             token_budget: 500,
             top_k_per_arm: 10,
             kinds: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -181,6 +185,9 @@ async fn recall_strategies_used_keeps_fixed_order() {
                     embedding: emb[0].clone(),
                     source: None,
                     context: None,
+                    document_id: None,
+                    tags: vec![],
+                    metadata: None,
                 },
                 NewMemoryRecord {
                     kind: MemoryKind::World,
@@ -192,6 +199,9 @@ async fn recall_strategies_used_keeps_fixed_order() {
                     embedding: emb[1].clone(),
                     source: None,
                     context: None,
+                    document_id: None,
+                    tags: vec![],
+                    metadata: None,
                 },
             ],
         )
@@ -214,6 +224,7 @@ async fn recall_strategies_used_keeps_fixed_order() {
             token_budget: 500,
             top_k_per_arm: 3,
             kinds: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -342,6 +353,16 @@ fn tool_call(id: &str, name: &str, args: serde_json::Value) -> LlmResponse {
     }
 }
 
+/// One turn of the final-synthesis call (upstream's answer machine) — the
+/// scripted sequence for every reflect is: loop turns → [forced-done] →
+/// synthesis → opinion extraction.
+fn synthesis_resp(text: &str) -> LlmResponse {
+    LlmResponse {
+        content: Some(text.into()),
+        tool_calls: vec![],
+    }
+}
+
 fn extraction_resp() -> LlmResponse {
     LlmResponse {
         content: Some(
@@ -362,10 +383,6 @@ async fn reflect_loop_with_scripted_tools() {
             "finish",
             json!({"answer": "Alice works at Google.", "citations": ["bogus-id"]}),
         ),
-        LlmResponse {
-            content: Some(r#"{"opinions":[]}"#.into()),
-            tool_calls: vec![],
-        },
     ]);
     let e = Engine::new(
         Arc::new(store),
@@ -378,13 +395,73 @@ async fn reflect_loop_with_scripted_tools() {
     retain(&e, "r", "Alice works at Google as an engineer.").await;
     let resp = e.reflect("r", "What does Alice do?").await.unwrap();
     assert_eq!(resp.answer, "Alice works at Google.");
+    // Upstream done-first precedence: the loop's own finish answer wins;
+    // no standalone synthesis call runs.
+    assert_eq!(resp.answer_path, AnswerPath::Loop);
+    assert!(!resp.synthesized);
     assert!(resp.rounds >= 2);
     assert!(resp.retrieved >= 1);
     assert!(
         resp.citations.is_empty(),
         "bogus citation must be filtered: {resp:?}"
     );
-    assert_eq!(resp.opinions_formed, 0);
+}
+
+#[tokio::test]
+async fn reflect_unwraps_finish_shaped_content_answers() {
+    // 2026-11-11 parity-run failure mode: gpt-oss emitted the `finish`
+    // arguments as plain JSON content instead of a tool call, so the raw
+    // `{"answer": ..., "citations": [...]}` envelope became the visible
+    // answer and citations validated to zero. The loop must unwrap the
+    // envelope and validate its citations like a real finish call.
+    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let mk_engine = |llm: Arc<dyn LlmProvider>| {
+        Engine::new(
+            store.clone(),
+            llm,
+            Arc::new(MockEmbed::default()),
+            Arc::new(MockRerank),
+            Arc::new(SimpleTokenEstimator),
+            Arc::new(FixedClock::new(1_800_000_000_000)),
+        )
+    };
+    let seeder = mk_engine(Arc::new(MockLlm::script(vec![extraction_resp()])));
+    retain(&seeder, "fj", "Alice works at Google as an engineer.").await;
+    let real_id = seeder
+        .recall(RecallRequest {
+            bank_id: "fj".into(),
+            query: "Alice".into(),
+            token_budget: 500,
+            top_k_per_arm: 5,
+            kinds: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .memories[0]
+        .id
+        .clone();
+
+    let script = MockLlm::script(vec![
+        tool_call("1", "recall", json!({"query": "Alice"})),
+        LlmResponse {
+            content: Some(format!(
+                r#"{{"answer": "Alice works at Google.", "citations": ["{real_id}", "bogus-id"]}}"#
+            )),
+            tool_calls: vec![],
+        },
+    ]);
+    let e = mk_engine(Arc::new(script));
+    let resp = e.reflect("fj", "What does Alice do?").await.unwrap();
+    assert_eq!(
+        resp.answer, "Alice works at Google.",
+        "JSON envelope must not leak into the answer: {resp:?}"
+    );
+    assert_eq!(
+        resp.citations,
+        vec![real_id],
+        "unwrapped citations validate against retrieved ids: {resp:?}"
+    );
 }
 
 #[tokio::test]
@@ -464,10 +541,6 @@ async fn reflect_citations_limited_to_read_observations() {
             "finish",
             json!({"answer": "Hana leads design.", "citations": [ivan_obs, hana_obs.clone()]}),
         ),
-        LlmResponse {
-            content: Some(r#"{"opinions":[]}"#.into()),
-            tool_calls: vec![],
-        },
     ]);
     let e = mk_engine(Arc::new(script));
     let resp = e.reflect("cl", "What about Hana?").await.unwrap();
@@ -489,6 +562,9 @@ async fn reflect_forms_and_stores_opinions() {
             "finish",
             json!({"answer": "I think Python suits this project."}),
         ),
+        // closing ask: plain prose, not finish-shaped — ignored, the
+        // volunteered answer stands
+        synthesis_resp("Not a finish call."),
         LlmResponse {
             content: Some(
                 r#"{"opinions":[{"text":"I think Python suits this project.","confidence":0.8}]}"#
@@ -515,9 +591,20 @@ async fn reflect_forms_and_stores_opinions() {
         .reflect("o", "Which language should I use?")
         .await
         .unwrap();
-    assert_eq!(resp.opinions_formed, 1);
-    let ops = e.store.list_opinions("o").unwrap();
-    assert_eq!(ops.len(), 1);
+    assert_eq!(resp.answer, "I think Python suits this project.");
+    assert_eq!(resp.answer_path, AnswerPath::Loop);
+    // Opinion formation is backgrounded off the response path: poll the
+    // store until the spawned extraction lands (bounded, like the worker
+    // tests).
+    let mut ops = vec![];
+    for _ in 0..200 {
+        ops = e.store.list_opinions("o").unwrap();
+        if ops.len() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(ops.len(), 1, "opinion must form in the background");
     assert!((ops[0].confidence - 0.8).abs() < 1e-6);
     assert!(ops[0].embedding.is_some());
 }
@@ -549,27 +636,21 @@ async fn reflect_completes_from_batched_tool_calls() {
         .next()
         .expect("retained memory");
 
-    let script = MockLlm::script(vec![
-        LlmResponse {
-            content: None,
-            tool_calls: vec![
-                ToolCall {
-                    id: "1".into(),
-                    name: "recall".into(),
-                    arguments: json!({"query": "Alice"}),
-                },
-                ToolCall {
-                    id: "2".into(),
-                    name: "finish".into(),
-                    arguments: json!({"answer": "Alice works at Google.", "citations": [mem_id]}),
-                },
-            ],
-        },
-        LlmResponse {
-            content: Some(r#"{"opinions":[]}"#.into()),
-            tool_calls: vec![],
-        },
-    ]);
+    let script = MockLlm::script(vec![LlmResponse {
+        content: None,
+        tool_calls: vec![
+            ToolCall {
+                id: "1".into(),
+                name: "recall".into(),
+                arguments: json!({"query": "Alice"}),
+            },
+            ToolCall {
+                id: "2".into(),
+                name: "finish".into(),
+                arguments: json!({"answer": "Alice works at Google.", "citations": [mem_id]}),
+            },
+        ],
+    }]);
     let e = Engine::new(
         store,
         Arc::new(script),
@@ -580,7 +661,11 @@ async fn reflect_completes_from_batched_tool_calls() {
     );
     let resp = e.reflect("batch", "What does Alice do?").await.unwrap();
     assert_eq!(resp.answer, "Alice works at Google.");
-    assert_eq!(resp.rounds, 1, "batched recall+finish is one round");
+    assert_eq!(resp.answer_path, AnswerPath::Loop);
+    assert_eq!(
+        resp.rounds, 2,
+        "batched recall+finish is one loop round + the closing ask"
+    );
     assert!(
         resp.citations.contains(&mem_id),
         "recall in the same batch makes its memories citable: {resp:?}"
@@ -599,6 +684,44 @@ async fn reflect_nudges_past_empty_response() {
             tool_calls: vec![],
         },
         tool_call("1", "finish", json!({"answer": "Recovered after a nudge."})),
+    ]);
+    let e = Engine::new(
+        Arc::new(store),
+        Arc::new(script),
+        Arc::new(MockEmbed::default()),
+        Arc::new(MockRerank),
+        Arc::new(SimpleTokenEstimator),
+        Arc::new(FixedClock::new(1_800_000_000_000)),
+    );
+    let resp = e.reflect("quiet", "Anybody there?").await.unwrap();
+    assert_eq!(resp.answer, "Recovered after a nudge.");
+    assert_eq!(resp.answer_path, AnswerPath::Loop);
+    assert_eq!(resp.rounds, 3, "nudge round + finish round + closing ask");
+}
+
+/// Two consecutive empty responses no longer fail the question: the loop
+/// hands off to the forced-done round and the final-synthesis call, which
+/// composes an answer from whatever the tools gathered (here: nothing —
+/// the synthesis still answers, from the no-data prompt).
+#[tokio::test]
+async fn reflect_synthesizes_after_consecutive_empty_responses() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    // empty, empty (loop breaks), empty (forced-done), "Nothing known."
+    // (synthesis), opinions.
+    let script = MockLlm::script(vec![
+        LlmResponse {
+            content: None,
+            tool_calls: vec![],
+        },
+        LlmResponse {
+            content: None,
+            tool_calls: vec![],
+        },
+        LlmResponse {
+            content: None,
+            tool_calls: vec![],
+        },
+        synthesis_resp("Nothing known."),
         LlmResponse {
             content: Some(r#"{"opinions":[]}"#.into()),
             tool_calls: vec![],
@@ -612,39 +735,11 @@ async fn reflect_nudges_past_empty_response() {
         Arc::new(SimpleTokenEstimator),
         Arc::new(FixedClock::new(1_800_000_000_000)),
     );
-    let resp = e.reflect("quiet", "Anybody there?").await.unwrap();
-    assert_eq!(resp.answer, "Recovered after a nudge.");
-    assert_eq!(resp.rounds, 2);
-}
-
-/// Two consecutive empty responses still fail — the nudge is a retry, not
-/// an infinite loop; rounds and the streak bound it.
-#[tokio::test]
-async fn reflect_fails_after_consecutive_empty_responses() {
-    let store = SqliteStore::open_in_memory().unwrap();
-    let script = MockLlm::script(vec![
-        LlmResponse {
-            content: None,
-            tool_calls: vec![],
-        },
-        LlmResponse {
-            content: None,
-            tool_calls: vec![],
-        },
-    ]);
-    let e = Engine::new(
-        Arc::new(store),
-        Arc::new(script),
-        Arc::new(MockEmbed::default()),
-        Arc::new(MockRerank),
-        Arc::new(SimpleTokenEstimator),
-        Arc::new(FixedClock::new(1_800_000_000_000)),
-    );
-    let err = e.reflect("silent", "q").await.unwrap_err();
-    assert!(
-        err.to_string().contains("empty response"),
-        "unexpected error: {err}"
-    );
+    let resp = e.reflect("silent", "q").await.unwrap();
+    assert_eq!(resp.answer, "Nothing known.");
+    assert_eq!(resp.answer_path, AnswerPath::Synthesis);
+    assert!(resp.synthesized);
+    assert!(resp.citations.is_empty());
 }
 
 fn facts_resp(facts: &[(&str, &str)]) -> LlmResponse {
@@ -673,6 +768,8 @@ async fn opinion_linked_to_entity_is_reinforced_by_consolidation() {
             "finish",
             json!({"answer": "I think Alice is meticulous."}),
         ),
+        // closing ask: plain prose, not finish-shaped — ignored
+        synthesis_resp("Not a finish call."),
         // opinion extraction tags the entity the opinion is about
         LlmResponse {
             content: Some(
@@ -713,8 +810,18 @@ async fn opinion_linked_to_entity_is_reinforced_by_consolidation() {
         .reflect("ri", "What do you think of Alice?")
         .await
         .unwrap();
-    assert_eq!(resp.opinions_formed, 1);
+    assert_eq!(resp.answer_path, AnswerPath::Loop);
 
+    // The opinion forms in a background task; wait for it before the
+    // scripted retain #2 below (they share one script queue).
+    let mut ops = vec![];
+    for _ in 0..200 {
+        ops = e.store.list_opinions("ri").unwrap();
+        if ops.len() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     let alice = e
         .store
         .entities_for_bank("ri")
@@ -722,7 +829,6 @@ async fn opinion_linked_to_entity_is_reinforced_by_consolidation() {
         .into_iter()
         .find(|x| x.name == "Alice")
         .expect("alice entity exists");
-    let ops = e.store.list_opinions("ri").unwrap();
     assert_eq!(ops.len(), 1);
     assert_eq!(ops[0].entity_ids, vec![alice.id.clone()]);
     assert!((ops[0].confidence - 0.6).abs() < 1e-6);
@@ -735,6 +841,7 @@ async fn opinion_linked_to_entity_is_reinforced_by_consolidation() {
                 .into(),
         context: None,
         timestamp_ms: Some(1_800_003_600_000),
+        ..Default::default()
     })
     .await
     .unwrap();
@@ -781,6 +888,7 @@ async fn opinion_without_entities_is_untouched_by_consolidation() {
         context: None,
         // later than the opinion so the recency filter alone would not spare it
         timestamp_ms: Some(1_800_003_600_000),
+        ..Default::default()
     })
     .await
     .unwrap();
@@ -1036,6 +1144,7 @@ async fn retain_fails_fast_on_permanent_llm_error() {
             content: "Fay moved to Reno last winter.".into(),
             context: None,
             timestamp_ms: None,
+            ..Default::default()
         })
         .await
         .unwrap_err();
@@ -1052,10 +1161,6 @@ async fn reflect_retries_transient_llm_failure() {
     let inner = MockLlm::script(vec![
         tool_call("1", "recall", json!({"query": "anything"})),
         tool_call("2", "finish", json!({"answer": "Fine."})),
-        LlmResponse {
-            content: Some(r#"{"opinions":[]}"#.into()),
-            tool_calls: vec![],
-        },
     ]);
     let e = Engine::new(
         Arc::new(SqliteStore::open_in_memory().unwrap()),
@@ -1081,10 +1186,6 @@ async fn reflect_retries_transient_recall_embed_failure() {
     let inner = MockLlm::script(vec![
         tool_call("1", "recall", json!({"query": "anything"})),
         tool_call("2", "finish", json!({"answer": "Fine."})),
-        LlmResponse {
-            content: Some(r#"{"opinions":[]}"#.into()),
-            tool_calls: vec![],
-        },
     ]);
     let e = Engine::new(
         Arc::new(SqliteStore::open_in_memory().unwrap()),
@@ -1122,6 +1223,7 @@ async fn retain_reasks_at_half_size_on_parse_failure() {
     let e = chunked_engine(Arc::new(script), 3000, 200);
     let r = retain(&e, "rh", "Bob moved recently and bought property.").await;
     assert_eq!(r.memories_stored, 3, "{r:?}");
+    assert_eq!(r.reasks, 1, "one half-size re-ask: {r:?}");
 
     let mems = e.store.list_memories("rh", 100).unwrap();
     let id = |needle: &str| {
@@ -1201,6 +1303,7 @@ async fn recall_fixture(e: &Engine) -> Vec<MemoryRef> {
         token_budget: 1000,
         top_k_per_arm: 10,
         kinds: None,
+        ..Default::default()
     })
     .await
     .unwrap()
@@ -1320,6 +1423,7 @@ async fn retain_parses_upstream_shaped_extraction_response() {
             content: "Alice joined Google. I recommended Alice for the infra team.".into(),
             context: None,
             timestamp_ms: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -1469,7 +1573,7 @@ fn synthesis_entity(req: &LlmRequest) -> String {
 impl LlmProvider for PerEntityLlm {
     async fn complete(&self, req: &LlmRequest) -> Result<LlmResponse> {
         let system = req.system.clone().unwrap_or_default();
-        if system.contains("OBJECTIVE OBSERVER") {
+        if system.contains("You are a memory consolidation system") {
             let entity = synthesis_entity(req);
             let content = {
                 let mut map = self.synthesis.lock().unwrap();
@@ -1582,7 +1686,7 @@ struct DelayedEntityLlm {
 impl LlmProvider for DelayedEntityLlm {
     async fn complete(&self, req: &LlmRequest) -> Result<LlmResponse> {
         let system = req.system.clone().unwrap_or_default();
-        if system.contains("OBJECTIVE OBSERVER") {
+        if system.contains("You are a memory consolidation system") {
             let entity = synthesis_entity(req);
             if let Some(ms) = self.delay_ms.get(&entity) {
                 tokio::time::sleep(Duration::from_millis(*ms)).await;
@@ -1629,6 +1733,7 @@ async fn consolidation_deadline_stops_starting_new_entities() {
         content: "Alice joined Google. Alice works on Search infrastructure.".into(),
         context: None,
         timestamp_ms: Some(t0),
+        ..Default::default()
     })
     .await
     .unwrap();
@@ -1638,6 +1743,7 @@ async fn consolidation_deadline_stops_starting_new_entities() {
         content: "Bob bought a vintage synthesizer. Bob practices the synthesizer daily.".into(),
         context: None,
         timestamp_ms: Some(t0 + 3_600_000),
+        ..Default::default()
     })
     .await
     .unwrap();
@@ -1720,6 +1826,7 @@ async fn retain_at(e: &Engine, bank: &str, content: &str, ts: i64) -> RetainResp
         content: content.into(),
         context: None,
         timestamp_ms: Some(ts),
+        ..Default::default()
     })
     .await
     .unwrap()
@@ -1858,6 +1965,7 @@ async fn knowledge_update_survives_fragmentation_through_wide_recall_pool() {
             token_budget: 2000,
             top_k_per_arm: e.config.recall_budget.resolve(None, 2000),
             kinds: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -1868,5 +1976,1314 @@ async fn knowledge_update_survives_fragmentation_through_wide_recall_pool() {
             .iter()
             .map(|m| m.text.clone())
             .collect::<Vec<_>>()
+    );
+}
+
+// --- upstream consolidation response machine (creates/updates/deletes) ------
+
+/// The upstream plan machine: pass 1 creates from `source_fact_ids`, pass 2
+/// updates the observation by id (new text + merged evidence + history),
+/// and a delete-with-merge folds a duplicate's evidence into its survivor
+/// before removing it.
+#[tokio::test]
+async fn consolidation_applies_upstream_plan_creates_updates_merges() {
+    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let mk = |llm: Arc<dyn LlmProvider>| {
+        Engine::new(
+            store.clone(),
+            llm,
+            Arc::new(MockEmbed::default()),
+            Arc::new(MockRerank),
+            Arc::new(SimpleTokenEstimator),
+            Arc::new(FixedClock::new(1_800_000_000_000)),
+        )
+    };
+    retain(
+        &mk(Arc::new(MockLlm::script(vec![facts_resp(&[
+            ("Alice owns a 2019 Honda Civic.", "Alice"),
+            ("Alice commutes far.", "Alice"),
+        ])]))),
+        "plan",
+        "Alice owns a 2019 Honda Civic. Alice commutes far.",
+    )
+    .await;
+    let facts = store.list_memories("plan", 10).unwrap();
+    let civic = facts
+        .iter()
+        .find(|m| m.text.contains("Civic"))
+        .expect("civic fact")
+        .id
+        .clone();
+
+    // Pass 1: upstream-shaped create.
+    let pass1 = MockLlm::script(vec![LlmResponse {
+        content: Some(
+            json!({
+                "creates": [{"text": "Alice owns a 2019 Honda Civic.",
+                             "source_fact_ids": [civic], "reason": "new facet"}],
+                "updates": [], "deletes": []
+            })
+            .to_string(),
+        ),
+        tool_calls: vec![],
+    }]);
+    mk(Arc::new(pass1))
+        .consolidate_once("plan", 10)
+        .await
+        .unwrap();
+    let obs = store.observations_for_bank("plan").unwrap();
+    assert_eq!(obs.len(), 1);
+    let obs_id = obs[0].id.clone();
+    assert_eq!(obs[0].evidence.len(), 1);
+    assert!(obs[0].embedding.is_some(), "{:?}", obs[0]);
+
+    // A second entity synthesizes a near-verbatim duplicate observation.
+    let comm = facts
+        .iter()
+        .find(|m| m.text.contains("commutes"))
+        .expect("commute fact")
+        .id
+        .clone();
+    retain(
+        &mk(Arc::new(MockLlm::script(vec![facts_resp(&[
+            ("Alice commutes far daily.", "Alice"),
+            ("Alice drives to work.", "Alice"),
+        ])]))),
+        "plan",
+        "Alice commutes far daily. Alice drives to work.",
+    )
+    .await;
+
+    // Pass 2: an update that rewrites the observation text, plus a
+    // delete-with-merge folding the duplicate into it.
+    let dupe_text = "Alice owns a 2019 Honda Civic.";
+    let dup_obs = Observation {
+        id: "dup-obs".into(),
+        bank_id: "plan".into(),
+        entity_id: obs[0].entity_id.clone(),
+        text: format!("{dupe_text} (duplicate)"),
+        evidence: vec![],
+        proof_count: 1,
+        history: vec![],
+        updated_at_ms: 1,
+        created_at_ms: 1,
+        embedding: None,
+    };
+    store.upsert_observation(&dup_obs).unwrap();
+    // give the duplicate an embedding so only text changes are re-embedded
+    store
+        .set_observation_embedding("dup-obs", Some(vec![0.1; 512]))
+        .unwrap();
+
+    let pass2 = MockLlm::script(vec![LlmResponse {
+        content: Some(
+            json!({
+                "creates": [],
+                "updates": [{
+                    "observation_id": obs_id,
+                    "text": "Alice owns a 2019 Honda Civic and commutes far.",
+                    "source_fact_ids": [comm],
+                    "reason": "state change"
+                }],
+                "deletes": [{
+                    "observation_id": "dup-obs",
+                    "merged_into": obs_id,
+                    "reason": "restates the Civic observation"
+                }]
+            })
+            .to_string(),
+        ),
+        tool_calls: vec![],
+    }]);
+    mk(Arc::new(pass2))
+        .consolidate_once("plan", 10)
+        .await
+        .unwrap();
+
+    let obs = store.observations_for_bank("plan").unwrap();
+    assert_eq!(obs.len(), 1, "merged duplicate removed: {obs:?}");
+    assert_eq!(obs[0].id, obs_id);
+    assert_eq!(
+        obs[0].text,
+        "Alice owns a 2019 Honda Civic and commutes far."
+    );
+    assert!(
+        obs[0].text != *dupe_text || obs[0].history.is_empty(),
+        "history recorded"
+    );
+    assert_eq!(
+        obs[0].history,
+        vec!["Alice owns a 2019 Honda Civic.".to_string()]
+    );
+    // update evidence (civic) + commute (comm) + duplicate's backfilled
+    // first fact all merged into the survivor
+    assert!(obs[0].evidence.len() >= 2, "{:?}", obs[0].evidence);
+}
+
+/// The bank-level exact-dupe guard: two passes whose model emits the same
+/// create text write one observation whose evidence grows, not siblings.
+#[tokio::test]
+async fn consolidation_exact_dupe_guard_merges_repeated_creates() {
+    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let mk = |llm: Arc<dyn LlmProvider>| {
+        Engine::new(
+            store.clone(),
+            llm,
+            Arc::new(MockEmbed::default()),
+            Arc::new(MockRerank),
+            Arc::new(SimpleTokenEstimator),
+            Arc::new(FixedClock::new(1_800_000_000_000)),
+        )
+    };
+    retain(
+        &mk(Arc::new(MockLlm::script(vec![facts_resp(&[
+            ("Alice joined Google.", "Alice"),
+            ("Alice works on search.", "Alice"),
+        ])]))),
+        "dup",
+        "Alice joined Google. Alice works on search.",
+    )
+    .await;
+    let facts = store.list_memories("dup", 10).unwrap();
+    let f0 = facts[0].id.clone();
+
+    for pass in 0..2 {
+        let script = MockLlm::script(vec![LlmResponse {
+            content: Some(
+                json!({
+                    "creates": [{"text": "Alice works at Google on search.",
+                                 "source_fact_ids": [f0], "reason": "pass"}],
+                    "updates": [], "deletes": []
+                })
+                .to_string(),
+            ),
+            tool_calls: vec![],
+        }]);
+        mk(Arc::new(script))
+            .consolidate_once("dup", 10)
+            .await
+            .unwrap();
+        let obs = store.observations_for_bank("dup").unwrap();
+        assert_eq!(obs.len(), 1, "pass {pass}: {obs:?}");
+        assert_eq!(obs[0].proof_count, 1, "same fact deduped by memory id");
+    }
+}
+
+/// RS-19: entities with more facts than one window page through them all —
+/// the old fixed 60-fact cap silently dropped older facts of big entities
+/// so they never reached an observation.
+#[tokio::test]
+async fn consolidation_pages_past_the_fact_cap() {
+    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let mk = |llm: Arc<dyn LlmProvider>| {
+        Engine::new(
+            store.clone(),
+            llm,
+            Arc::new(MockEmbed::default()),
+            Arc::new(MockRerank),
+            Arc::new(SimpleTokenEstimator),
+            Arc::new(FixedClock::new(1_800_000_000_000)),
+        )
+        .with_config(EngineConfig {
+            consolidate_max_facts_per_entity: 2,
+            ..Default::default()
+        })
+    };
+    // Retain 1 (earlier): two Bob facts; retain 2 (later): two more.
+    retain(
+        &mk(Arc::new(MockLlm::script(vec![facts_resp(&[
+            ("Bob joined Stripe.", "Bob"),
+            ("Bob works on payments.", "Bob"),
+        ])]))),
+        "page",
+        "Bob joined Stripe. Bob works on payments.",
+    )
+    .await;
+    let e = mk(Arc::new(MockLlm::script(vec![
+        facts_resp(&[
+            ("Bob moved to the infrastructure team.", "Bob"),
+            ("Bob was promoted to senior developer.", "Bob"),
+        ]),
+        // Window 1 = the two NEWEST facts (retain 2), window 2 = the older
+        // pair; each window's plan cites its own facts by index.
+        LlmResponse {
+            content: Some(
+                json!({"observations": [
+                    {"text": "Bob moved to infrastructure and was promoted.",
+                     "evidence": [{"fact_index": 0, "quote": ""}, {"fact_index": 1, "quote": ""}]}
+                ]})
+                .to_string(),
+            ),
+            tool_calls: vec![],
+        },
+        LlmResponse {
+            content: Some(
+                json!({"observations": [
+                    {"text": "Bob joined Stripe and works on payments.",
+                     "evidence": [{"fact_index": 0, "quote": ""}, {"fact_index": 1, "quote": ""}]}
+                ]})
+                .to_string(),
+            ),
+            tool_calls: vec![],
+        },
+    ])));
+    e.retain(RetainRequest {
+        bank_id: "page".into(),
+        content: "Bob moved to the infrastructure team. Bob was promoted to senior developer."
+            .into(),
+        context: None,
+        timestamp_ms: Some(1_800_086_400_000),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    e.consolidate_once("page", 10).await.unwrap();
+
+    let obs = store.observations_for_bank("page").unwrap();
+    assert_eq!(obs.len(), 2, "one observation per window: {obs:?}");
+    let evidenced: HashSet<String> = obs
+        .iter()
+        .flat_map(|o| o.evidence.iter().map(|ev| ev.memory_id.clone()))
+        .collect();
+    let all_facts: HashSet<String> = store
+        .list_memories("page", 100)
+        .unwrap()
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    assert_eq!(
+        evidenced, all_facts,
+        "every fact — including the older window's — must be consolidated"
+    );
+    assert!(obs.iter().all(|o| o.embedding.is_some()), "{obs:?}");
+}
+
+/// RS-19: the cosine near-dupe guard — a CREATE paraphrasing an existing
+/// observation merges its evidence instead of writing a sibling (the
+/// 2026-11-12 runs' paraphrase siblings, e.g. "Bob began his career at
+/// Stripe…" vs "Bob started as a junior developer…"). A genuinely new
+/// observation is untouched.
+#[tokio::test]
+async fn consolidation_cosine_guard_merges_paraphrase_siblings() {
+    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let mk = |llm: Arc<dyn LlmProvider>| {
+        Engine::new(
+            store.clone(),
+            llm,
+            Arc::new(MockEmbed::default()),
+            Arc::new(MockRerank),
+            Arc::new(SimpleTokenEstimator),
+            Arc::new(FixedClock::new(1_800_000_000_000)),
+        )
+    };
+    // Pass 1: two facts → one observation, embedded.
+    retain(
+        &mk(Arc::new(MockLlm::script(vec![facts_resp(&[
+            ("Bob joined Stripe on the payments team.", "Bob"),
+            ("Bob started as a junior developer there.", "Bob"),
+        ])]))),
+        "cos",
+        "Bob joined Stripe on the payments team. Bob started as a junior developer there.",
+    )
+    .await;
+    let e = mk(Arc::new(MockLlm::script(vec![LlmResponse {
+        content: Some(
+            json!({"observations": [
+                {"text": "Bob started as a junior developer on the payments team at Stripe.",
+                 "evidence": [{"fact_index": 0, "quote": ""}, {"fact_index": 1, "quote": ""}]},
+                {"text": "Bob keeps a saltwater aquarium with two clownfish.",
+                 "evidence": [{"fact_index": 0, "quote": ""}]}
+            ]})
+            .to_string(),
+        ),
+        tool_calls: vec![],
+    }])));
+    e.consolidate_once("cos", 10).await.unwrap();
+    let obs = store.observations_for_bank("cos").unwrap();
+    assert_eq!(obs.len(), 2, "{obs:?}");
+
+    // Pass 2: a new fact arrives; the model CREATEs a near-paraphrase of
+    // the existing observation plus a genuinely new one.
+    let e = mk(Arc::new(MockLlm::script(vec![
+        facts_resp(&[("Bob was promoted in May.", "Bob")]),
+        LlmResponse {
+            content: Some(
+                json!({"observations": [
+                    // Paraphrase (adds two words — cosine ~0.93 under the
+                    // bag-of-words mock embed): must merge, not sibling.
+                    {"text": "Bob started as a junior developer on the payments team at Stripe in March.",
+                     "evidence": [{"fact_index": 0, "quote": ""}]},
+                    // Genuinely new topic: must create.
+                    {"text": "Bob cycles to work most days.",
+                     "evidence": [{"fact_index": 0, "quote": ""}]}
+                ]})
+                .to_string(),
+            ),
+            tool_calls: vec![],
+        },
+    ])));
+    e.retain(RetainRequest {
+        bank_id: "cos".into(),
+        content: "Bob was promoted in May.".into(),
+        context: None,
+        timestamp_ms: Some(1_800_086_400_000),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    e.consolidate_once("cos", 10).await.unwrap();
+
+    let obs = store.observations_for_bank("cos").unwrap();
+    let texts: Vec<&str> = obs.iter().map(|o| o.text.as_str()).collect();
+    assert!(
+        !texts.contains(
+            &"Bob started as a junior developer on the payments team at Stripe in March."
+        ),
+        "paraphrase must not write a sibling: {texts:?}"
+    );
+    assert!(
+        texts.contains(&"Bob cycles to work most days."),
+        "{texts:?}"
+    );
+    assert_eq!(obs.len(), 3, "2 originals + 1 genuinely new: {obs:?}");
+    // The promoted fact's evidence merged into the paraphrase target.
+    let promoted: Vec<&Observation> = obs
+        .iter()
+        .filter(|o| o.text.contains("junior developer"))
+        .collect();
+    assert_eq!(promoted.len(), 1, "{texts:?}");
+    assert!(promoted[0].proof_count >= 3, "{:?}", promoted[0]);
+}
+
+// --- reflect: kind-separated tools, forced-done, split synthesis -------------
+
+/// Records the final-synthesis user message and answers the loop from a
+/// fixed script — lets tests inspect exactly what the answer machine saw.
+struct CapturingLlm {
+    loop_script: std::sync::Mutex<VecDeque<LlmResponse>>,
+    synthesis_prompts: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl LlmProvider for CapturingLlm {
+    async fn complete(&self, req: &LlmRequest) -> Result<LlmResponse> {
+        let system = req.system.clone().unwrap_or_default();
+        if system.contains("You MUST ONLY use information from retrieved tool results") {
+            self.synthesis_prompts.lock().unwrap().push(
+                req.messages
+                    .last()
+                    .map(|m| m.content.clone())
+                    .unwrap_or_default(),
+            );
+            return Ok(synthesis_resp("Synthesized."));
+        }
+        if system.contains("You extract evidence from retrieved memory data") {
+            return Ok(synthesis_resp("- (claims)"));
+        }
+        Ok(self
+            .loop_script
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(synthesis_resp("{}")))
+    }
+}
+
+/// Upstream kind alignment: `recall` surfaces only world/experience facts
+/// and `search_observations` only observations — the synthesis prompt sees
+/// exactly the kind the called tool owns, never a mixed pool.
+#[tokio::test]
+async fn reflect_tools_are_kind_separated() {
+    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let seeder = Engine::new(
+        store.clone(),
+        Arc::new(MockLlm::script(vec![
+            facts_resp(&[
+                ("Alice joined Google.", "Alice"),
+                ("Alice works on search.", "Alice"),
+            ]),
+            LlmResponse {
+                content: Some(
+                    r#"{"observations":[{"text":"Alice works at Google on search.","evidence":[{"fact_index":0,"quote":""}]}]}"#
+                        .into(),
+                ),
+                tool_calls: vec![],
+            },
+        ])),
+        Arc::new(MockEmbed::default()),
+        Arc::new(MockRerank),
+        Arc::new(SimpleTokenEstimator),
+        Arc::new(FixedClock::new(1_800_000_000_000)),
+    );
+    retain(&seeder, "ks", "Alice joined Google. Alice works on search.").await;
+    seeder.consolidate_once("ks", 10).await.unwrap();
+
+    // recall sees only raw facts. The loop searches once then goes silent
+    // (two empties end the loop, a third answers nothing in the forced-done
+    // round), so the fallback synthesis runs and its prompt is captured.
+    let empty = LlmResponse {
+        content: None,
+        tool_calls: vec![],
+    };
+    let capture = Arc::new(CapturingLlm {
+        loop_script: std::sync::Mutex::new(
+            vec![
+                tool_call("1", "recall", json!({"query": "Alice"})),
+                empty.clone(),
+                empty.clone(),
+                empty.clone(),
+            ]
+            .into(),
+        ),
+        synthesis_prompts: std::sync::Mutex::new(vec![]),
+    });
+    let e = Engine::new(
+        store.clone(),
+        capture.clone(),
+        Arc::new(MockEmbed::default()),
+        Arc::new(MockRerank),
+        Arc::new(SimpleTokenEstimator),
+        Arc::new(FixedClock::new(1_800_000_000_000)),
+    );
+    let resp = e.reflect("ks", "Where does Alice work?").await.unwrap();
+    assert_eq!(resp.answer_path, AnswerPath::Synthesis);
+    let prompts = capture.synthesis_prompts.lock().unwrap().clone();
+    assert_eq!(prompts.len(), 1);
+    let prompt = &prompts[0];
+    assert!(prompt.contains("Alice joined Google"), "{prompt}");
+    assert!(
+        !prompt.contains("Alice works at Google on search"),
+        "observations must not ride the recall tool: {prompt}"
+    );
+
+    // search_observations sees only observations
+    let capture2 = Arc::new(CapturingLlm {
+        loop_script: std::sync::Mutex::new(
+            vec![
+                tool_call("1", "search_observations", json!({"query": "Alice"})),
+                empty.clone(),
+                empty.clone(),
+                empty,
+            ]
+            .into(),
+        ),
+        synthesis_prompts: std::sync::Mutex::new(vec![]),
+    });
+    let e2 = Engine::new(
+        store,
+        capture2.clone(),
+        Arc::new(MockEmbed::default()),
+        Arc::new(MockRerank),
+        Arc::new(SimpleTokenEstimator),
+        Arc::new(FixedClock::new(1_800_000_000_000)),
+    );
+    let resp = e2.reflect("ks", "Where does Alice work?").await.unwrap();
+    assert_eq!(resp.answer_path, AnswerPath::Synthesis);
+    let prompts = capture2.synthesis_prompts.lock().unwrap().clone();
+    let prompt = &prompts[0];
+    assert!(
+        prompt.contains("Alice works at Google on search"),
+        "{prompt}"
+    );
+    assert!(
+        !prompt.contains("\"Alice joined Google.\""),
+        "raw facts must not ride search_observations: {prompt}"
+    );
+}
+
+/// The 2026-11-11 parity-run 500s: a model that searches every round and
+/// never finishes must still get an answer — the forced-done round asks
+/// once more, and the synthesis call composes from the gathered history
+/// regardless.
+#[tokio::test]
+async fn reflect_answers_after_round_exhaustion_without_finish() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    // 8 recall rounds (the default max), then the forced-done round's
+    // response (empty), then the synthesis answer, then opinions.
+    let mut script: Vec<LlmResponse> = (0..8)
+        .map(|i| tool_call(&format!("r{i}"), "recall", json!({"query": "everything"})))
+        .collect();
+    script.push(LlmResponse {
+        content: None,
+        tool_calls: vec![],
+    });
+    script.push(synthesis_resp(
+        "Best-effort synthesis of everything gathered.",
+    ));
+    let e = Engine::new(
+        Arc::new(store),
+        Arc::new(MockLlm::script(script)),
+        Arc::new(MockEmbed::default()),
+        Arc::new(MockRerank),
+        Arc::new(SimpleTokenEstimator),
+        Arc::new(FixedClock::new(1_800_000_000_000)),
+    );
+    let resp = e.reflect("exhaust", "What is known?").await.unwrap();
+    assert_eq!(resp.answer, "Best-effort synthesis of everything gathered.");
+    assert_eq!(resp.answer_path, AnswerPath::Synthesis);
+    assert_eq!(resp.rounds, 9, "8 loop rounds + the forced-done round");
+}
+
+/// Histories over `reflect_max_context_tokens` take upstream's split path:
+/// chunks map to dated claims, then one reduce call synthesizes — evidence
+/// is split, never dropped.
+#[tokio::test]
+async fn reflect_split_synthesis_maps_claims_and_reduces() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let empty = LlmResponse {
+        content: None,
+        tool_calls: vec![],
+    };
+    let script = MockLlm::script(vec![
+        tool_call("1", "recall", json!({"query": "Alice"})),
+        empty.clone(),
+        empty.clone(),
+        empty,
+        synthesis_resp("- Alice joined Google (mentioned_at: unknown; memory_ids: x)"),
+        synthesis_resp("Reduced answer from claims."),
+    ]);
+    let e = Engine::new(
+        Arc::new(store),
+        Arc::new(script),
+        Arc::new(MockEmbed::default()),
+        Arc::new(MockRerank),
+        Arc::new(SimpleTokenEstimator),
+        Arc::new(FixedClock::new(1_800_000_000_000)),
+    )
+    .with_config(EngineConfig {
+        // Tiny budget: any recall history overflows it, but the 1024-token
+        // split floor keeps a single chunk → one claims call + one reduce.
+        reflect_max_context_tokens: 10,
+        ..Default::default()
+    });
+    let resp = e.reflect("split", "Where does Alice work?").await.unwrap();
+    assert_eq!(resp.answer, "Reduced answer from claims.");
+    assert_eq!(resp.answer_path, AnswerPath::Synthesis);
+}
+
+/// Upstream #4567 sufficiency gate: a `finish` reporting "nothing is
+/// known" (`answer_found: false`) with no `recall` yet is refused exactly
+/// once and the model is nudged to recall; the second finish is honored
+/// even if recall never ran.
+#[tokio::test]
+async fn reflect_refuses_premature_negative_finish_until_recall() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let script = MockLlm::script(vec![
+        tool_call("1", "search_observations", json!({"query": "Alice"})),
+        tool_call(
+            "2",
+            "finish",
+            json!({"answer": "Nothing is known about Alice.", "answer_found": false}),
+        ),
+        tool_call("3", "recall", json!({"query": "Alice"})),
+        tool_call(
+            "4",
+            "finish",
+            json!({"answer": "Nothing is known about Alice.", "answer_found": false}),
+        ),
+    ]);
+    let e = Engine::new(
+        Arc::new(store),
+        Arc::new(script),
+        Arc::new(MockEmbed::default()),
+        Arc::new(MockRerank),
+        Arc::new(SimpleTokenEstimator),
+        Arc::new(FixedClock::new(1_800_000_000_000)),
+    );
+    let resp = e.reflect("gate", "What does Alice do?").await.unwrap();
+    assert_eq!(resp.answer, "Nothing is known about Alice.");
+    assert_eq!(resp.answer_path, AnswerPath::Loop);
+    assert_eq!(
+        resp.rounds, 5,
+        "refused finish + recall + honored finish + the closing ask"
+    );
+}
+
+/// The refusal is one-shot per reflect: without a recall in between, the
+/// model's immediate second `finish` must be honored (never an infinite
+/// refusal loop).
+#[tokio::test]
+async fn reflect_honors_repeated_negative_finish_without_recall() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let script = MockLlm::script(vec![
+        tool_call(
+            "1",
+            "finish",
+            json!({"answer": "Nothing known.", "answer_found": false}),
+        ),
+        tool_call(
+            "2",
+            "finish",
+            json!({"answer": "Nothing known.", "answer_found": false}),
+        ),
+    ]);
+    let e = Engine::new(
+        Arc::new(store),
+        Arc::new(script),
+        Arc::new(MockEmbed::default()),
+        Arc::new(MockRerank),
+        Arc::new(SimpleTokenEstimator),
+        Arc::new(FixedClock::new(1_800_000_000_000)),
+    );
+    let resp = e.reflect("gate2", "What is known?").await.unwrap();
+    assert_eq!(resp.answer, "Nothing known.");
+    assert_eq!(
+        resp.rounds, 3,
+        "first finish refused, second honored, + the closing ask"
+    );
+}
+
+/// Upstream precedence, mechanically: the closing ask (upstream
+/// `_ask_for_done`) always runs after the loop stops and its finish wins
+/// over the loop's volunteered one — the volunteered text survives only
+/// when the ask itself fails. No standalone synthesis call is made when
+/// either loop-side answer exists (the parity rerun's terse answers came
+/// from synthesizing over a thin history while discarding the loop's
+/// conversation-context answer).
+#[tokio::test]
+async fn reflect_closing_ask_wins_and_no_synthesis_runs() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let capture = Arc::new(CapturingLlm {
+        loop_script: std::sync::Mutex::new(
+            vec![
+                tool_call("1", "search_observations", json!({"query": "Alice"})),
+                tool_call("2", "finish", json!({"answer": "Alice works at Google."})),
+                tool_call(
+                    "3",
+                    "finish",
+                    json!({"answer": "Alice works at Google as an engineer on search."}),
+                ),
+            ]
+            .into(),
+        ),
+        synthesis_prompts: std::sync::Mutex::new(vec![]),
+    });
+    let e = Engine::new(
+        Arc::new(store),
+        capture.clone(),
+        Arc::new(MockEmbed::default()),
+        Arc::new(MockRerank),
+        Arc::new(SimpleTokenEstimator),
+        Arc::new(FixedClock::new(1_800_000_000_000)),
+    );
+    let resp = e.reflect("pref", "What does Alice do?").await.unwrap();
+    assert_eq!(
+        resp.answer, "Alice works at Google as an engineer on search.",
+        "the closing ask's answer replaces the volunteered one"
+    );
+    assert_eq!(resp.answer_path, AnswerPath::ForcedDone);
+    assert_eq!(resp.rounds, 3, "search + volunteered finish + closing ask");
+    assert!(
+        capture.synthesis_prompts.lock().unwrap().is_empty(),
+        "synthesis must not run when a loop-side answer exists"
+    );
+    assert_eq!(resp.synthesis_ms, None);
+}
+
+/// The volunteered finish survives as the fallback when the closing ask
+/// yields nothing usable (here: plain prose, not finish-shaped).
+#[tokio::test]
+async fn reflect_volunteered_finish_is_the_closing_ask_fallback() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let script = MockLlm::script(vec![
+        tool_call("1", "recall", json!({"query": "Alice"})),
+        tool_call("2", "finish", json!({"answer": "Volunteered answer."})),
+        synthesis_resp("Just prose, not a finish call."),
+    ]);
+    let e = Engine::new(
+        Arc::new(store),
+        Arc::new(script),
+        Arc::new(MockEmbed::default()),
+        Arc::new(MockRerank),
+        Arc::new(SimpleTokenEstimator),
+        Arc::new(FixedClock::new(1_800_000_000_000)),
+    );
+    let resp = e.reflect("fb", "q").await.unwrap();
+    assert_eq!(resp.answer, "Volunteered answer.");
+    assert_eq!(resp.answer_path, AnswerPath::Loop);
+}
+
+/// A closing-ask answer that sanitizes to nothing (nothing but pasted
+/// memory ids) falls through to the volunteered finish instead of failing
+/// the reflect — the 2026-11-12 run's 2025-12 scenario lost a question to
+/// an all-or-nothing answer path.
+#[tokio::test]
+async fn reflect_ids_only_closing_answer_falls_through_to_volunteered() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let script = MockLlm::script(vec![
+        tool_call("1", "recall", json!({"query": "Alice"})),
+        tool_call(
+            "2",
+            "finish",
+            json!({"answer": "Volunteered substantive answer."}),
+        ),
+        tool_call(
+            "3",
+            "finish",
+            json!({"answer": "Citations\n- 2aeb87d1-9b14-48d7-98cd-d822bd5c7475"}),
+        ),
+    ]);
+    let e = Engine::new(
+        Arc::new(store),
+        Arc::new(script),
+        Arc::new(MockEmbed::default()),
+        Arc::new(MockRerank),
+        Arc::new(SimpleTokenEstimator),
+        Arc::new(FixedClock::new(1_800_000_000_000)),
+    );
+    let resp = e.reflect("fall", "q").await.unwrap();
+    assert_eq!(resp.answer, "Volunteered substantive answer.");
+    assert_eq!(resp.answer_path, AnswerPath::Loop);
+}
+
+/// The closing ask caps its requested output (upstream
+/// `reflect_max_completion_tokens`): without a cap, gateways allocate a
+/// huge default reasoning/output budget for thinking models and the call
+/// 400s on context length (2026-11-12: 52k input + 79k allocation vs the
+/// 131k window). It also forces the `finish` tool (upstream
+/// `tool_choice=done`).
+#[tokio::test]
+async fn reflect_closing_ask_caps_output_and_forces_finish() {
+    use rustsight_core::traits::LlmRequest;
+
+    #[derive(Default)]
+    struct ReqCapture {
+        reqs: std::sync::Mutex<Vec<LlmRequest>>,
+        script: std::sync::Mutex<VecDeque<LlmResponse>>,
+    }
+    #[async_trait]
+    impl LlmProvider for ReqCapture {
+        async fn complete(&self, req: &LlmRequest) -> rustsight_core::Result<LlmResponse> {
+            self.reqs.lock().unwrap().push(req.clone());
+            Ok(self
+                .script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(synthesis_resp("{}")))
+        }
+    }
+
+    let capture = Arc::new(ReqCapture {
+        reqs: std::sync::Mutex::new(vec![]),
+        script: std::sync::Mutex::new(
+            vec![
+                tool_call("1", "recall", json!({"query": "Alice"})),
+                tool_call("2", "finish", json!({"answer": "done"})),
+                tool_call("3", "finish", json!({"answer": "Closing answer."})),
+            ]
+            .into(),
+        ),
+    });
+    let e = Engine::new(
+        Arc::new(SqliteStore::open_in_memory().unwrap()),
+        capture.clone(),
+        Arc::new(MockEmbed::default()),
+        Arc::new(MockRerank),
+        Arc::new(SimpleTokenEstimator),
+        Arc::new(FixedClock::new(1_800_000_000_000)),
+    );
+    let resp = e.reflect("cap", "q").await.unwrap();
+    assert_eq!(resp.answer, "Closing answer.");
+    let reqs = capture.reqs.lock().unwrap();
+    // The closing ask is the request that forced `finish`.
+    let closing = reqs
+        .iter()
+        .find(|r| r.tool_choice.as_deref() == Some("finish"))
+        .expect("closing ask must force the finish tool");
+    assert_eq!(
+        closing.max_tokens,
+        Some(8192),
+        "closing ask must cap output (default config)"
+    );
+    // Upstream's reflect answer-length target (default 4096) rides the
+    // closing ask as the ## Length directive — without it the same model
+    // that writes gold's exhaustive answers writes one-liners.
+    let closing_user = closing
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::User)
+        .map(|m| m.content.as_str())
+        .unwrap_or_default();
+    assert!(
+        closing_user.contains("approximately 4096 tokens"),
+        "length directive missing from closing ask: {closing_user}"
+    );
+    // The loop turns stay uncapped (upstream caps only the answer machine).
+    let loop_reqs: Vec<_> = reqs.iter().filter(|r| r.tool_choice.is_none()).collect();
+    assert!(!loop_reqs.is_empty());
+    assert!(loop_reqs.iter().all(|r| r.max_tokens.is_none()));
+}
+
+/// gpt-oss harness noise (channel/constrain special tokens leaked through
+/// the gateway as content) must never become the answer — the turn counts
+/// as empty and the closing ask recovers (2026-11-12 parity run: one
+/// question answered with `<|channel|>final <|constrain|>citations":…]}`).
+#[tokio::test]
+async fn reflect_rejects_harness_noise_content() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let script = MockLlm::script(vec![
+        LlmResponse {
+            content: Some(
+                "<|start|>assistant<|channel|>final <|constrain|>citations\":[\"2aeb87d1\"]}<|call|>"
+                    .into(),
+            ),
+            tool_calls: vec![],
+        },
+        tool_call("1", "recall", json!({"query": "Alice"})),
+        tool_call(
+            "2",
+            "finish",
+            json!({"answer": "Recovered from harness noise."}),
+        ),
+        synthesis_resp("Ignored prose."),
+    ]);
+    let e = Engine::new(
+        Arc::new(store),
+        Arc::new(script),
+        Arc::new(MockEmbed::default()),
+        Arc::new(MockRerank),
+        Arc::new(SimpleTokenEstimator),
+        Arc::new(FixedClock::new(1_800_000_000_000)),
+    );
+    let resp = e.reflect("noise", "q").await.unwrap();
+    assert_eq!(
+        resp.answer, "Recovered from harness noise.",
+        "channel-token garbage must not leak: {resp:?}"
+    );
+    assert!(!resp.answer.contains("<|"), "{resp:?}");
+}
+
+/// Answers that pasted bare memory ids / "Citations" sections inline
+/// (2026-11-12 run) get them stripped post-hoc (upstream
+/// `presenter.drop_unseen_ids`) and the harvested ids land in the
+/// validated citation set.
+#[tokio::test]
+async fn reflect_strips_inline_memory_ids_and_harvests_citations() {
+    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let seeder = Engine::new(
+        store.clone(),
+        Arc::new(MockLlm::script(vec![extraction_resp()])),
+        Arc::new(MockEmbed::default()),
+        Arc::new(MockRerank),
+        Arc::new(SimpleTokenEstimator),
+        Arc::new(FixedClock::new(1_800_000_000_000)),
+    );
+    retain(&seeder, "ids", "Alice works at Google as an engineer.").await;
+    let real_id = seeder
+        .recall(RecallRequest {
+            bank_id: "ids".into(),
+            query: "Alice".into(),
+            token_budget: 500,
+            top_k_per_arm: 5,
+            kinds: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .memories[0]
+        .id
+        .clone();
+
+    let script = MockLlm::script(vec![
+        tool_call("1", "recall", json!({"query": "Alice"})),
+        tool_call(
+            "2",
+            "finish",
+            json!({
+                "answer": format!(
+                    "Alice works at Google.\n\n**Citations**\n- {real_id}\n- 00000000-dead-beef-0000-000000000000"
+                ),
+                "citations": []
+            }),
+        ),
+        synthesis_resp("Ignored prose."),
+    ]);
+    let e = Engine::new(
+        store,
+        Arc::new(script),
+        Arc::new(MockEmbed::default()),
+        Arc::new(MockRerank),
+        Arc::new(SimpleTokenEstimator),
+        Arc::new(FixedClock::new(1_800_000_000_000)),
+    );
+    let resp = e.reflect("ids", "What does Alice do?").await.unwrap();
+    assert_eq!(resp.answer, "Alice works at Google.", "{resp:?}");
+    assert!(
+        !resp.answer.contains("Citations") && !resp.answer.contains(&real_id),
+        "{resp:?}"
+    );
+    // The harvested retrieved id becomes a citation; the unretrieved
+    // one is filtered by validation.
+    assert_eq!(resp.citations, vec![real_id], "{resp:?}");
+}
+
+// ── Hindsight-parity surface: documents, tags, metadata, per-op LLMs ────
+
+fn doc_request(bank: &str, doc: &str, content: &str) -> RetainRequest {
+    RetainRequest {
+        bank_id: bank.into(),
+        content: content.into(),
+        document_id: Some(doc.into()),
+        ..Default::default()
+    }
+}
+
+fn texts(e: &Engine, bank: &str) -> Vec<String> {
+    let mut t: Vec<String> = e
+        .store
+        .list_memories(bank, 100)
+        .unwrap()
+        .into_iter()
+        .map(|m| m.text)
+        .collect();
+    t.sort();
+    t
+}
+
+#[tokio::test]
+async fn document_replace_swaps_memories_and_append_extends() {
+    let e = engine();
+    let first = e
+        .retain(RetainRequest {
+            tags: vec!["topic:career".into()],
+            metadata: Some([("type".to_string(), "note".to_string())].into()),
+            context: Some("career".into()),
+            ..doc_request("docs", "d1", "Alice joined Google.")
+        })
+        .await
+        .unwrap();
+    assert_eq!(first.document_id.as_deref(), Some("d1"));
+    assert_eq!(texts(&e, "docs"), vec!["Alice joined Google"]);
+    let stored = &e.store.list_memories("docs", 10).unwrap()[0];
+    assert_eq!(stored.document_id.as_deref(), Some("d1"));
+    assert_eq!(stored.tags, vec!["topic:career".to_string()]);
+    assert_eq!(
+        stored
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("type"))
+            .map(String::as_str),
+        Some("note")
+    );
+
+    // Replace (the default mode): the old version's memories are gone.
+    e.retain(doc_request("docs", "d1", "Alice moved to Figma."))
+        .await
+        .unwrap();
+    assert_eq!(texts(&e, "docs"), vec!["Alice moved to Figma"]);
+    let doc = e.store.get_document("docs", "d1").unwrap().unwrap();
+    assert_eq!(doc.original_text, "Alice moved to Figma.");
+
+    // Append: existing memories stay, the body grows, only the tail is new.
+    let appended = e
+        .retain(RetainRequest {
+            update_mode: UpdateMode::Append,
+            ..doc_request("docs", "d1", "Alice leads design systems.")
+        })
+        .await
+        .unwrap();
+    assert_eq!(appended.memories_stored, 1);
+    assert_eq!(
+        texts(&e, "docs"),
+        vec!["Alice leads design systems", "Alice moved to Figma"]
+    );
+    let doc = e.store.get_document("docs", "d1").unwrap().unwrap();
+    assert_eq!(
+        doc.original_text,
+        "Alice moved to Figma.\nAlice leads design systems."
+    );
+    assert_eq!(e.store.count_document_memories("docs", "d1").unwrap(), 2);
+
+    // Deleting the document removes its memories too.
+    assert_eq!(e.forget_document("docs", "d1").unwrap(), 2);
+    assert!(texts(&e, "docs").is_empty());
+    assert!(e.store.get_document("docs", "d1").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn identical_document_reretain_is_a_no_op() {
+    let e = engine();
+    let first = e
+        .retain(doc_request("idem", "cfg", "Alice joined Google."))
+        .await
+        .unwrap();
+    assert_eq!(first.memories_stored, 1);
+    let again = e
+        .retain(doc_request("idem", "cfg", "Alice joined Google."))
+        .await
+        .unwrap();
+    assert_eq!(again.memories_stored, 0, "{again:?}");
+    assert_eq!(texts(&e, "idem").len(), 1, "no duplicate memories");
+}
+
+#[tokio::test]
+async fn retain_without_document_id_files_under_a_generated_document() {
+    let e = engine();
+    let r = retain(&e, "gen", "Alice joined Google.").await;
+    let doc_id = r.document_id.expect("generated document id");
+    let doc = e.store.get_document("gen", &doc_id).unwrap().unwrap();
+    assert_eq!(doc.original_text, "Alice joined Google.");
+    // Two plain retains of the same text are two documents (no dedup).
+    let second = retain(&e, "gen", "Alice joined Google.").await;
+    assert_ne!(second.document_id.as_deref(), Some(doc_id.as_str()));
+    assert_eq!(texts(&e, "gen").len(), 2);
+}
+
+#[tokio::test]
+async fn document_replace_strips_stale_observation_evidence() {
+    let e = engine();
+    e.retain(doc_request(
+        "obsdoc",
+        "d1",
+        "Alice joined Google. Alice works on search infrastructure.",
+    ))
+    .await
+    .unwrap();
+    e.consolidate_once("obsdoc", 50).await.unwrap();
+    assert!(!e.store.observations_for_bank("obsdoc").unwrap().is_empty());
+
+    e.retain(doc_request("obsdoc", "d1", "Bob moved to Austin."))
+        .await
+        .unwrap();
+    let live: std::collections::HashSet<String> = e
+        .store
+        .list_memories("obsdoc", 100)
+        .unwrap()
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    for o in e.store.observations_for_bank("obsdoc").unwrap() {
+        for ev in &o.evidence {
+            assert!(
+                live.contains(&ev.memory_id),
+                "observation cites a deleted memory: {o:?}"
+            );
+        }
+    }
+}
+
+async fn tagged_recall(e: &Engine, bank: &str, tags: &[&str], mode: TagsMatch) -> Vec<String> {
+    let mut t: Vec<String> = e
+        .recall(RecallRequest {
+            bank_id: bank.into(),
+            query: "Where does everyone work?".into(),
+            token_budget: 4096,
+            top_k_per_arm: 300,
+            kinds: Some(vec![MemoryKind::World, MemoryKind::Experience]),
+            tags: Some(TagFilter {
+                tags: tags.iter().map(|s| s.to_string()).collect(),
+                mode,
+                groups: vec![],
+            }),
+            now_ms: None,
+        })
+        .await
+        .unwrap()
+        .memories
+        .into_iter()
+        .map(|m| m.text)
+        .collect();
+    t.sort();
+    t
+}
+
+#[tokio::test]
+async fn recall_tag_scope_follows_upstream_match_modes() {
+    let e = engine();
+    for (content, tags) in [
+        ("Alice joined Google.", vec!["user:a"]),
+        ("Bob joined Stripe.", vec!["user:b"]),
+        ("Carol joined Anthropic.", vec!["user:a", "user:b"]),
+        ("Dave joined Figma.", vec![]),
+    ] {
+        e.retain(RetainRequest {
+            bank_id: "tags".into(),
+            content: content.into(),
+            tags: tags.into_iter().map(String::from).collect(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+    // any: OR match, untagged included.
+    assert_eq!(
+        tagged_recall(&e, "tags", &["user:a"], TagsMatch::Any).await,
+        vec![
+            "Alice joined Google",
+            "Carol joined Anthropic",
+            "Dave joined Figma"
+        ]
+    );
+    // any_strict: untagged excluded.
+    assert_eq!(
+        tagged_recall(&e, "tags", &["user:a"], TagsMatch::AnyStrict).await,
+        vec!["Alice joined Google", "Carol joined Anthropic"]
+    );
+    // all_strict: every tag required.
+    assert_eq!(
+        tagged_recall(&e, "tags", &["user:a", "user:b"], TagsMatch::AllStrict).await,
+        vec!["Carol joined Anthropic"]
+    );
+    // exact: set equality; an empty scope selects untagged memories only.
+    assert_eq!(
+        tagged_recall(&e, "tags", &["user:b"], TagsMatch::Exact).await,
+        vec!["Bob joined Stripe"]
+    );
+    assert_eq!(
+        tagged_recall(&e, "tags", &[], TagsMatch::Exact).await,
+        vec!["Dave joined Figma"]
+    );
+}
+
+#[tokio::test]
+async fn observations_inherit_evidence_tags_for_scoping() {
+    let e = engine();
+    e.retain(RetainRequest {
+        bank_id: "obstags".into(),
+        content: "Alice joined Google. Alice works on search infrastructure.".into(),
+        tags: vec!["user:a".into()],
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    e.consolidate_once("obstags", 50).await.unwrap();
+    let recall = |tags: &'static [&'static str]| {
+        let e = &e;
+        async move {
+            e.recall(RecallRequest {
+                bank_id: "obstags".into(),
+                query: "Alice".into(),
+                token_budget: 4096,
+                top_k_per_arm: 300,
+                kinds: Some(vec![MemoryKind::Observation]),
+                tags: Some(TagFilter {
+                    tags: tags.iter().map(|s| s.to_string()).collect(),
+                    mode: TagsMatch::AnyStrict,
+                    groups: vec![],
+                }),
+                now_ms: None,
+            })
+            .await
+            .unwrap()
+            .memories
+        }
+    };
+    let hit = recall(&["user:a"]).await;
+    assert!(!hit.is_empty(), "observation visible in its facts' scope");
+    assert_eq!(hit[0].tags, vec!["user:a".to_string()]);
+    assert!(
+        recall(&["user:b"]).await.is_empty(),
+        "observation hidden from another scope"
+    );
+}
+
+#[tokio::test]
+async fn caller_supplied_entities_are_linked_to_extracted_facts() {
+    let e = engine();
+    e.retain(RetainRequest {
+        bank_id: "ents".into(),
+        content: "The launch slipped by two weeks.".into(),
+        entities: vec![ExtractedEntity {
+            name: "Project Atlas".into(),
+            etype: EntityType::Concept,
+        }],
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let atlas = e
+        .store
+        .entities_for_bank("ents")
+        .unwrap()
+        .into_iter()
+        .find(|en| en.name == "Project Atlas")
+        .expect("caller-supplied entity created");
+    assert!(
+        !e.store.facts_for_entity(&atlas.id, 10).unwrap().is_empty(),
+        "the extracted fact is linked to the supplied entity"
+    );
+}
+
+#[tokio::test]
+async fn per_operation_llm_overrides_route_calls() {
+    // The main LLM is the demo mock (it would extract "Alice joined
+    // Google"); the retain override is scripted with a distinct fact, so
+    // the stored text shows which model retain actually called.
+    let e = Engine::new(
+        Arc::new(SqliteStore::open_in_memory().unwrap()),
+        Arc::new(MockLlm::demo()),
+        Arc::new(MockEmbed::default()),
+        Arc::new(MockRerank),
+        Arc::new(SimpleTokenEstimator),
+        Arc::new(FixedClock::new(1_800_000_000_000)),
+    )
+    .with_retain_llm(Arc::new(MockLlm::script(vec![causal_facts_resp(&[(
+        "Routed through the retain model.",
+        &[],
+    )])])));
+    let r = retain(&e, "ops", "Alice joined Google.").await;
+    assert_eq!(r.memories_stored, 1);
+    assert_eq!(texts(&e, "ops"), vec!["Routed through the retain model."]);
+    // Reflect has no override, so it falls back to the main (demo) LLM.
+    assert!(e.reflect("ops", "Where does Alice work?").await.is_ok());
+}
+
+#[tokio::test]
+async fn reflect_renders_structured_output_from_response_schema() {
+    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let script = MockLlm::script(vec![
+        // loop: volunteered finish, then the closing ask's finish
+        tool_call(
+            "1",
+            "finish",
+            json!({"answer": "Alice works at Google.", "citations": []}),
+        ),
+        tool_call(
+            "2",
+            "finish",
+            json!({"answer": "Alice works at Google.", "citations": []}),
+        ),
+        // structured-output rendering (before background opinion extraction)
+        LlmResponse {
+            content: Some(r#"{"company": "Google"}"#.into()),
+            tool_calls: vec![],
+        },
+    ]);
+    let e = Engine::new(
+        store,
+        Arc::new(script),
+        Arc::new(MockEmbed::default()),
+        Arc::new(MockRerank),
+        Arc::new(SimpleTokenEstimator),
+        Arc::new(FixedClock::new(1_800_000_000_000)),
+    );
+    let resp = e
+        .reflect_with(
+            "so",
+            "Where does Alice work?",
+            &ReflectOptions {
+                response_schema: Some(
+                    json!({"type": "object", "properties": {"company": {"type": "string"}}}),
+                ),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.answer, "Alice works at Google.");
+    assert_eq!(resp.structured_output, Some(json!({"company": "Google"})));
+    assert!(resp.structured_output_error.is_none());
+}
+
+#[tokio::test]
+async fn reflect_budgeted_rounds_follow_upstream_multipliers() {
+    let e = engine();
+    assert_eq!(e.reflect_rounds_for_budget(rustsight_core::Budget::Low), 5);
+    assert_eq!(e.reflect_rounds_for_budget(rustsight_core::Budget::Mid), 10);
+    assert_eq!(
+        e.reflect_rounds_for_budget(rustsight_core::Budget::High),
+        20
     );
 }

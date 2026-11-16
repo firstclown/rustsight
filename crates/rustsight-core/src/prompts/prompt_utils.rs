@@ -11,6 +11,24 @@
 /// context on every fact; repeated per memory it would bloat the prompt.
 pub const PROMPT_CONTEXT_MAX_CHARS: usize = 200;
 
+/// UTC date (`YYYY-MM-DD`) for an ms-epoch timestamp — the granularity
+/// upstream's prompts render temporal fields at. Falls back to the raw
+/// milliseconds for out-of-range timestamps (never panics).
+pub fn iso_date_utc(ms: i64) -> String {
+    chrono::DateTime::from_timestamp(ms.div_euclid(1000), 0)
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| ms.to_string())
+}
+
+/// UTC datetime (`YYYY-MM-DD HH:MM UTC`) for an ms-epoch timestamp — the
+/// "current date and time" rendering reflect prompts carry (upstream uses
+/// minute precision for prompt caching).
+pub fn iso_datetime_utc(ms: i64) -> String {
+    chrono::DateTime::from_timestamp(ms.div_euclid(1000), 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| ms.to_string())
+}
+
 /// Double any lone `{` / `}` so the text survives Python-side `str.format`
 /// untouched.
 ///

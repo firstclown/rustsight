@@ -1,7 +1,7 @@
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 use rustsight_core::types::*;
 use rustsight_core::{Clock, Error, MemoryStore, Result, SystemClock};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -115,6 +115,29 @@ CREATE TABLE IF NOT EXISTS opinion_entities(
   entity_id TEXT NOT NULL,
   PRIMARY KEY(opinion_id, entity_id)
 );
+CREATE TABLE IF NOT EXISTS documents(
+  bank_id TEXT NOT NULL,
+  id TEXT NOT NULL,
+  original_text TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  tags_json TEXT NOT NULL DEFAULT '[]',
+  metadata_json TEXT,
+  retain_params_json TEXT NOT NULL DEFAULT '{}',
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(bank_id, id)
+);
+CREATE TABLE IF NOT EXISTS operations(
+  id TEXT PRIMARY KEY,
+  bank_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  status TEXT NOT NULL,
+  error TEXT,
+  payload_json TEXT NOT NULL DEFAULT 'null',
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ops_bank ON operations(bank_id, created_at_ms);
 CREATE TABLE IF NOT EXISTS mental_models(
   id TEXT PRIMARY KEY,
   bank_id TEXT NOT NULL,
@@ -138,6 +161,25 @@ fn blob_to_emb(b: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+fn parse_tags(raw: Option<String>) -> Vec<String> {
+    raw.and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn tags_to_json(tags: &[String]) -> String {
+    serde_json::to_string(tags).unwrap_or_else(|_| "[]".into())
+}
+
+fn parse_metadata(raw: Option<String>) -> Option<BTreeMap<String, String>> {
+    raw.and_then(|s| serde_json::from_str(&s).ok())
+}
+
+fn metadata_to_json(metadata: &Option<BTreeMap<String, String>>) -> Option<String> {
+    metadata
+        .as_ref()
+        .map(|m| serde_json::to_string(m).unwrap_or_else(|_| "{}".into()))
+}
+
 fn placeholders(n: usize) -> String {
     vec!["?"; n].join(",")
 }
@@ -151,10 +193,45 @@ impl SqliteStore {
         conn.pragma_update(None, "busy_timeout", 5000)
             .map_err(store_err)?;
         conn.execute_batch(SCHEMA).map_err(store_err)?;
+        Self::migrate(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             clock,
         })
+    }
+
+    /// Additive column migrations for databases created before a column
+    /// existed (`CREATE TABLE IF NOT EXISTS` never alters an existing
+    /// table). Each entry is idempotent: the column is added only when
+    /// `pragma table_info` does not already list it.
+    fn migrate(conn: &Connection) -> Result<()> {
+        const COLUMNS: &[(&str, &str, &str)] = &[
+            ("memories", "document_id", "TEXT"),
+            ("memories", "tags_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("memories", "metadata_json", "TEXT"),
+            ("banks", "config_json", "TEXT"),
+        ];
+        for (table, column, decl) in COLUMNS {
+            let exists = conn
+                .prepare(&format!(
+                    "SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"
+                ))
+                .and_then(|mut st| st.exists(params![column]))
+                .map_err(store_err)?;
+            if !exists {
+                conn.execute(
+                    &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+                    [],
+                )
+                .map_err(store_err)?;
+            }
+        }
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mem_document ON memories(bank_id, document_id)",
+            [],
+        )
+        .map_err(store_err)?;
+        Ok(())
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -201,6 +278,9 @@ impl SqliteStore {
             mentioned_at_ms: r.get(7)?,
             source: r.get(8)?,
             context: r.get(9)?,
+            document_id: r.get(10)?,
+            tags: parse_tags(r.get::<_, Option<String>>(11)?),
+            metadata: parse_metadata(r.get::<_, Option<String>>(12)?),
         })
     }
 
@@ -338,8 +418,8 @@ impl MemoryStore for SqliteStore {
         for item in items {
             let id = uuid::Uuid::new_v4().to_string();
             tx.execute(
-                "INSERT INTO memories(id, bank_id, kind, text, confidence, occurred_start_ms, occurred_end_ms, mentioned_at_ms, embedding, source, context, created_at_ms)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                "INSERT INTO memories(id, bank_id, kind, text, confidence, occurred_start_ms, occurred_end_ms, mentioned_at_ms, embedding, source, context, created_at_ms, document_id, tags_json, metadata_json)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
                 params![
                     id,
                     bank_id,
@@ -352,7 +432,10 @@ impl MemoryStore for SqliteStore {
                     emb_to_blob(&item.embedding),
                     item.source,
                     item.context,
-                    now
+                    now,
+                    item.document_id,
+                    tags_to_json(&item.tags),
+                    metadata_to_json(&item.metadata)
                 ],
             )
             .map_err(store_err)?;
@@ -372,6 +455,9 @@ impl MemoryStore for SqliteStore {
                 mentioned_at_ms: item.mentioned_at_ms,
                 source: item.source.clone(),
                 context: item.context.clone(),
+                document_id: item.document_id.clone(),
+                tags: item.tags.clone(),
+                metadata: item.metadata.clone(),
             });
         }
         tx.commit().map_err(store_err)?;
@@ -381,7 +467,7 @@ impl MemoryStore for SqliteStore {
     fn get_memory(&self, id: &MemoryId) -> Result<Option<Memory>> {
         let conn = self.lock_conn();
         conn.query_row(
-            "SELECT id, bank_id, kind, text, confidence, occurred_start_ms, occurred_end_ms, mentioned_at_ms, source, context FROM memories WHERE id = ?1",
+            "SELECT id, bank_id, kind, text, confidence, occurred_start_ms, occurred_end_ms, mentioned_at_ms, source, context, document_id, tags_json, metadata_json FROM memories WHERE id = ?1",
             params![id],
             Self::row_memory,
         )
@@ -393,7 +479,7 @@ impl MemoryStore for SqliteStore {
         let conn = self.lock_conn();
         let mut stmt = conn
             .prepare(
-                "SELECT id, bank_id, kind, text, confidence, occurred_start_ms, occurred_end_ms, mentioned_at_ms, source, context FROM memories WHERE bank_id=?1 ORDER BY mentioned_at_ms DESC, id LIMIT ?2",
+                "SELECT id, bank_id, kind, text, confidence, occurred_start_ms, occurred_end_ms, mentioned_at_ms, source, context, document_id, tags_json, metadata_json FROM memories WHERE bank_id=?1 ORDER BY mentioned_at_ms DESC, id LIMIT ?2",
             )
             .map_err(store_err)?;
         let rows = stmt
@@ -410,7 +496,7 @@ impl MemoryStore for SqliteStore {
         let conn = self.lock_conn();
         let mut stmt = conn
             .prepare(
-                "SELECT id, bank_id, kind, text, confidence, occurred_start_ms, occurred_end_ms, mentioned_at_ms, source, context FROM memories WHERE bank_id=?1 ORDER BY created_at_ms DESC, id LIMIT ?2",
+                "SELECT id, bank_id, kind, text, confidence, occurred_start_ms, occurred_end_ms, mentioned_at_ms, source, context, document_id, tags_json, metadata_json FROM memories WHERE bank_id=?1 ORDER BY created_at_ms DESC, id LIMIT ?2",
             )
             .map_err(store_err)?;
         let rows = stmt
@@ -530,7 +616,7 @@ impl MemoryStore for SqliteStore {
         let conn = self.lock_conn();
         let mut stmt = conn
             .prepare(
-                "SELECT id, bank_id, kind, text, confidence, occurred_start_ms, occurred_end_ms, mentioned_at_ms, source, context FROM memories
+                "SELECT id, bank_id, kind, text, confidence, occurred_start_ms, occurred_end_ms, mentioned_at_ms, source, context, document_id, tags_json, metadata_json FROM memories
                  WHERE bank_id=?1 AND (
                    (occurred_start_ms IS NOT NULL AND occurred_start_ms <= ?2 AND COALESCE(occurred_end_ms, occurred_start_ms) >= ?3)
                    OR (occurred_start_ms IS NULL AND mentioned_at_ms BETWEEN ?3 AND ?2)
@@ -556,7 +642,7 @@ impl MemoryStore for SqliteStore {
         for chunk in ids.chunks(400) {
             let ph = placeholders(chunk.len());
             let sql = format!(
-                "SELECT id, kind, text, occurred_start_ms, occurred_end_ms, mentioned_at_ms FROM memories WHERE bank_id = ? AND id IN ({ph})"
+                "SELECT id, kind, text, occurred_start_ms, occurred_end_ms, mentioned_at_ms, context, document_id, tags_json, metadata_json FROM memories WHERE bank_id = ? AND id IN ({ph})"
             );
             let mut stmt = conn.prepare(&sql).map_err(store_err)?;
             let rows = stmt
@@ -576,6 +662,10 @@ impl MemoryStore for SqliteStore {
                             mentioned_at_ms: Some(r.get(5)?),
                             entity_ids: vec![],
                             proof_count: None,
+                            context: r.get(6)?,
+                            document_id: r.get(7)?,
+                            tags: parse_tags(r.get::<_, Option<String>>(8)?),
+                            metadata: parse_metadata(r.get::<_, Option<String>>(9)?),
                         })
                     },
                 )
@@ -605,6 +695,10 @@ impl MemoryStore for SqliteStore {
                             mentioned_at_ms: Some(r.get(3)?),
                             entity_ids: vec![r.get(2)?],
                             proof_count: Some(r.get(4)?),
+                            context: None,
+                            document_id: None,
+                            tags: vec![],
+                            metadata: None,
                         })
                     },
                 )
@@ -634,6 +728,10 @@ impl MemoryStore for SqliteStore {
                             mentioned_at_ms: Some(r.get(2)?),
                             entity_ids: vec![],
                             proof_count: None,
+                            context: None,
+                            document_id: None,
+                            tags: vec![],
+                            metadata: None,
                         })
                     },
                 )
@@ -937,7 +1035,7 @@ impl MemoryStore for SqliteStore {
         let conn = self.lock_conn();
         let mut stmt = conn
             .prepare(
-                "SELECT m.id, m.bank_id, m.kind, m.text, m.confidence, m.occurred_start_ms, m.occurred_end_ms, m.mentioned_at_ms, m.source, m.context
+                "SELECT m.id, m.bank_id, m.kind, m.text, m.confidence, m.occurred_start_ms, m.occurred_end_ms, m.mentioned_at_ms, m.source, m.context, m.document_id, m.tags_json, m.metadata_json
                  FROM memories m JOIN memory_entities me ON me.memory_id = m.id
                  WHERE me.entity_id = ?1 ORDER BY m.mentioned_at_ms DESC LIMIT ?2",
             )
@@ -968,7 +1066,7 @@ impl MemoryStore for SqliteStore {
             // reproducing facts_for_entity's per-id
             // `ORDER BY mentioned_at_ms DESC LIMIT ?` in one query.
             let sql = format!(
-                "SELECT m.id, m.bank_id, m.kind, m.text, m.confidence, m.occurred_start_ms, m.occurred_end_ms, m.mentioned_at_ms, m.source, m.context, sub.eid
+                "SELECT m.id, m.bank_id, m.kind, m.text, m.confidence, m.occurred_start_ms, m.occurred_end_ms, m.mentioned_at_ms, m.source, m.context, m.document_id, m.tags_json, m.metadata_json, sub.eid
                  FROM (
                    SELECT me.entity_id AS eid, me.memory_id AS mid,
                           ROW_NUMBER() OVER (PARTITION BY me.entity_id ORDER BY m2.mentioned_at_ms DESC) AS rn
@@ -988,7 +1086,7 @@ impl MemoryStore for SqliteStore {
             bind.push(rusqlite::types::Value::Integer(per_entity_limit as i64));
             let rows = stmt
                 .query_map(params_from_iter(bind), |r| {
-                    Ok((Self::row_memory(r)?, r.get::<_, String>(10)?))
+                    Ok((Self::row_memory(r)?, r.get::<_, String>(13)?))
                 })
                 .map_err(store_err)?;
             for r in rows {
@@ -1181,6 +1279,22 @@ impl MemoryStore for SqliteStore {
         Ok(())
     }
 
+    fn delete_observation(&self, bank_id: &str, id: &str) -> Result<()> {
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction().map_err(store_err)?;
+        tx.execute(
+            "DELETE FROM observations WHERE id = ?1 AND bank_id = ?2",
+            params![id, bank_id],
+        )
+        .map_err(store_err)?;
+        tx.execute(
+            "DELETE FROM texts_fts WHERE bank_id = ?1 AND ref_id = ?2",
+            params![bank_id, id],
+        )
+        .map_err(store_err)?;
+        tx.commit().map_err(store_err)
+    }
+
     fn upsert_opinion(&self, o: &Opinion) -> Result<()> {
         let mut conn = self.lock_conn();
         let tx = conn.transaction().map_err(store_err)?;
@@ -1284,6 +1398,292 @@ impl MemoryStore for SqliteStore {
         Ok(out)
     }
 
+    fn bank_config(&self, bank_id: &str) -> Result<serde_json::Value> {
+        let conn = self.lock_conn();
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT config_json FROM banks WHERE id = ?1",
+                params![bank_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(Option::flatten)
+            .map_err(store_err)?;
+        Ok(raw
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .filter(|v| v.is_object())
+            .unwrap_or_else(|| serde_json::json!({})))
+    }
+
+    fn set_bank_config(&self, bank_id: &str, config: &serde_json::Value) -> Result<()> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "UPDATE banks SET config_json = ?2 WHERE id = ?1",
+            params![bank_id, config.to_string()],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    fn upsert_document(&self, doc: &Document) -> Result<()> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "INSERT INTO documents(bank_id, id, original_text, content_hash, tags_json, metadata_json, retain_params_json, created_at_ms, updated_at_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+             ON CONFLICT(bank_id, id) DO UPDATE SET original_text=excluded.original_text, content_hash=excluded.content_hash, tags_json=excluded.tags_json, metadata_json=excluded.metadata_json, retain_params_json=excluded.retain_params_json, updated_at_ms=excluded.updated_at_ms",
+            params![
+                doc.bank_id,
+                doc.id,
+                doc.original_text,
+                doc.content_hash,
+                tags_to_json(&doc.tags),
+                metadata_to_json(&doc.metadata),
+                doc.retain_params.to_string(),
+                doc.created_at_ms,
+                doc.updated_at_ms
+            ],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    fn get_document(&self, bank_id: &str, id: &str) -> Result<Option<Document>> {
+        let conn = self.lock_conn();
+        conn.query_row(
+            "SELECT id, bank_id, original_text, content_hash, tags_json, metadata_json, retain_params_json, created_at_ms, updated_at_ms FROM documents WHERE bank_id = ?1 AND id = ?2",
+            params![bank_id, id],
+            Self::row_document,
+        )
+        .optional()
+        .map_err(store_err)
+    }
+
+    fn list_documents(&self, bank_id: &str, limit: usize) -> Result<Vec<Document>> {
+        let conn = self.lock_conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, bank_id, original_text, content_hash, tags_json, metadata_json, retain_params_json, created_at_ms, updated_at_ms FROM documents WHERE bank_id = ?1 ORDER BY updated_at_ms DESC, id LIMIT ?2",
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![bank_id, limit], Self::row_document)
+            .map_err(store_err)?;
+        let mut out = vec![];
+        for r in rows {
+            out.push(r.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
+    fn count_document_memories(&self, bank_id: &str, id: &str) -> Result<usize> {
+        let conn = self.lock_conn();
+        conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE bank_id = ?1 AND document_id = ?2",
+            params![bank_id, id],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n as usize)
+        .map_err(store_err)
+    }
+
+    fn delete_document_memories(&self, bank_id: &str, id: &str) -> Result<(usize, Vec<String>)> {
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction().map_err(store_err)?;
+        let ids: Vec<String> = {
+            let mut stmt = tx
+                .prepare("SELECT id FROM memories WHERE bank_id = ?1 AND document_id = ?2")
+                .map_err(store_err)?;
+            let rows = stmt
+                .query_map(params![bank_id, id], |r| r.get::<_, String>(0))
+                .map_err(store_err)?;
+            rows.collect::<rusqlite::Result<_>>().map_err(store_err)?
+        };
+        if ids.is_empty() {
+            return Ok((0, vec![]));
+        }
+        let gone: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        let mut affected: HashSet<String> = HashSet::new();
+        for chunk in ids.chunks(400) {
+            let ph = placeholders(chunk.len());
+            {
+                let mut stmt = tx
+                    .prepare(&format!(
+                        "SELECT DISTINCT entity_id FROM memory_entities WHERE memory_id IN ({ph})"
+                    ))
+                    .map_err(store_err)?;
+                let rows = stmt
+                    .query_map(params_from_iter(chunk.iter()), |r| r.get::<_, String>(0))
+                    .map_err(store_err)?;
+                for r in rows {
+                    affected.insert(r.map_err(store_err)?);
+                }
+            }
+            for sql in [
+                format!("DELETE FROM memory_entities WHERE memory_id IN ({ph})"),
+                format!("DELETE FROM edges WHERE a_id IN ({ph})"),
+                format!("DELETE FROM edges WHERE b_id IN ({ph})"),
+                format!("DELETE FROM texts_fts WHERE ref_id IN ({ph})"),
+                format!("DELETE FROM memories WHERE id IN ({ph})"),
+            ] {
+                tx.execute(&sql, params_from_iter(chunk.iter()))
+                    .map_err(store_err)?;
+            }
+        }
+        // Observations must not keep citing facts that no longer exist.
+        let observations: Vec<(String, String, String)> = {
+            let mut stmt = tx
+                .prepare("SELECT id, entity_id, evidence_json FROM observations WHERE bank_id = ?1")
+                .map_err(store_err)?;
+            let rows = stmt
+                .query_map(params![bank_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .map_err(store_err)?;
+            rows.collect::<rusqlite::Result<_>>().map_err(store_err)?
+        };
+        for (oid, entity_id, evidence_json) in observations {
+            let evidence: Vec<Evidence> = serde_json::from_str(&evidence_json).unwrap_or_default();
+            if !evidence
+                .iter()
+                .any(|ev| gone.contains(ev.memory_id.as_str()))
+            {
+                continue;
+            }
+            affected.insert(entity_id);
+            let kept: Vec<Evidence> = evidence
+                .into_iter()
+                .filter(|ev| !gone.contains(ev.memory_id.as_str()))
+                .collect();
+            if kept.is_empty() {
+                tx.execute("DELETE FROM observations WHERE id = ?1", params![oid])
+                    .map_err(store_err)?;
+                tx.execute(
+                    "DELETE FROM texts_fts WHERE bank_id = ?1 AND ref_id = ?2",
+                    params![bank_id, oid],
+                )
+                .map_err(store_err)?;
+            } else {
+                tx.execute(
+                    "UPDATE observations SET evidence_json = ?2, proof_count = ?3 WHERE id = ?1",
+                    params![
+                        oid,
+                        serde_json::to_string(&kept).map_err(|e| Error::Store(e.to_string()))?,
+                        kept.len() as i64
+                    ],
+                )
+                .map_err(store_err)?;
+            }
+        }
+        tx.commit().map_err(store_err)?;
+        let mut affected: Vec<String> = affected.into_iter().collect();
+        affected.sort();
+        Ok((ids.len(), affected))
+    }
+
+    fn delete_document(&self, bank_id: &str, id: &str) -> Result<()> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "DELETE FROM documents WHERE bank_id = ?1 AND id = ?2",
+            params![bank_id, id],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    fn tag_index(&self, bank_id: &str) -> Result<HashMap<String, Vec<String>>> {
+        let conn = self.lock_conn();
+        let mut out: HashMap<String, Vec<String>> = HashMap::new();
+        {
+            let mut stmt = conn
+                .prepare("SELECT id, tags_json FROM memories WHERE bank_id = ?1 AND tags_json IS NOT NULL AND tags_json != '[]'")
+                .map_err(store_err)?;
+            let rows = stmt
+                .query_map(params![bank_id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+                })
+                .map_err(store_err)?;
+            for r in rows {
+                let (id, raw) = r.map_err(store_err)?;
+                let tags = parse_tags(raw);
+                if !tags.is_empty() {
+                    out.insert(id, tags);
+                }
+            }
+        }
+        if out.is_empty() {
+            return Ok(out);
+        }
+        let mut stmt = conn
+            .prepare("SELECT id, evidence_json FROM observations WHERE bank_id = ?1")
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![bank_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(store_err)?;
+        let mut derived: Vec<(String, Vec<String>)> = vec![];
+        for r in rows {
+            let (id, evidence_json) = r.map_err(store_err)?;
+            let evidence: Vec<Evidence> = serde_json::from_str(&evidence_json).unwrap_or_default();
+            let mut tags: Vec<String> = vec![];
+            for ev in &evidence {
+                for t in out.get(&ev.memory_id).into_iter().flatten() {
+                    if !tags.contains(t) {
+                        tags.push(t.clone());
+                    }
+                }
+            }
+            if !tags.is_empty() {
+                derived.push((id, tags));
+            }
+        }
+        out.extend(derived);
+        Ok(out)
+    }
+
+    fn upsert_operation(&self, op: &Operation) -> Result<()> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "INSERT INTO operations(id, bank_id, kind, status, error, payload_json, created_at_ms, updated_at_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+             ON CONFLICT(id) DO UPDATE SET status=excluded.status, error=excluded.error, payload_json=excluded.payload_json, updated_at_ms=excluded.updated_at_ms",
+            params![
+                op.id,
+                op.bank_id,
+                op.kind,
+                op.status,
+                op.error,
+                op.payload.to_string(),
+                op.created_at_ms,
+                op.updated_at_ms
+            ],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    fn get_operation(&self, id: &str) -> Result<Option<Operation>> {
+        let conn = self.lock_conn();
+        conn.query_row(
+            "SELECT id, bank_id, kind, status, error, payload_json, created_at_ms, updated_at_ms FROM operations WHERE id = ?1",
+            params![id],
+            Self::row_operation,
+        )
+        .optional()
+        .map_err(store_err)
+    }
+
+    fn pending_operations(&self) -> Result<Vec<Operation>> {
+        let conn = self.lock_conn();
+        let mut stmt = conn
+            .prepare("SELECT id, bank_id, kind, status, error, payload_json, created_at_ms, updated_at_ms FROM operations WHERE status = 'pending' ORDER BY created_at_ms, id")
+            .map_err(store_err)?;
+        let rows = stmt.query_map([], Self::row_operation).map_err(store_err)?;
+        let mut out = vec![];
+        for r in rows {
+            out.push(r.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
     fn upsert_mental_model(&self, m: &MentalModel) -> Result<()> {
         let conn = self.lock_conn();
         conn.execute(
@@ -1330,6 +1730,35 @@ impl MemoryStore for SqliteStore {
 }
 
 impl SqliteStore {
+    fn row_document(r: &Row) -> rusqlite::Result<Document> {
+        Ok(Document {
+            id: r.get(0)?,
+            bank_id: r.get(1)?,
+            original_text: r.get(2)?,
+            content_hash: r.get(3)?,
+            tags: parse_tags(r.get::<_, Option<String>>(4)?),
+            metadata: parse_metadata(r.get::<_, Option<String>>(5)?),
+            retain_params: serde_json::from_str(&r.get::<_, String>(6)?)
+                .unwrap_or(serde_json::Value::Null),
+            created_at_ms: r.get(7)?,
+            updated_at_ms: r.get(8)?,
+        })
+    }
+
+    fn row_operation(r: &Row) -> rusqlite::Result<Operation> {
+        Ok(Operation {
+            id: r.get(0)?,
+            bank_id: r.get(1)?,
+            kind: r.get(2)?,
+            status: r.get(3)?,
+            error: r.get(4)?,
+            payload: serde_json::from_str(&r.get::<_, String>(5)?)
+                .unwrap_or(serde_json::Value::Null),
+            created_at_ms: r.get(6)?,
+            updated_at_ms: r.get(7)?,
+        })
+    }
+
     fn row_observation(r: &Row) -> rusqlite::Result<Observation> {
         let evj: String = r.get(4)?;
         let hj: String = r.get(6)?;
@@ -1396,6 +1825,9 @@ mod tests {
             embedding: vec![1.0, 0.0],
             source: None,
             context: None,
+            document_id: None,
+            tags: vec![],
+            metadata: None,
         }
     }
 
@@ -1931,5 +2363,176 @@ mod tests {
             .coentities_batch(&["ghost".into()], 50)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn migrates_databases_created_before_document_columns() {
+        // The schema as it shipped before documents/tags/metadata existed.
+        let dir = std::env::temp_dir().join(format!("rustsight-migrate-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE banks(id TEXT PRIMARY KEY, mission TEXT, directives TEXT, background TEXT,
+                   skepticism INTEGER NOT NULL DEFAULT 3, literalism INTEGER NOT NULL DEFAULT 3,
+                   empathy INTEGER NOT NULL DEFAULT 3, bias_strength REAL NOT NULL DEFAULT 0.5,
+                   created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL);
+                 CREATE TABLE memories(id TEXT PRIMARY KEY, bank_id TEXT NOT NULL, kind TEXT NOT NULL,
+                   text TEXT NOT NULL, confidence REAL, occurred_start_ms INTEGER, occurred_end_ms INTEGER,
+                   mentioned_at_ms INTEGER NOT NULL, embedding BLOB, source TEXT, context TEXT,
+                   created_at_ms INTEGER NOT NULL);
+                 INSERT INTO banks(id, created_at_ms, updated_at_ms) VALUES ('b', 1, 1);
+                 INSERT INTO memories(id, bank_id, kind, text, mentioned_at_ms, created_at_ms)
+                   VALUES ('m1', 'b', 'world', 'an old fact', 5, 5);",
+            )
+            .unwrap();
+        }
+        // Opening twice proves the migration is idempotent.
+        for _ in 0..2 {
+            let s = SqliteStore::open(&path).unwrap();
+            let old = s.get_memory(&"m1".to_string()).unwrap().unwrap();
+            assert_eq!(old.text, "an old fact");
+            assert!(old.tags.is_empty() && old.document_id.is_none() && old.metadata.is_none());
+            assert_eq!(s.bank_config("b").unwrap(), serde_json::json!({}));
+        }
+        let s = SqliteStore::open(&path).unwrap();
+        let mut rec = new_mem("a new fact", 9);
+        rec.document_id = Some("d".into());
+        rec.tags = vec!["t".into()];
+        let stored = s.insert_memories("b", &[rec]).unwrap();
+        let back = s.get_memory(&stored[0].id).unwrap().unwrap();
+        assert_eq!(back.document_id.as_deref(), Some("d"));
+        assert_eq!(back.tags, vec!["t".to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn document_delete_cascades_and_repairs_observations() {
+        let s = store();
+        s.ensure_bank(&Bank {
+            id: "b".into(),
+            mission: None,
+            directives: None,
+            background: None,
+            disposition: Disposition::default(),
+        })
+        .unwrap();
+        let mut doomed = new_mem("doomed fact", 1);
+        doomed.document_id = Some("d1".into());
+        doomed.tags = vec!["t".into()];
+        let mut kept = new_mem("kept fact", 2);
+        kept.document_id = Some("d2".into());
+        let mems = s.insert_memories("b", &[doomed, kept]).unwrap();
+        let ent = s
+            .create_entity(&NewEntity {
+                bank_id: "b".into(),
+                name: "Alice".into(),
+                etype: EntityType::Person,
+            })
+            .unwrap();
+        s.link_memory_entities(&mems[0].id, &[(ent.id.clone(), "Alice".into())], 1)
+            .unwrap();
+        let obs = |id: &str, evidence: Vec<&Memory>| Observation {
+            id: id.into(),
+            bank_id: "b".into(),
+            entity_id: ent.id.clone(),
+            text: format!("observation {id}"),
+            evidence: evidence
+                .into_iter()
+                .map(|m| Evidence {
+                    memory_id: m.id.clone(),
+                    quote: m.text.clone(),
+                })
+                .collect(),
+            proof_count: 2,
+            history: vec![],
+            updated_at_ms: 3,
+            created_at_ms: 3,
+            embedding: None,
+        };
+        s.upsert_observation(&obs("o-mixed", vec![&mems[0], &mems[1]]))
+            .unwrap();
+        s.upsert_observation(&obs("o-only", vec![&mems[0]]))
+            .unwrap();
+
+        // Observations inherit the union of their evidence facts' tags.
+        let index = s.tag_index("b").unwrap();
+        assert_eq!(index.get("o-mixed"), Some(&vec!["t".to_string()]));
+        assert_eq!(index.get(&mems[1].id), None, "untagged items are absent");
+
+        let (deleted, affected) = s.delete_document_memories("b", "d1").unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(affected, vec![ent.id.clone()]);
+        assert!(s.get_memory(&mems[0].id).unwrap().is_none());
+        assert!(s.get_memory(&mems[1].id).unwrap().is_some());
+        assert!(s.memory_entity_ids(&mems[0].id).unwrap().is_empty());
+        let left = s.observations_for_bank("b").unwrap();
+        assert_eq!(left.len(), 1, "evidence-less observation removed: {left:?}");
+        assert_eq!(left[0].id, "o-mixed");
+        assert_eq!(left[0].evidence.len(), 1);
+        assert_eq!(left[0].evidence[0].memory_id, mems[1].id);
+        assert_eq!(left[0].proof_count, 1);
+        // The deleted fact no longer matches a keyword search.
+        assert!(s
+            .search_bm25("b", &["doomed".into()], 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn documents_and_operations_roundtrip() {
+        let s = store();
+        let doc = Document {
+            id: "tracker:config:water".into(),
+            bank_id: "b".into(),
+            original_text: "v1".into(),
+            content_hash: "h1".into(),
+            tags: vec!["t".into()],
+            metadata: Some([("k".to_string(), "v".to_string())].into()),
+            retain_params: serde_json::json!({"context": "c"}),
+            created_at_ms: 10,
+            updated_at_ms: 10,
+        };
+        s.upsert_document(&doc).unwrap();
+        s.upsert_document(&Document {
+            original_text: "v2".into(),
+            created_at_ms: 99,
+            updated_at_ms: 20,
+            ..doc.clone()
+        })
+        .unwrap();
+        let back = s
+            .get_document("b", "tracker:config:water")
+            .unwrap()
+            .unwrap();
+        assert_eq!(back.original_text, "v2");
+        assert_eq!(back.created_at_ms, 10, "created_at survives an update");
+        assert_eq!(back.updated_at_ms, 20);
+        assert_eq!(back.metadata, doc.metadata);
+        assert!(s
+            .get_document("other", "tracker:config:water")
+            .unwrap()
+            .is_none());
+        assert_eq!(s.list_documents("b", 10).unwrap().len(), 1);
+
+        let mut op = Operation {
+            id: "op1".into(),
+            bank_id: "b".into(),
+            kind: "retain".into(),
+            status: "pending".into(),
+            error: None,
+            payload: serde_json::json!({"items": [{"content": "x"}]}),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        s.upsert_operation(&op).unwrap();
+        assert_eq!(s.pending_operations().unwrap().len(), 1);
+        op.status = "completed".into();
+        s.upsert_operation(&op).unwrap();
+        assert!(s.pending_operations().unwrap().is_empty());
+        let back = s.get_operation("op1").unwrap().unwrap();
+        assert_eq!(back.status, "completed");
+        assert_eq!(back.payload["items"][0]["content"], "x");
     }
 }

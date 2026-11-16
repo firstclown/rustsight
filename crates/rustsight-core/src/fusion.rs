@@ -82,6 +82,10 @@ mod tests {
             mentioned_at_ms: None,
             entity_ids: vec![],
             proof_count: None,
+            context: None,
+            document_id: None,
+            tags: vec![],
+            metadata: None,
         }
     }
 

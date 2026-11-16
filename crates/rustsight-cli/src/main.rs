@@ -2,7 +2,8 @@ use clap::{Parser, Subcommand};
 use rustsight_core::types::*;
 use rustsight_core::{Engine, SystemClock};
 use rustsight_providers::{
-    build_mock_providers, build_providers, ProviderEnv, SimpleTokenEstimator,
+    build_mock_providers, build_operation_llms, build_providers, OperationLlms, ProviderEnv,
+    SimpleTokenEstimator,
 };
 use rustsight_server::{auth::ApiAuth, http, mcp};
 use rustsight_storage::SqliteStore;
@@ -31,6 +32,16 @@ enum Cmd {
     Serve {
         #[arg(long, default_value = "127.0.0.1:8888")]
         addr: String,
+        /// Bind host; with `--port`, the `hindsight-api`-style spelling of
+        /// `--addr` (either flag overrides that part of `--addr`).
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long)]
+        port: Option<u16>,
+        /// Accepted for `hindsight-api` command-line compatibility; rustsight
+        /// logs to stderr at a single level.
+        #[arg(long)]
+        log_level: Option<String>,
         /// Serve on non-loopback interfaces without an API token
         /// (RUSTSIGHT_API_TOKEN / RUSTSIGHT_API_TOKEN_FILE).
         #[arg(long)]
@@ -117,6 +128,11 @@ async fn build_engine(db: &PathBuf, mock: bool) -> Arc<Engine> {
         eprintln!("failed to open database {}: {e}", db.display());
         std::process::exit(1);
     });
+    let mut operation_llms = OperationLlms {
+        retain: None,
+        reflect: None,
+        consolidate: None,
+    };
     let (llm, embed, rerank) = if mock {
         build_mock_providers()
     } else {
@@ -133,19 +149,47 @@ async fn build_engine(db: &PathBuf, mock: bool) -> Arc<Engine> {
             );
             std::process::exit(1);
         }
+        operation_llms = build_operation_llms(&env).unwrap_or_else(|msg| {
+            eprintln!("provider setup failed: {msg}");
+            std::process::exit(1);
+        });
         build_providers(&env).await.unwrap_or_else(|msg| {
             eprintln!("provider setup failed: {msg}");
             std::process::exit(1);
         })
     };
-    Arc::new(Engine::new(
+    let mut engine = Engine::new(
         Arc::new(store),
         llm,
         embed,
         rerank,
         Arc::new(SimpleTokenEstimator),
         clock,
-    ))
+    );
+    // Per-operation models (e.g. a small extractor, a large answerer).
+    engine.retain_llm = operation_llms.retain;
+    engine.reflect_llm = operation_llms.reflect;
+    engine.consolidate_llm = operation_llms.consolidate;
+    Arc::new(engine)
+}
+
+/// `--addr` with its host and/or port replaced by `--host` / `--port`.
+fn serve_addr(addr: &str, host: Option<&str>, port: Option<u16>) -> String {
+    if host.is_none() && port.is_none() {
+        return addr.to_string();
+    }
+    let (addr_host, addr_port) = addr.rsplit_once(':').unwrap_or((addr, "8888"));
+    let host = host.unwrap_or(addr_host);
+    // A bare IPv6 literal needs brackets to carry a port.
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    match port {
+        Some(p) => format!("{host}:{p}"),
+        None => format!("{host}:{addr_port}"),
+    }
 }
 
 fn print_json<T: serde::Serialize>(value: &T) {
@@ -161,7 +205,14 @@ async fn main() {
     let db = cli.db.clone().unwrap_or_else(default_db);
     let engine = build_engine(&db, cli.mock).await;
     let result: Result<(), rustsight_core::Error> = match cli.cmd {
-        Cmd::Serve { addr, allow_unauth } => {
+        Cmd::Serve {
+            addr,
+            host,
+            port,
+            log_level: _,
+            allow_unauth,
+        } => {
+            let addr = serve_addr(&addr, host.as_deref(), port);
             let auth = ApiAuth::from_env();
             let auth_note = match &auth {
                 ApiAuth::Token(_) => " (bearer-token auth on)",
@@ -185,6 +236,7 @@ async fn main() {
                 content,
                 context,
                 timestamp_ms,
+                ..Default::default()
             })
             .await
             .map(|r| print_json(&r)),
@@ -199,6 +251,7 @@ async fn main() {
                 top_k_per_arm: engine.config.recall_budget.resolve(None, budget),
                 token_budget: budget,
                 kinds: None,
+                ..Default::default()
             })
             .await
             .map(|r| print_json(&r)),
@@ -270,5 +323,31 @@ async fn main() {
     if let Err(e) = result {
         eprintln!("error: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::serve_addr;
+
+    #[test]
+    fn host_and_port_flags_override_parts_of_addr() {
+        assert_eq!(serve_addr("127.0.0.1:8888", None, None), "127.0.0.1:8888");
+        assert_eq!(
+            serve_addr("127.0.0.1:8888", None, Some(9000)),
+            "127.0.0.1:9000"
+        );
+        assert_eq!(
+            serve_addr("127.0.0.1:8888", Some("0.0.0.0"), None),
+            "0.0.0.0:8888"
+        );
+        assert_eq!(
+            serve_addr("127.0.0.1:8888", Some("localhost"), Some(18790)),
+            "localhost:18790"
+        );
+        assert_eq!(
+            serve_addr("127.0.0.1:8888", Some("::1"), Some(1)),
+            "[::1]:1"
+        );
     }
 }

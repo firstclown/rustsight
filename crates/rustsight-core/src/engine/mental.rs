@@ -3,7 +3,6 @@ use crate::prompts::reflect::build_mental_model_prompt;
 use crate::traits::{ChatMessage, LlmRequest};
 use crate::types::*;
 use crate::Result;
-use std::sync::Arc;
 
 pub(super) async fn refresh(
     e: &Engine,
@@ -22,6 +21,7 @@ pub(super) async fn refresh(
             // Mental-model refresh runs at the default (MID) recall budget.
             top_k_per_arm: e.config.recall_budget.resolve(None, 1500),
             kinds: None,
+            ..Default::default()
         })
         .await?;
     let block = if r.memories.is_empty() {
@@ -34,7 +34,7 @@ pub(super) async fn refresh(
             .join("\n")
     };
     let (system, user) = build_mental_model_prompt(question, &block);
-    let llm = Arc::clone(&e.llm);
+    let llm = e.llm_for_reflect();
     let request = LlmRequest {
         system: Some(system),
         messages: vec![ChatMessage::user(user)],

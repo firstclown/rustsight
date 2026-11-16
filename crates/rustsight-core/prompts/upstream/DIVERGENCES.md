@@ -44,21 +44,125 @@ the *engine* intentionally deviates from upstream, and what was not ported.
    rustsight keeps its `ExtractedFact`/`ExtractedEntity` types (etype
    defaults to `other` for plain-string entities) so entity resolution and
    the storage layer are unchanged.
-4. **Consolidation pipeline keeps its own prompt.** The upstream builders are
-   ported and parity-tested, but `engine/consolidate.rs` still sends
-   rustsight's original `OBJECTIVE OBSERVER SYNTHESIS ENGINE` prompt and
-   parses `{"observations": [...]}`. Adopting the upstream prompt requires
-   porting its creates/updates/deletes response machine plus the
-   facts/observations *formatters* from upstream's `consolidator.py` (not in
-   the vendored set) — future ticket.
-5. **Reflect pipeline keeps its own tool loop.** `build_system_prompt_for_tools`
-   is ported with full branch parity, but the engine still exposes its
-   `recall`/`read_observation`/`finish` tools and its own (diverged) system
+4. **Consolidation pipeline adopts the upstream response machine (Nov 2026
+   parity iteration), with per-entity passes.** `engine/consolidate.rs` now
+   sends the byte-parity upstream system prompt and parses the
+   creates/updates/deletes plan (`parse_consolidation_plan`). Declared
+   engine divergences on top:
+   - rustsight consolidates **per dirty entity** (upstream pools facts +
+     recalled observations bank-wide per batch), so the user message is the
+     upstream `build_consolidation_input` prefixed with an `ENTITY: <name>`
+     scope line. Deletes/updates therefore only ever name the entity's own
+     observations.
+   - **Lenient parsing**: the legacy rustsight `{"observations": [...]}`
+     shape still parses — every element becomes a CREATE whose
+     `fact_index` evidence the engine resolves to fact ids (scripted
+     providers and older models keep working, same pattern as
+     `parse_extraction`). Entries missing required fields (update/delete
+     ids, create text) are dropped, not fatal.
+    - **Bank-level exact-dupe guard + cosine near-dupe guard**: a CREATE
+      whose whitespace-collapsed lowercase text exactly matches any
+      existing bank observation (same entity, cross-entity, or earlier in
+      the same batch), or whose embedding clears
+      `consolidate_dupe_cosine` (default 0.9) against any embedded
+      observation, merges its evidence into that observation instead of
+      writing a sibling — the 2026-11-11/12 parity runs showed verbatim
+      and paraphrase cross-entity duplicates ("Pierogi week" ×2, eight
+      near-identical escape-room observations, "Bob began his career at
+      Stripe…" vs "Bob started as a junior developer…") crowding real
+      facts out of reflect's token budget (5-8x upstream's observation
+      count). Other CREATE-side detail stays the model's job (UPDATE over
+      CREATE).
+    - **Fact paging**: an entity's facts feed consolidation in
+      newest-first windows of `consolidate_max_facts_per_entity` (default
+      200), each window seeing the previous windows' observations — the
+      previous fixed cap of 60 silently dropped older facts of big
+      entities (2025-11: 159 bank facts, the "Joe" entity alone exceeded
+      the cap), so they never reached an observation.
+   - Evidence backfill: a create/update citing no resolvable fact id
+     backfills from the batch's first fact (weak models still produce
+     attributable observations).
+   - Updates re-embed: an update that changes the text queues a fresh
+     embedding (the old 0.85-text-merge path never re-embedded).
+   - Not ported from `consolidator.py` (not in the vendored set): the
+     recall-based existing-observation pooling (we show the entity's whole
+     observation set), capacity notes, and tag handling.
+5. **Reflect keeps its own tool loop; the answer machine is upstream's.**
+   `build_system_prompt_for_tools` is ported with full branch parity, but
+   the engine still exposes its own tools — `search_observations` /
+   `recall` / `read_observation` / `finish` — with a diverged system
    prompt: sending the upstream prompt as-is would advertise
-   `search_mental_models`/`search_observations`/`expand`/`done`/`answer_ready`
-   — exactly the hallucinated-tool-call failure upstream's own #1724 fixed by
-   matching prompt to exposed tools. Adoption belongs with the mental-model
-   retrieval ladder (RS-8).
+   `search_mental_models`/`expand`/`done`/`answer_ready` — exactly the
+   hallucinated-tool-call failure upstream's own #1724 fixed by matching
+   prompt to exposed tools. Full ladder adoption belongs with the
+   mental-model retrieval ladder (RS-8). What IS adopted (Nov 2026 parity
+   iterations):
+   - **Kind separation** (upstream ladder semantics): the loop's `recall`
+     returns world/experience memories only; observations are searched via
+     the dedicated `search_observations` tool; opinions are not retrievable
+     by reflect at all. The native HTTP/MCP recall endpoints keep returning
+     all kinds.
+   - **Closing-ask answer precedence** (upstream `_ask_for_done` +
+     `_process_done_tool`): when the loop stops — volunteered `finish`,
+     round exhaustion, or silence — one closing user turn
+     (`build_done_request_prompt`) asks for the `finish` over the full
+     tool conversation, with the tool forced (`LlmRequest.tool_choice`,
+     upstream `tool_choice=done`). That closing answer wins
+     (`AnswerPath::ForcedDone`); the loop's volunteered finish survives
+     only as fallback when the ask fails (`AnswerPath::Loop`); the
+     separate final-synthesis call (`build_final_prompt` +
+     `split_context_history` claims-map/reduce, hand-ported) runs only
+     when neither produced anything. Rationale: upstream measured only
+     ~29% of loops volunteer `done` — gold's exhaustive answers come from
+     the closing ask's depth directive in the freshest position; the
+     2026-11-12 rerun (done-first without the closing ask) still scored
+     12/29 `rustsight_less` with gpt-oss one-liners on point questions
+     that had complete evidence in context, and one answer was raw
+     harness noise (`<|channel|>final <|constrain|>citations":…]}`)
+     accepted verbatim.
+   - **Answer hygiene** (upstream `presenter.drop_unseen_ids` + harness
+     token normalization): content containing gpt-oss special tokens
+     (`<|channel|>`, `<|constrain|>`, …) is treated as an empty turn,
+     never an answer; every answer path is post-processed to strip
+     id-shaped tokens and "Citations" sections, with the harvested ids
+     folded into the validated citation set.
+   - **Query Strategy + research depth** (upstream
+     `build_system_prompt_for_tools` sections, tool names adapted):
+     decompose the question into targeted per-entity/concept searches, MID
+     depth wording verbatim.
+   - **Sufficiency gate** (upstream #4567): `finish` carries
+     `_DONE_SUFFICIENCY_GATE` (adapted `done`→`finish`) and the
+     `answer_found` bool; the engine refuses one premature
+     `answer_found: false` finish while `recall` has not run (a nudge
+     tool-result), then honors whatever comes next.
+   - **Tool budget defaults** match upstream schemas: `search_observations`
+     5000 result tokens, `recall` 2048.
+   - **Evidence Discipline section** (engine-side, extends upstream's
+     grounding boundary): no inferring attendance/meeting/liking/using
+     from related notes; `mentioned_at` vs occurred dates for
+     "in <period>" questions; "the memories do not record X" plus the
+     nearest recorded facts is a complete answer; before/after-a-date
+     questions weigh every recorded milestone, not only the final one —
+     the 2026-11-12 runs' contradictions were all synthesis-level
+     over-inference of exactly these shapes.
+   - **Forced-done round**: a loop that exhausts rounds or stays empty gets
+     one tools-restricted `build_done_request_prompt` round (citations +
+     the answer — which now wins per done-first), then the synthesis runs
+     only if that round too produced nothing — "reflect produced no
+     answer" is reachable only when the loop finished nothing AND the
+     synthesis provider call fails.
+   - The split/claims/reduce/done-request/final-prompt builders are
+     hand-ported from the vendored source (verbatim text, shape-tested) —
+     they are NOT yet covered by `scripts/prompt-goldens` fixtures;
+     extending the generator is the follow-up that makes them
+     parity-tested.
+   - The loop still unwraps a `finish` tool's arguments when a model emits
+     them as plain JSON content (gpt-oss via OpenRouter did this on 5 of 10
+     parity answers), validating their citations identically.
+   - **Opinion formation is backgrounded** (rustsight-original feature, no
+     upstream counterpart): the per-reflect opinion-extraction call runs in
+     a detached task after the response is composed — it formed 0 opinions
+     on 29/29 parity reflects while adding a full LLM round trip to each.
 6. **Parameterized clock.** Upstream builders read the wall clock internally
    (`_current_utc_datetime`, minute precision for prompt caching); the Rust
    builders take `current_datetime: &str` so tests are deterministic. Rendered
@@ -96,9 +200,51 @@ the *engine* intentionally deviates from upstream, and what was not ported.
    with the 0.1 floor and coarse-period handling, log-normalized proof-count
    boost; temporal boost carried at neutral). rustsight's recall remains
    structurally simpler than upstream's TEMR pipeline — the per-arm limit
-   spans all memory kinds rather than per fact_type (upstream's reflect
-   recall filters to world/experience), and rustsight's reflect keeps its
-   own tool loop (see item 5); full TEMR parity is ticketed as RS-15.
+   spans the requested kinds in one pool rather than per fact_type; the
+   reflect tools now *request* kind-filtered pools (world/experience for
+   `recall`, observations for `search_observations`, matching upstream's
+   reflect semantics — see item 5), but the native recall endpoint's
+   per-kind per-arm structure, strategy boosts, min-score floors, rerank
+   modes, and per-level candidate caps are ticketed as RS-15.
+
+9. **Hindsight wire API: same shapes, simpler machinery behind some of
+   them.** `rustsight-server/src/compat.rs` serves upstream's paths and
+   request/response models (read from hindsight-api 1.2.1 `api/http.py`).
+   Where the engine does less than upstream behind an accepted field:
+   - **Tags**: `tags_match` semantics are an exact port of
+     `build_tags_where_clause` (any / all / any_strict / all_strict / exact,
+     incl. "exact + no tags = untagged only") and `tag_groups` and/or/not
+     trees (leaf default `any_strict`); `resolve: "fuzzy"` leaves are
+     rejected. **Observations are not tag-partitioned**: upstream
+     consolidates per tag scope (`observation_scopes`, default `combined`)
+     and stores tags on the observation; rustsight consolidates per entity
+     across tags and derives an observation's tags as the union of its
+     evidence facts' tags at query time.
+   - **Documents**: `replace` deletes the old version's memories and
+     re-extracts the whole document (upstream's delta retain reuses
+     unchanged chunks' facts); only a byte-identical re-retain with
+     unchanged tags/metadata/context is skipped. `append` joins bodies with
+     upstream's `join_document_parts` rule (JSON arrays of objects merge,
+     otherwise newline) and extracts only the new tail. Chunks are not
+     stored (`chunk_id` null, `include.chunks` ignored).
+   - **Reflect budget**: `budget` maps to loop rounds with upstream's
+     multipliers over a base of 10 (low 5 / mid 10 / high 20, API default
+     low). The native `Engine::reflect` path keeps `reflect_max_rounds`
+     (8), the value the parity runs were tuned at.
+   - **Mission split**: a bank configured through this API follows
+     upstream — `reflect_mission` (and its deprecated aliases) steers
+     reflect only; extraction and consolidation use `retain_mission` /
+     `observations_mission`. Natively configured banks keep sharing one
+     `mission` across all three (rustsight's earlier behavior).
+   - **Structured output**: `response_schema` is rendered by one extra
+     JSON-mode call over the finished answer with a rustsight-written
+     instruction (upstream's `structured_output.py` is not vendored); the
+     schema is not enforced beyond "valid JSON".
+   - **`timestamp: "unset"`**: the extractor gets no event date, but the
+     memory still records the retain time as `mentioned_at` (upstream
+     stores none).
+   - Not produced: `usage`, reflect `trace`, `scores.reranker` /
+     `semantic` / `keyword` (only `scores.final`).
 
 ## Not ported (no parity claim)
 

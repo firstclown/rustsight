@@ -37,6 +37,9 @@ fi
 
 OUT="${RUSTSIGHT_EVAL_OUT:-evals/fullstack-smoke}"
 if [ -e "$OUT" ]; then
+    # Keep exactly one previous run: drop the old *.prev first — a plain
+    # `mv` onto an existing non-empty directory fails (seen twice).
+    rm -rf "${OUT}.prev"
     mv "$OUT" "${OUT}.prev"
     echo "fullstack-smoke: rotated previous run to ${OUT}.prev"
 fi

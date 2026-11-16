@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Build the release binary used by parity/benchmark/desktop runs, WITH the
+# local ONNX reranker compiled in (CUDA by default; --cpu for CPU-only).
+#
+# WHY THIS EXISTS: a plain `cargo build --release` does not include the
+# reranker features and silently overwrites target/release/rustsight with
+# a binary that refuses to start under RUSTSIGHT_RERANK=local ("provider
+# setup failed ... built without the onnx-rerank feature"). The 2026-11-12
+# parity run lost all six scenarios at /healthz to exactly that.
+#
+# Usage:
+#   scripts/build-release          # CUDA reranker (matches parity-suite .env)
+#   scripts/build-release --cpu    # CPU-only reranker
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+export PATH="$HOME/.cargo/bin:$PATH"
+
+FEATURE=onnx-rerank-cuda
+if [[ "${1:-}" == "--cpu" ]]; then
+    FEATURE=onnx-rerank
+fi
+
+exec cargo build --release -p rustsight-cli --features "$FEATURE"

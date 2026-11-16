@@ -44,32 +44,123 @@ pub fn build_reflect_system(bank: &Bank) -> String {
     s.push('\n');
     s.push_str(&verbalize_disposition(&bank.disposition));
     s.push_str("\n\nTOOL PROTOCOL:\n\
-        - Call the `recall` tool to search memory. You may call it multiple times with different queries.\n\
-        - Call `read_observation` to read the consolidated profile of a specific entity; prefer observations over raw facts when both exist.\n\
-        - SOURCE PRIORITY: observations (distilled beliefs) first, then world/experience facts. Read the distilled answer before the transcript.\n\
-        - You MUST retrieve something with a tool before answering. Never fabricate memory.\n\
-        - When done, call `finish` with your answer. You may only cite memory ids that tools actually returned to you in this conversation. If the bank does not contain the answer, say so plainly instead of guessing.\n");
+         - Call `search_observations` first: it returns consolidated knowledge (observations) — \
+         the distilled answer, with freshness (mentioned_at) and proof counts. If observations \
+         exist but do not STATE the answer, or are stale, descend to raw facts.\n\
+         - Call `recall` for raw facts (world/experience memories) when observations are missing, \
+         stale, or lack the specific detail asked for. You MUST run recall before reporting that \
+         the bank holds nothing about something.\n\
+         - Call `read_observation` to read every observation for one named entity.\n\
+         - Tool results are ordered by semantic relevance, NOT by time — the position of an entry \
+         says nothing about when it was retained. For temporal reasoning read the per-entry \
+         mentioned_at / occurred dates.\n\
+         - You MUST retrieve something with a tool before answering. Never fabricate memory.\n\
+         - When done, call `finish` with your answer. The answer is the full response, not a summary of it: \
+         carry over every relevant fact, date and number from the tool results, at the same depth you would \
+         write for a reader who cannot see them. Connect related memories to form a complete picture — if you \
+         have related information, use it to give the best possible answer.\n\
+         - Citations: you may only cite memory ids that tools actually returned to you in this conversation, \
+         and they go in the `citations` array — NEVER cite memory ids or UUIDs in the answer text itself. \
+         If the bank does not contain the answer, say so plainly instead of guessing.\n\n");
+    // Upstream `build_system_prompt_for_tools` Query Strategy section,
+    // adapted to this engine's tool names: one literal echo of the question
+    // finds one facet of a multi-entity question; gold's answer breadth
+    // comes from decomposed searches.
+    s.push_str(
+        "## Query Strategy\n\
+         search_observations() and recall() use semantic search. NEVER just echo the user's \
+         question - decompose it into targeted searches:\n\n\
+         BAD: User asks 'recurring lesson themes between students' -> \
+         search_observations('recurring lesson themes between students')\n\
+         GOOD: Break it down into component searches:\n\
+         \x20 1. search_observations('lessons') - find all lesson-related observations\n\
+         \x20 2. search_observations('teaching sessions') - alternative phrasing\n\
+         \x20 3. recall('student progress') - find student-related raw facts\n\n\
+         Think: What ENTITIES and CONCEPTS does this question involve? Search for each separately.\n\n",
+    );
+    // Upstream's MODERATE research-depth wording, verbatim (names no tools).
+    s.push_str(
+        "## RESEARCH DEPTH: MODERATE (Balanced)\n\
+         - Balance thoroughness with efficiency\n\
+         - Check multiple sources when the question warrants it\n\
+         - Verify stale data if it's central to the answer\n\
+         - A result that is merely on the same topic does not answer the question: when it does \
+         not cover it, go on to the next level\n\
+         - Don't over-explore, but ensure reasonable coverage\n\n",
+    );
+    // Engine-side evidence discipline (extends upstream's grounding
+    // boundary): the parity runs' contradictions were all synthesis-level
+    // over-inference — attendance/preferences inferred from related notes,
+    // mentioned-in-period read as happened-in-period, a yes/no answered
+    // against the final milestone only. The participation line encodes the
+    // bank owner's adjudicated semantics (2026-11-12): activities recorded
+    // as done together — co-writing, pair work — ARE meetings; planning,
+    // scheduling, or intending is not; and liking a specific meal is a
+    // record about that meal, never a standing preference.
+    s.push_str(
+        "## Evidence Discipline\n\
+         - A record is evidence only of what it states. Do NOT infer that someone liked, \
+         owned, or used something merely because they ate it, went there, or bought it — and \
+         a record of enjoying one meal says only that that meal was enjoyed, not a food \
+         preference. Activities recorded as done together with someone (co-writing, pair \
+         work) DO count as meeting them; planning, scheduling, or intending something with \
+         them does not.\n\
+         - `mentioned_at` is when a memory was written down; `occurred` dates are when it \
+         happened. For \"in <period>\" questions select on occurred dates: an event merely \
+         mentioned in the period did not necessarily happen in it.\n\
+         - Prefer stating what IS recorded over inferring. \"The memories do not record X\" \
+         followed by the nearest recorded facts is a complete, correct answer.\n\
+         - For before/after-a-date questions, weigh every recorded milestone of the subject — \
+         an earlier partial ship, visit, or change counts — not only the final one.\n\n",
+    );
     s
 }
+
+/// Upstream `_DONE_SUFFICIENCY_GATE` (tools_schema.py), adapted from `done`
+/// to this engine's `finish` tool: the stopping condition the model weighs
+/// at the moment it picks finish over another search.
+pub const FINISH_SUFFICIENCY_GATE: &str = " You have NOT gathered enough while the levels you \
+     searched do not STATE the answer: a result that only shares the question's topic is not an \
+     answer, so search the next level (search_observations, then recall) instead of answering \
+     around it. Never call finish to report that nothing is known unless recall has already run \
+     on the question's key terms.";
 
 pub fn reflect_tools() -> Vec<ToolDef> {
     vec![
         ToolDef {
-            name: "recall".into(),
-            description: "Search the memory bank and get relevant memories within a token budget."
+            name: "search_observations".into(),
+            description: "Search the consolidated knowledge base (observations): distilled \
+                beliefs synthesized from raw facts, with freshness and proof counts. Start \
+                here; descend to `recall` when observations do not state the answer."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "What to search for"},
-                    "token_budget": {"type": "integer", "description": "Approximate token budget for returned context", "default": 2000}
+                    // Upstream search tool default: 5000 result tokens.
+                    "token_budget": {"type": "integer", "description": "Approximate token budget for returned context. Use higher values for broader searches.", "default": 5000}
+                },
+                "required": ["query"]
+            }),
+        },
+        ToolDef {
+            name: "recall".into(),
+            description: "Search raw memory facts (world/experience memories — the source \
+                observations are built from) within a token budget."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "What to search for"},
+                    // Upstream recall tool default: 2048 result tokens.
+                    "token_budget": {"type": "integer", "description": "Optional limit on result size. Use higher values for broader searches.", "default": 2048}
                 },
                 "required": ["query"]
             }),
         },
         ToolDef {
             name: "read_observation".into(),
-            description: "Read the consolidated observation profile for a named entity.".into(),
+            description: "Read every consolidated observation for one named entity.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -80,13 +171,23 @@ pub fn reflect_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "finish".into(),
-            description:
-                "Deliver the final answer. Cite only memory ids that were returned by tools.".into(),
+            description: format!(
+                "Deliver the final answer. Cite only memory ids that were returned by tools.{FINISH_SUFFICIENCY_GATE}"
+            ),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "answer": {"type": "string"},
-                    "citations": {"type": "array", "items": {"type": "string"}, "description": "Memory ids actually used"}
+                    "answer": {
+                        "type": "string",
+                        "description": "Your response as well-formatted markdown; use headers, lists, and bold where they help. \
+                            This is the ANSWER, not a summary of it: carry over every relevant fact, date and number \
+                            from the tool results, at the same depth you would write for a reader who cannot see them. \
+                            NEVER include memory IDs, UUIDs, or citation markers in this text — put ids only in the citations array."
+                    },
+                    "citations": {"type": "array", "items": {"type": "string"}, "description": "Memory ids actually used"},
+                    // Upstream `_DONE_ANSWER_FOUND_PROPERTY` (#4567): a false with
+                    // no recall yet is refused by the engine and re-asked.
+                    "answer_found": {"type": "boolean", "description": "true if what you retrieved states the answer to the question. false if you are reporting that nothing (or not enough) is known about it."}
                 },
                 "required": ["answer"]
             }),
@@ -222,6 +323,154 @@ mod tests {
         assert!(s.contains("MISSION: Research assistant"));
         assert!(s.contains("DIRECTIVES"));
         assert!(s.contains("finish"));
+    }
+
+    /// The tool ladder mirrors upstream's leveling: observations first
+    /// (`search_observations`), raw facts behind `recall`, `finish` last.
+    #[test]
+    fn reflect_tools_expose_search_ladder() {
+        let tools = reflect_tools();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "search_observations",
+                "recall",
+                "read_observation",
+                "finish"
+            ]
+        );
+        let recall = tools.iter().find(|t| t.name == "recall").unwrap();
+        assert!(recall.description.contains("raw"));
+        let search = tools
+            .iter()
+            .find(|t| t.name == "search_observations")
+            .unwrap();
+        assert!(search.description.contains("consolidated"));
+    }
+
+    /// The system prompt carries the observations-first ladder and the
+    /// temporal-ordering warning (upstream's two strongest reflect
+    /// behaviors).
+    #[test]
+    fn reflect_system_carries_ladder_and_temporal_note() {
+        let s = build_reflect_system(&Bank {
+            id: "b".into(),
+            mission: None,
+            directives: None,
+            background: None,
+            disposition: Disposition::default(),
+        });
+        assert!(s.contains("search_observations"));
+        assert!(s.contains("ordered by semantic relevance, NOT by time"));
+        assert!(s.contains("mentioned_at"));
+    }
+
+    #[test]
+    fn reflect_system_carries_answer_completeness_guidance() {
+        // Upstream parity-run finding (2026-11-11): without the answer-not-a-
+        // summary wording, models answer the literal question in one line and
+        // the judge scores adjacent retrieved facts as omitted information.
+        let s = build_reflect_system(&Bank {
+            id: "b".into(),
+            mission: None,
+            directives: None,
+            background: None,
+            disposition: Disposition::default(),
+        });
+        assert!(s.contains("not a summary of it"));
+        assert!(s.contains("carry over every relevant fact, date and number"));
+        assert!(s.contains("NEVER cite memory ids or UUIDs in the answer text"));
+    }
+
+    #[test]
+    fn finish_tool_answer_field_guides_depth_and_bans_inline_ids() {
+        let tools = reflect_tools();
+        let finish = tools.iter().find(|t| t.name == "finish").unwrap();
+        let answer = &finish.parameters["properties"]["answer"];
+        let desc = answer["description"].as_str().unwrap();
+        assert!(desc.contains("well-formatted markdown"));
+        assert!(desc.contains("not a summary of it"));
+        assert!(desc.contains("NEVER include memory IDs"));
+    }
+
+    /// Upstream's Query Strategy and MODERATE research-depth sections drive
+    /// gold's evidence breadth (decomposed searches, not one literal echo) —
+    /// pin their presence.
+    #[test]
+    fn reflect_system_carries_query_strategy_and_depth() {
+        let s = build_reflect_system(&Bank {
+            id: "b".into(),
+            mission: None,
+            directives: None,
+            background: None,
+            disposition: Disposition::default(),
+        });
+        assert!(s.contains("## Query Strategy"));
+        assert!(s.contains("NEVER just echo the user's question"));
+        assert!(s.contains("Search for each separately"));
+        assert!(s.contains("## RESEARCH DEPTH: MODERATE (Balanced)"));
+    }
+
+    /// The engine-side evidence-discipline section (RS-20): the parity
+    /// runs' contradictions were inference — preferences from outings,
+    /// mentioned-as-occurred, final-milestone yes/nos. The participation
+    /// line encodes the bank owner's adjudicated semantics: together
+    /// activities are meetings, planning is not, one liked meal is not a
+    /// preference.
+    #[test]
+    fn reflect_system_carries_evidence_discipline() {
+        let s = build_reflect_system(&Bank {
+            id: "b".into(),
+            mission: None,
+            directives: None,
+            background: None,
+            disposition: Disposition::default(),
+        });
+        assert!(s.contains("## Evidence Discipline"));
+        assert!(s.contains("DO count as meeting them"));
+        assert!(s.contains("not a food"));
+        assert!(s.contains("mentioned"));
+        assert!(s.contains("every recorded milestone"));
+    }
+
+    /// Tool budget defaults mirror upstream's schemas: search 5000, recall
+    /// 2048 (the 2026-11-11 rerun gathered one literal 2000-token search).
+    #[test]
+    fn reflect_tool_budget_defaults_match_upstream() {
+        let tools = reflect_tools();
+        let search = tools
+            .iter()
+            .find(|t| t.name == "search_observations")
+            .unwrap();
+        assert_eq!(
+            search.parameters["properties"]["token_budget"]["default"],
+            5000
+        );
+        let recall = tools.iter().find(|t| t.name == "recall").unwrap();
+        assert_eq!(
+            recall.parameters["properties"]["token_budget"]["default"],
+            2048
+        );
+    }
+
+    /// The finish tool carries upstream's #4567 machinery: the sufficiency
+    /// gate in the description and the `answer_found` verdict the engine
+    /// refuses a premature negative on.
+    #[test]
+    fn finish_tool_carries_sufficiency_gate_and_answer_found() {
+        let tools = reflect_tools();
+        let finish = tools.iter().find(|t| t.name == "finish").unwrap();
+        assert!(finish.description.contains("You have NOT gathered enough"));
+        assert!(finish.description.contains(
+            "Never call finish to report that nothing is known unless recall has already run"
+        ));
+        let answer_found = &finish.parameters["properties"]["answer_found"];
+        assert_eq!(answer_found["type"], "boolean");
+        assert!(answer_found["description"]
+            .as_str()
+            .unwrap()
+            .contains("nothing (or not enough) is known"));
     }
 
     #[test]

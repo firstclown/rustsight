@@ -497,14 +497,59 @@ for basic retain/recall/reflect.
   (3,900+ commits), don't promise full parity.
 
 ### Definition of done
-- [ ] `/v1/compat` router (feature-gated) implementing retain/recall/reflect
-      + bank CRUD per upstream v1.1.0 spec subset, with their field names.
+- [x] Compat router implementing retain/recall/reflect + bank create/update
+      + documents + async-retain operations with upstream's paths and field
+      names (`crates/rustsight-server/src/compat.rs`). Served at upstream's
+      own paths (`/v1/default/banks/...`, `/version`, `/health`) rather than
+      under `/v1/compat`, and always on rather than feature-gated: a client
+      has to work with only its `baseUrl` changed, and the paths do not
+      collide with the native API.
 - [ ] OpenAPI document generated for our native API (utoipa or hand-written
       spec) and served at `/openapi.json`.
-- [ ] Smoke test: `pip install hindsight-client` pointed at rustsight
-      performs retain → recall → reflect successfully (scripted in
-      `rustsight-system-tests` or CI job).
-- [ ] Compat matrix doc: supported endpoints, known divergences.
+- [x] Smoke test with a real Hindsight client: `@vectorize-io/hindsight-client`
+      1.2.1 (TypeScript) pointed at `rustsight --mock serve` performs
+      createBank → retain (plain / document+tags+metadata / append / async /
+      unset timestamp) → recall (types, budget, tags, tag groups, source
+      facts) → reflect (budget, context, fact types, response schema) →
+      getDocument. Run by hand (Nov 2026); not yet scripted into the repo —
+      the in-repo coverage is the router tests in `compat.rs`.
+- [x] Compat matrix doc: supported endpoints, accepted-but-ignored options,
+      behavioral differences (README "Hindsight-compatible API").
+
+Shipped Nov 2026, driven by the first real consumer (a TypeScript agent
+harness that spawns `hindsight-api` and talks to it through the official
+client). Facts for later tickets:
+
+- The engine grew what the wire shapes needed, not just a translation
+  layer: documents (`document_id`, `update_mode` replace/append, stored
+  `original_text`), tags with upstream's five `tags_match` modes plus
+  `tag_groups`, per-memory metadata, caller-supplied entities, per-request
+  reflect options (budgeted rounds, answer length, tag scope, `fact_types`,
+  `response_schema`), per-operation LLMs, async retain with a persisted
+  operation queue.
+- Shapes were read from the installed hindsight-api **1.2.1** `api/http.py`
+  (the client version the consumer runs), while prompts stay pinned at
+  **1.1.0**. `/version` reports `api_version: "1.1.0"`.
+- Upstream's API reflect default is `budget: low` = 5 iterations
+  (`reflect_max_iterations` 10 x 0.5). The native `Engine::reflect` still
+  runs `reflect_max_rounds` = 8. **The parity suite in rustsight-compare
+  drives the native endpoints**, so its numbers describe an 8-round loop
+  — not what a Hindsight client gets through the compat API (5 rounds at
+  the default budget). Point the
+  suite at `/v1/default/...` before trusting its numbers for the swap.
+- Open follow-ups, in rough priority order for a real swap:
+  1. Tag-partitioned consolidation (`observation_scopes`): today observation
+     tags are derived from evidence and consolidation runs per entity across
+     tags.
+  2. Local embeddings (upstream `embeddings.provider = local`,
+     bge-small-en-v1.5): rustsight needs an embeddings endpoint.
+  3. Chunk storage (`include.chunks`, `chunk_id`), `usage` token counts,
+     reflect `trace` (tool/LLM call log).
+  4. Directives as first-class resources, mental models through this API,
+     bank delete / bank config endpoints, HTTP MCP at `/mcp/{bank_id}/`.
+  5. Delta retain: `replace` re-extracts the whole document (upstream
+     reuses unchanged chunks' facts); only byte-identical re-retains are
+     skipped.
 
 ---
 
@@ -658,18 +703,79 @@ constants.
       engine_flow merge-positive and fragment+wide-pool integration tests.
 - [x] Offline `--mock` fullstack smoke 7/7; real run pending (user).
 
+## RS-17 — Parity-run iteration: reflect answer machine + consolidation response machine (done) · P1 · L
+
+### Description
+
+The first hosted parity-suite run vs Hindsight (2026-11-11, gpt-oss-120b via
+OpenRouter, 6 scenarios / 20 questions) scored 40% overall: 6 `rustsight_less`
+(broad list questions answered from a fraction of what was retrieved — e.g.
+"What does Joe hate?" retrieved 150 items, cited 3), 2 contradictions
+(consolidation baked first-person inferences into observations — "Joe …
+participated"; reflect inferred "likes hibachi/thai/pierogi" from outing
+memories), and 2 whole scenarios dead with `reflect produced no answer` HTTP
+500s (the loop searched every round and never called `finish`). Root causes
+were structural, not prompt-wording: observations were 6–8x upstream's count
+(196/245 vs 31/26) with verbatim cross-entity duplicates crowding reflect's
+token budget, the recall pool was observation-dominated (upstream's reflect
+recall returns world/experience only), and the loop model was asked to both
+stop and compose the final answer — upstream throws that answer away and
+re-synthesizes from the full gathered history.
+
+### Shipped (Nov 2026)
+
+- Reflect answer machine: kind-separated tools (`recall` → world/experience,
+  `search_observations` → observations, opinions unretrievable by reflect),
+  forced-done round on round-exhaustion/empties, then a separate
+  final-synthesis call over the packed tool history (`build_final_prompt` /
+  `split_context_history` / claims-map + reduce, hand-ported from the vendored
+  upstream). "reflect produced no answer" is now reachable only when the
+  synthesis provider call fails with no fallback.
+- Consolidation response machine: byte-parity upstream prompt with
+  per-entity `ENTITY:`-scoped batches, creates/updates/deletes application
+  (deletes merge evidence into `merged_into` survivors), bank-level
+  exact-dupe guard, update re-embedding, and a lenient parser accepting the
+  legacy `{"observations": [...]}` shape.
+- Store: `delete_observation` (row + FTS).
+
+### Definition of done
+
+- [x] No scenario errors from model-shape failures (forced-done + synthesis).
+- [x] `ReflectResponse.synthesized` records the answering path; eval traces it.
+- [x] engine_flow: upstream-plan application, delete-merge, dupe guard,
+      kind separation (synthesis prompt capture), round-exhaustion,
+      split-synthesis, empty-streak synthesis tests.
+- [x] `cargo fmt` / `clippy -D warnings` / all tests green; offline
+      fullstack smoke 7/7.
+- [x] Parity-suite rerun (Nov 2026, reranker on CUDA): **regressed to 13.8%**
+      (4/29 equivalent, 15 `rustsight_less`, 4 contradictions, 0 errors —
+      run `20261111T195956Z` in rustsight-compare). The synthesis-first
+      answer machine writes minimal literal answers even with complete
+      evidence in the packed history (alice_profile: cited observation said
+      "four years on the Bing ranking pipeline"; answer said "four years").
+      Root causes and follow-ups ticketed as RS-18..RS-21 below.
+- [ ] Golden-pin the hand-ported final-synthesis builders via
+      `scripts/prompt-goldens` (extend the generator's harness) — rolled
+      into RS-18's DoD.
+
+Facts for the rerun: answers now cost one extra LLM call per reflect (the
+synthesis; upstream pays it too) — expect reflect wall time up ~50%, answer
+completeness up. The escape-room contradiction may persist even after the
+consolidation fix: our observation asserted what the first-person journal
+implied, gold says otherwise — partly judge/gold noise.
+
 ## RS-15 — Full TEMR recall parity · P1 · L
 
 Upstream recall is a budget-driven pipeline across per-fact_type arms with
 strategy boosts, min-score floors, `interleave`/`rrf`/`cross_encoder`
 reranking modes, recency decay config plumbing, and per-level
-`reranker_max_candidates`. rustsight's recall is one pool per arm across all
-kinds. Port the structure (per-kind per-arm limits, budget levels plumbed
+`reranker_max_candidates`. rustsight's recall is one pool per arm across the
+requested kinds. Port the structure (per-kind per-arm limits, budget levels plumbed
 through the reflect tool schema, decision-reranker hook) — see
 `memories/pg/recall.py`, `search/retrieval.py`, `search/fusion.py`,
-`memory_engine.py` at the pin. Includes aligning reflect's recall kind
-filter (upstream: world/experience only; observations come from
-`search_observations`).
+`memory_engine.py` at the pin. The reflect-side kind alignment (recall →
+world/experience, observations behind `search_observations`) shipped with
+RS-17; what remains is the *engine* recall's per-fact_type arm structure.
 
 ## RS-16 — Entity merge/alias repair API (upstream #3216) · P2 · M
 
@@ -680,6 +786,257 @@ aliases, memory links, observations, co-occurrences; dirty queue re-runs
 consolidation) plus `inspect` reporting of likely duplicate pairs
 (`cluster_new_entity_names` on existing entities as the candidate
 generator).
+
+## RS-18 — Reflect answer path back to upstream semantics + evidence breadth · P0 · L
+
+### Description
+
+The Nov 2026 parity rerun (`20261111T195956Z`, gpt-oss-120b via OpenRouter,
+6 scenarios / 29 questions, reranker on CUDA) regressed to 13.8% parity from
+the first run's 40%, all failure modes being answer *depth*, not retrieval:
+
+- 15/29 `rustsight_less`. Retrieval is NOT the bottleneck: alice_profile
+  "How long did Alice work at Microsoft?" retrieved 6/6 bank observations,
+  the top hit was "Alice Chen worked at Microsoft for four years on the
+  Bing ranking pipeline", and the answer still came back "Alice worked at
+  Microsoft for **four years**." role_change "Which company does Bob work
+  for?" retrieved the whole Stripe→Figma timeline; answer: "Bob works for
+  **Figma**." The separate final-synthesis call (RS-17) writes minimal
+  literal answers even with complete evidence in its packed history.
+- Upstream's reflect does the opposite of what we shipped: the loop's
+  `done` tool call IS the answer (verified in installed hindsight-api
+  1.1.0 `agent.py`: the done payload is validated, id-stripped, and
+  returned; `build_final_prompt` is only the *fallback* when the closing
+  done call fails — `_ask_for_done`'s except path). Gold answers show the
+  loop searched both levels (they cite observation AND raw-fact ids with
+  observed/recalled dates), i.e. the ladder + done answer written with the
+  whole tool conversation in context.
+- Our loop prompt also lacks the two upstream behaviors that drive gold's
+  evidence breadth: the **Query Strategy** section ("NEVER just echo the
+  user's question — decompose it into targeted searches … search each
+  entity/concept separately", vendored `reflect/prompts.py`
+  `build_system_prompt_for_tools`) and the **done sufficiency gate**
+  (`_DONE_SUFFICIENCY_GATE` + `answer_found` bool in `tools_schema.py`,
+  with the #4567 guardrail: refuse a negative `done` until recall ran).
+  With gpt-oss batching `search_observations`+`finish` in one round, most
+  reflects gather a single literal 2000-token search then answer.
+- Tool budget defaults diverge: upstream search_observations defaults to
+  5000 result tokens (recall: 2048); ours say 2000
+  (`prompts/reflect.rs::reflect_tools`, `engine/reflect.rs` default).
+
+### Work
+
+1. [x] **Done-first answer priority** in `engine/reflect.rs`: a non-empty loop
+   `finish` answer (including the finish-shaped-content unwrap and the
+   forced-done round) becomes the response; the standalone synthesis runs
+   only when the loop produced nothing usable (round exhaustion, empties,
+   provider failure) — upstream's exact precedence.
+   `ReflectResponse.answer_path` records the path (loop | forced-done |
+   synthesis); `synthesized` stays as the compatibility view. One fewer
+   LLM call on the common path.
+   **Iteration 2 (after the 2026-11-12 rerun, 13.8% → 20.7% but still
+   12/29 `rustsight_less` + 1 abstain):** the closing ask
+   (`build_done_request_prompt` + forced `finish` via the new
+   `LlmRequest.tool_choice`, upstream `tool_choice=done`) now ALWAYS runs
+   when the loop stops and its answer wins (ForcedDone); the volunteered
+   finish is the fallback (Loop); synthesis stays the last resort. Also:
+   harness-noise content (`<|channel|>`-style tokens) is treated as an
+   empty turn (one answer was raw gateway garbage), and every answer is
+   stripped of inline memory ids / "Citations" sections with the ids
+   harvested into the validated citations (upstream
+   `presenter.drop_unseen_ids`).
+   **Iteration 3 (after the 2026-11-12 31.0% run):** the missing depth
+   lever was mechanical, not luck — upstream `reflect_async` defaults
+   `max_tokens: int = 4096` (a *visible answer-length target*, distinct
+   from the output cap), which rides the closing ask and synthesis
+   prompts as the `## Length` directive ("a complete, self-contained
+   answer of approximately N tokens"). We passed `None`, so the same
+   model that writes gold's exhaustive answers wrote 41-char one-liners
+   on point questions with perfect retrieval (alice flipped 100% → 25%
+   across runs on this alone). New
+   `reflect_answer_max_tokens` config (default 4096) now feeds
+   `build_done_request_prompt`, `build_final_prompt`, and
+   `build_reduce_prompt`.
+2. [x] **Port the upstream loop guidance into our diverged system prompt**
+   (`build_reflect_system`): the Query Strategy section (verbatim where
+   possible, tool names adapted), the research-depth (MID) wording.
+3. [x] **Sufficiency gate on `finish`**: `answer_found` (bool) on the tool
+   schema with upstream's description + `_DONE_SUFFICIENCY_GATE`
+   (done→finish) appended to the description; `answer_found=false` before
+   any `recall` is refused once with a nudge, the retry honored (applies
+   to finish tool calls and finish-shaped content; not the forced-done
+   closing ask, matching upstream).
+4. [x] **Tool budget defaults** → search_observations 5000, recall 2048
+   (schema defaults and `run_recall_tool` fallbacks).
+5. [ ] Update DIVERGENCES.md item 5 (done — see above) and golden-pin the
+   hand-ported final-synthesis builders (RS-17 leftover) via
+   `scripts/prompt-goldens` — the generator extension is still open.
+
+### Definition of done
+
+- [x] `answer_path` recorded and asserted in engine_flow tests: loop
+      finish preferred (`reflect_makes_no_synthesis_call_when_loop_finishes`,
+      `reflect_loop_with_scripted_tools`); synthesis only on empty loop;
+      forced-done answer wins when it lands (eval runner test).
+- [x] Sufficiency-gate refusal tests:
+      `reflect_refuses_premature_negative_finish_until_recall`,
+      `reflect_honors_repeated_negative_finish_without_recall`.
+- [x] Prompt tests pin the new Query Strategy / depth sections and tool
+      budget defaults (`reflect_system_carries_query_strategy_and_depth`,
+      `reflect_tool_budget_defaults_match_upstream`,
+      `finish_tool_carries_sufficiency_gate_and_answer_found`).
+- [x] fmt / clippy -D warnings / 228 tests green / offline fullstack
+      smoke 7/7.
+- [x] First parity rerun (2026-11-12): 20.7% (from 13.8%), less 12 (from
+      15), contradictions 2 (from 4), first exact-string match — but under
+      the ≥40% target; iteration 2 (closing ask + hygiene) shipped on the
+      same ticket.
+- [ ] Second parity rerun: `rustsight_less` ≤7/29, overall parity ≥40%;
+      0 errors.
+
+## RS-19 — Consolidation completeness: fact cap + near-dupe observations · P0 · M
+
+### Description
+
+Two consolidation defects keep observations weaker than gold's:
+
+- **60-fact cap drops facts silently.** `consolidate.rs` feeds each dirty
+  entity `facts_for_entity(eid, 60)` (newest-first). The 2025-11 scenario
+  has 159 facts — the "Joe" entity alone exceeds 60 — so older facts never
+  reach an observation on any pass (new facts keep pushing them out of the
+  window). Reflect must then find them via raw recall, which list-style
+  questions rarely do.
+- **Near-duplicate observations still crowd the bank.** 2025-11: 199
+  observations vs Hindsight's 31 (role_change: 5 vs 3). The exact-text
+  dupe guard can't catch paraphrases, and per-entity batches never show
+  the model observations outside the entity's own set, so it CREATEs a
+  sibling instead of UPDATEing (role_change: "Bob began his career at
+  Stripe as a junior developer on the payments team on March 2, 2026" and
+  "Bob started as a junior developer on the payments team at Stripe."
+  both live on, linked to different entities). Upstream pools existing
+  observations bank-wide via recall per batch (`consolidator.py`, not
+  vendored — see DIVERGENCES item 4).
+
+### Work
+
+1. [x] Page through ALL of a dirty entity's facts in consolidation windows
+   (`consolidate_max_facts_per_entity`, default 200, newest-first, later
+   windows see earlier windows' observations; one batched embed per
+   entity). The old fixed cap of 60 silently dropped older facts of big
+   entities.
+2. [x] Cosine near-dupe guard at CREATE time (`consolidate_dupe_cosine`,
+   default 0.9): a proposed observation this similar to any embedded
+   existing observation merges its evidence instead of writing a sibling;
+   exact-text guard stays the zero-cost first pass; create texts are
+   embedded once (batched) and reused for the stored embedding.
+3. [ ] (Measured-optional) widen the consolidation prompt's existing
+   observations with top-k recalled bank-wide observations, upstream-style
+   — only if the rerun still shows cross-entity paraphrase siblings.
+
+### Definition of done
+
+- [x] engine_flow: entity with more facts than one window consolidates
+      them all (`consolidation_pages_past_the_fact_cap`); nothing silently
+      dropped.
+- [x] engine_flow: a CREATE paraphrasing an existing observation (cosine ≥
+      threshold) merges evidence instead of writing a sibling; a genuinely
+      new CREATE is untouched
+      (`consolidation_cosine_guard_merges_paraphrase_siblings`).
+- [x] fmt / clippy / 233 tests / fullstack smoke 7/7 (rotation bug in the
+      smoke script fixed too).
+- [ ] Parity-suite rerun: observation count for the journal scenarios
+      within ~2x Hindsight's (from ~5-8x); no parity regression.
+
+## RS-20 — Inference discipline for contradictions · P1 · S
+
+### Description
+
+All 4 contradictions are synthesis-level over-inference, not bad data:
+
+- "What did Amy do in January?" added trauma-dumping, which the bank only
+  records as *mentioned* in January ("Sam's behavior reminds him of Amy's
+  trauma-dumping when Joe asked for a divorce") — occurred years earlier.
+- "What food does Joe likes?" listed outing foods as preferences; gold
+  abstains ("no statement about specific foods Joe likes").
+- "What days did Joe see Emma?" counted co-writing/planning days as
+  in-person meetings; gold lists only the documented visit.
+- "Who went to the escape room?" added Joe (first-person journal "escape
+  room with Meredith, Andrew, Jay, and Emma") — partly gold noise (the
+  journal voice does imply Joe attended; RS-17 noted this), acceptable to
+  lose.
+
+RS-18's done-first change may fix some of this for free (gold's strictness
+came from a loop that had run raw `recall`, whose literal facts — "wants
+to get pierogi during Pierogi week" — invite less inference than our
+distilled observations). Do this ticket only for what survives that rerun.
+
+### Work
+
+1. [x] (shipped with RS-19's round) Mentioned-vs-occurred + participation/
+   preference inference rules added to the loop system prompt as an
+   engine-side **Evidence Discipline** section (extends upstream's
+   grounding boundary; the closing ask rides the same conversation, so
+   the rules are in scope when the answer is written). Wording encodes
+   the bank owner's adjudicated semantics (2026-11-12): together
+   activities (co-writing) ARE meetings; planning/scheduling is not;
+   eating/going somewhere is not liking it; one explicitly liked meal is
+   not a standing preference; "in <period>" selects on occurred dates;
+   before/after-a-date questions weigh every milestone (the Atlas beta
+   case). Note: the Emma-days parity verdicts will read as
+   `contradiction` while rustsight is the *more accurate* side there —
+   the adjudication is recorded in rustsight-compare's README.
+2. [ ] If preference/attendance inference survives the RS-19 rerun,
+   extend the synthesis system prompt's grounding boundary the same way
+   (it only matters on the synthesis fallback path now).
+3. [x] Documented in DIVERGENCES.md item 5 as engine-side additions.
+
+### Definition of done
+
+- [x] Prompt tests pin the new wording
+      (`reflect_system_carries_evidence_discipline`).
+- [ ] Parity rerun: contradictions ≤3/29 (escape-room expected to persist
+      as gold noise; Atlas is borderline gold noise), no new abstain
+      mismatches.
+
+## RS-21 — Latency: opinion extraction off the reflect critical path · P1 · S
+
+### Description
+
+Every reflect awaits `form_opinions` (one extra LLM call per question)
+before responding: 29/29 reflects in the parity run formed **zero**
+opinions, while paying roughly 5–15 s each (reflect avg 35 s vs
+Hindsight's 20 s; loop + synthesis + opinion extraction = 3+ calls per
+question). The journal scenarios' answers simply don't carry first-person
+opinions.
+
+### Work
+
+1. [x] Move `form_opinions` off the response path: spawned as a background
+   task after the answer is composed (errors logged, never blocking the
+   HTTP response; `with_retry_config` carries the engine's retry policy
+   into the detached task). Tests poll the store for the landed opinion
+   (worker-test pattern).
+2. [x] Per-call latency splits in the reflect response:
+   `loop_ms` (all rounds + forced-done) and `synthesis_ms` (when it ran);
+   `rounds` already existed.
+3. [x] Re-ask visibility: `RetainResponse.reasks` counts half-size
+   re-asks per retain; a one-line warn logs each fire. The parity driver
+   records the response JSON, so per-scenario re-ask totals fall out of
+   the run. Open follow-up if re-asks dominate retain latency:
+   structured-output (`json_schema`) support in `OpenAiCompat` for
+   extraction (upstream uses response-model schemas) — should cut both
+   latency and parse failures.
+
+### Definition of done
+
+- [x] HTTP reflect returns without waiting on opinion extraction;
+      engine_flow proves opinions still form in the background
+      (`reflect_forms_and_stores_opinions`,
+      `opinion_linked_to_entity_is_reinforced_by_consolidation`).
+- [x] Reflect metadata carries per-phase timings
+      (`loop_ms`/`synthesis_ms`); assert via any reflect response.
+- [x] Re-ask counter exists and is asserted
+      (`retain_reasks_at_half_size_on_parse_failure`).
 
 ## Appendix — facts referenced by multiple tickets
 

@@ -1763,6 +1763,7 @@ name = "rustsight-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "chrono",
  "rustsight-core",
  "rustsight-providers",
  "rustsight-storage",
@@ -1770,6 +1771,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tower",
+ "uuid",
 ]
 
 [[package]]

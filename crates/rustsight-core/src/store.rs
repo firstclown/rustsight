@@ -93,6 +93,10 @@ pub trait MemoryStore: Send + Sync {
     fn upsert_observation(&self, o: &Observation) -> Result<()>;
     fn observations_for_entity(&self, entity_id: &str) -> Result<Vec<Observation>>;
     fn observations_for_bank(&self, bank_id: &str) -> Result<Vec<Observation>>;
+    /// Remove one observation (row + FTS text) by id, scoped to its bank.
+    /// Used by consolidation's `deletes` (upstream merge/supersede machine);
+    /// unknown ids are a no-op.
+    fn delete_observation(&self, bank_id: &str, id: &str) -> Result<()>;
     /// Attach (or clear) an embedding on an existing observation by id,
     /// without rewriting the rest of the row. Used by consolidation's
     /// post-embed backfill; unknown ids are a no-op.
@@ -100,6 +104,39 @@ pub trait MemoryStore: Send + Sync {
 
     fn upsert_opinion(&self, o: &Opinion) -> Result<()>;
     fn list_opinions(&self, bank_id: &str) -> Result<Vec<Opinion>>;
+
+    /// Free-form per-bank settings that have no column of their own — a
+    /// JSON object (`{}` when unset). Known keys: `name` (display label),
+    /// `retain_mission`, `observations_mission`, and `mission_scope`
+    /// (`"reflect"` when the bank's `mission` must steer reflect only, as
+    /// Hindsight's `reflect_mission` does).
+    fn bank_config(&self, bank_id: &str) -> Result<serde_json::Value>;
+    fn set_bank_config(&self, bank_id: &str, config: &serde_json::Value) -> Result<()>;
+
+    /// Insert or replace a document record (keeps `created_at_ms` of an
+    /// existing row).
+    fn upsert_document(&self, doc: &Document) -> Result<()>;
+    fn get_document(&self, bank_id: &str, id: &str) -> Result<Option<Document>>;
+    fn list_documents(&self, bank_id: &str, limit: usize) -> Result<Vec<Document>>;
+    fn count_document_memories(&self, bank_id: &str, id: &str) -> Result<usize>;
+    /// Delete every memory filed under a document, together with its FTS
+    /// rows, entity links and edges, and strip the deleted ids out of
+    /// observation evidence (an observation left with no evidence is
+    /// removed). Returns the number of memories deleted and the entity ids
+    /// whose facts or observations changed — the caller re-queues those for
+    /// consolidation. The document row itself is untouched.
+    fn delete_document_memories(&self, bank_id: &str, id: &str) -> Result<(usize, Vec<String>)>;
+    fn delete_document(&self, bank_id: &str, id: &str) -> Result<()>;
+
+    /// Tags per item id for a bank: raw memories carry their own tags,
+    /// observations the union of their evidence facts' tags. Untagged items
+    /// are absent from the map.
+    fn tag_index(&self, bank_id: &str) -> Result<HashMap<String, Vec<String>>>;
+
+    fn upsert_operation(&self, op: &Operation) -> Result<()>;
+    fn get_operation(&self, id: &str) -> Result<Option<Operation>>;
+    /// Operations still `pending`, oldest first — resumed at server start.
+    fn pending_operations(&self) -> Result<Vec<Operation>>;
 
     fn upsert_mental_model(&self, m: &MentalModel) -> Result<()>;
     fn list_mental_models(&self, bank_id: &str) -> Result<Vec<MentalModel>>;

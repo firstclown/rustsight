@@ -326,6 +326,10 @@ mod tests {
             mentioned_at_ms: Some(day_ms(390)),
             entity_ids: vec![],
             proof_count: None,
+            context: None,
+            document_id: None,
+            tags: vec![],
+            metadata: None,
         };
         let from_start = recency_for_ref(&m, now, &cfg);
         m.occurred_start_ms = None;
@@ -362,6 +366,10 @@ mod tests {
             mentioned_at_ms: None,
             entity_ids: vec![],
             proof_count: None,
+            context: None,
+            document_id: None,
+            tags: vec![],
+            metadata: None,
         };
         // Asked "now" = mid-2015: the period's end is in the future, but a
         // coarse date never earns a freshness boost — capped at 0.5.

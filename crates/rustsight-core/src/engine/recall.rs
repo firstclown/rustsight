@@ -12,8 +12,11 @@ use std::sync::Arc;
 /// — its entry points into the edge graph (upstream `GRAPH_SEED_LIMIT`).
 const GRAPH_SEED_LIMIT: usize = 20;
 
+/// Row cap for SQL-limited arms when a tag scope post-filters their rows.
+const SCOPED_FETCH: usize = 100_000;
+
 pub(super) async fn recall(e: &Engine, req: RecallRequest) -> Result<RecallResponse> {
-    let now = e.clock.now_ms();
+    let now = req.now_ms.unwrap_or_else(|| e.clock.now_ms());
     let window = parse_window(&req.query, now);
     let embed = Arc::clone(&e.embed);
     let qemb = with_retry(e, || embed.embed(vec![req.query.clone()]))
@@ -31,6 +34,20 @@ pub(super) async fn recall(e: &Engine, req: RecallRequest) -> Result<RecallRespo
         ]
     });
     let k = req.top_k_per_arm.max(1);
+    // Tag scope (upstream `tags` / `tags_match`): resolved once into the set
+    // of admissible ids, then applied inside every arm *before* its top-k
+    // cut, so a narrow scope still fills the pool.
+    let scope: Option<Arc<TagScope>> = match req.tags.as_ref().filter(|f| !f.is_noop()) {
+        Some(filter) => {
+            let bank = req.bank_id.clone();
+            let index = blocking_store(&e.store, move |store| store.tag_index(&bank)).await?;
+            Some(Arc::new(TagScope {
+                filter: filter.clone(),
+                index,
+            }))
+        }
+        None => None,
+    };
 
     // The four retrieval arms are independent SQLite scans. Run them
     // concurrently on the blocking pool (never inline on the async runtime),
@@ -39,14 +56,21 @@ pub(super) async fn recall(e: &Engine, req: RecallRequest) -> Result<RecallRespo
     // Arm behavior (filters, truncation, `strategies_used` assembly) is
     // unchanged — this is purely an execution-order change.
     let (sem, bm) = tokio::join!(
-        arm_semantic(e, &req.bank_id, &qemb, &kinds, k.max(GRAPH_SEED_LIMIT)),
-        arm_bm25(e, &req.bank_id, &req.query, &kinds, k),
+        arm_semantic(
+            e,
+            &req.bank_id,
+            &qemb,
+            &kinds,
+            k.max(GRAPH_SEED_LIMIT),
+            scope.clone()
+        ),
+        arm_bm25(e, &req.bank_id, &req.query, &kinds, k, scope.clone()),
     );
     let sem = sem?;
     let bm = bm?;
     let (graph, temp_arm) = tokio::join!(
-        arm_graph(e, &req.bank_id, &sem, &bm, k),
-        arm_temporal(e, &req.bank_id, window, &kinds, k),
+        arm_graph(e, &req.bank_id, &sem, &bm, k, scope.clone()),
+        arm_temporal(e, &req.bank_id, window, &kinds, k, scope.clone()),
     );
     let graph = graph?;
     let temp_arm = temp_arm?;
@@ -79,10 +103,43 @@ pub(super) async fn recall(e: &Engine, req: RecallRequest) -> Result<RecallRespo
         });
     }
 
-    let mut refs =
-        blocking_store(&e.store, move |store| store.get_refs(&req.bank_id, &ids)).await?;
-    for (r, (_, f)) in refs.iter_mut().zip(&fused) {
-        r.score = *f;
+    let refs_bank = req.bank_id.clone();
+    let mut refs = blocking_store(&e.store, move |store| store.get_refs(&refs_bank, &ids)).await?;
+    // Scores attach by id: `get_refs` drops ids that vanished between the
+    // arms and this fetch (a concurrent document replace), which would
+    // shift a positional zip.
+    let fused_score: std::collections::HashMap<&str, f32> =
+        fused.iter().map(|(id, f)| (id.as_str(), *f)).collect();
+    for r in refs.iter_mut() {
+        r.score = fused_score.get(r.id.as_str()).copied().unwrap_or(0.0);
+    }
+    // The graph arm can surface kinds the caller did not ask for (edges
+    // cross kinds); the request's kind filter is authoritative.
+    refs.retain(|r| kinds.contains(&r.kind));
+    // Observations carry no tags of their own — theirs are the union of
+    // their evidence facts' tags, read from the bank's tag index.
+    if refs.iter().any(|r| r.kind == MemoryKind::Observation) {
+        let fetched;
+        let index = match &scope {
+            Some(scope) => &scope.index,
+            None => {
+                let bank = req.bank_id.clone();
+                fetched = blocking_store(&e.store, move |store| store.tag_index(&bank)).await?;
+                &fetched
+            }
+        };
+        for r in refs.iter_mut().filter(|r| r.tags.is_empty()) {
+            if let Some(tags) = index.get(&r.id) {
+                r.tags = tags.clone();
+            }
+        }
+    }
+    if refs.is_empty() {
+        return Ok(RecallResponse {
+            memories: vec![],
+            window,
+            strategies_used: used,
+        });
     }
 
     // Rerank the whole fused pool (upstream reranks every candidate; the
@@ -177,6 +234,23 @@ pub(super) async fn recall(e: &Engine, req: RecallRequest) -> Result<RecallRespo
     })
 }
 
+/// A resolved tag scope: the filter plus the bank's id → tags index.
+struct TagScope {
+    filter: TagFilter,
+    index: std::collections::HashMap<String, Vec<String>>,
+}
+
+impl TagScope {
+    fn admits(&self, id: &str) -> bool {
+        self.filter
+            .matches(self.index.get(id).map(Vec::as_slice).unwrap_or(&[]))
+    }
+}
+
+fn admits(scope: &Option<Arc<TagScope>>, id: &str) -> bool {
+    scope.as_ref().is_none_or(|s| s.admits(id))
+}
+
 /// Run one short synchronous store query on tokio's blocking pool so the
 /// sync SQLite store never stalls the async runtime's workers.
 async fn blocking_store<T, F>(store: &Arc<dyn MemoryStore>, f: F) -> Result<T>
@@ -199,6 +273,7 @@ async fn arm_semantic(
     qemb: &[f32],
     kinds: &[MemoryKind],
     k: usize,
+    scope: Option<Arc<TagScope>>,
 ) -> Result<Vec<String>> {
     let bank_id = bank_id.to_string();
     let qemb = qemb.to_vec();
@@ -207,7 +282,7 @@ async fn arm_semantic(
         let all = store.all_embeddings(&bank_id)?;
         let mut scored: Vec<(f32, String)> = all
             .into_iter()
-            .filter(|(_, kind, _)| kinds.contains(kind))
+            .filter(|(id, kind, _)| kinds.contains(kind) && admits(&scope, id))
             .map(|(id, _, v)| (cosine(&qemb, &v), id))
             .collect();
         scored.sort_by(|a, b| {
@@ -227,6 +302,7 @@ async fn arm_bm25(
     query: &str,
     kinds: &[MemoryKind],
     k: usize,
+    scope: Option<Arc<TagScope>>,
 ) -> Result<Vec<String>> {
     let bank_id = bank_id.to_string();
     let query = query.to_string();
@@ -236,10 +312,12 @@ async fn arm_bm25(
         if terms.is_empty() {
             return Ok(vec![]);
         }
-        let hits = store.search_bm25(&bank_id, &terms, k * 2)?;
+        // A tag scope filters after the SQL LIMIT, so over-fetch under one.
+        let fetch = if scope.is_some() { SCOPED_FETCH } else { k * 2 };
+        let hits = store.search_bm25(&bank_id, &terms, fetch)?;
         let mut s: Vec<(f32, String)> = hits
             .into_iter()
-            .filter(|(_, kind, _)| kinds.contains(kind))
+            .filter(|(id, kind, _)| kinds.contains(kind) && admits(&scope, id))
             .map(|(id, _, sc)| (sc, id))
             .collect();
         s.sort_by(|a, b| {
@@ -259,6 +337,7 @@ async fn arm_graph(
     sem: &[String],
     bm: &[String],
     k: usize,
+    scope: Option<Arc<TagScope>>,
 ) -> Result<Vec<String>> {
     // Seeds: the graph arm's entry points — up to GRAPH_SEED_LIMIT of the
     // top semantic hits (upstream derives its seeds from the dense rows),
@@ -278,9 +357,11 @@ async fn arm_graph(
     let sem = sem.to_vec();
     let bm = bm.to_vec();
     blocking_store(&e.store, move |store| {
-        let n = store.neighbors(&bank_id, &seeds, 2, k)?;
+        let fetch = if scope.is_some() { SCOPED_FETCH } else { k };
+        let n = store.neighbors(&bank_id, &seeds, 2, fetch)?;
         Ok(n.into_iter()
-            .filter(|id| !sem.contains(id) && !bm.contains(id))
+            .filter(|id| !sem.contains(id) && !bm.contains(id) && admits(&scope, id))
+            .take(k)
             .collect())
     })
     .await
@@ -292,6 +373,7 @@ async fn arm_temporal(
     window: Option<(i64, i64)>,
     kinds: &[MemoryKind],
     k: usize,
+    scope: Option<Arc<TagScope>>,
 ) -> Result<Vec<String>> {
     let Some((s, t)) = window else {
         return Ok(vec![]);
@@ -299,10 +381,11 @@ async fn arm_temporal(
     let bank_id = bank_id.to_string();
     let kinds = kinds.to_vec();
     blocking_store(&e.store, move |store| {
-        let ms = store.memories_in_window(&bank_id, s, t, k * 3)?;
+        let fetch = if scope.is_some() { SCOPED_FETCH } else { k * 3 };
+        let ms = store.memories_in_window(&bank_id, s, t, fetch)?;
         Ok(ms
             .into_iter()
-            .filter(|m| kinds.contains(&m.kind))
+            .filter(|m| kinds.contains(&m.kind) && admits(&scope, &m.id))
             .map(|m| m.id)
             .take(k)
             .collect())

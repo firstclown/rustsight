@@ -1,12 +1,13 @@
 use crate::engine::{with_retry, Engine};
 use crate::prompts::consolidation::{
-    build_consolidation_prompt, build_opinion_reinforcement_prompt, parse_observations,
-    parse_reinforcement,
+    build_entity_consolidation_prompt, build_opinion_reinforcement_prompt,
+    parse_consolidation_plan, parse_reinforcement, ConsolidationPlan,
 };
 use crate::traits::{ChatMessage, LlmRequest};
 use crate::types::*;
-use crate::{string_similarity, Error, Result};
+use crate::{Error, Result};
 use futures::StreamExt;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -146,7 +147,7 @@ pub(super) async fn consolidate_once(
                     temperature: Some(0.0),
                     ..Default::default()
                 };
-                let llm = Arc::clone(&e.llm);
+                let llm = e.llm_for_consolidate();
                 let resp = match with_retry(e, || llm.complete(&request)).await {
                     Ok(r) => r,
                     Err(err) => {
@@ -190,6 +191,11 @@ pub(super) async fn consolidate_once(
 /// this entity — its dirty row survives and the next pass retries it — so
 /// one malformed provider response can no longer discard the rest of a
 /// pass's work.
+///
+/// Entities with more facts than `consolidate_max_facts_per_entity` page
+/// through them in newest-first windows, each window seeing the previous
+/// windows' observations — no fact is silently dropped for being old (the
+/// 2026-11-12 finding: the fixed 60-fact cap starved big entities).
 fn consolidate_entity<'a>(
     e: &'a Engine,
     bank_id: &'a str,
@@ -212,7 +218,7 @@ fn consolidate_entity<'a>(
                 }
             }
         };
-        let facts = match e.store.facts_for_entity(eid, 60) {
+        let facts = match e.store.facts_for_entity(eid, i64::MAX as usize) {
             Ok(f) => f,
             Err(error) => {
                 return EntityStep::Failed {
@@ -221,7 +227,7 @@ fn consolidate_entity<'a>(
                 }
             }
         };
-        let existing = match e.store.observations_for_entity(eid) {
+        let mut existing = match e.store.observations_for_entity(eid) {
             Ok(f) => f,
             Err(error) => {
                 return EntityStep::Failed {
@@ -233,26 +239,8 @@ fn consolidate_entity<'a>(
         if facts.len() < 2 && existing.is_empty() {
             return clear_ineligible(e, bank_id, eid);
         }
-        let (system, user) = build_consolidation_prompt(&entity.name, &facts, &existing);
-        let request = LlmRequest {
-            system: Some(system),
-            messages: vec![ChatMessage::user(user)],
-            json_mode: true,
-            temperature: Some(0.0),
-            ..Default::default()
-        };
-        let llm = Arc::clone(&e.llm);
-        let resp = match with_retry(e, || llm.complete(&request)).await {
-            Ok(r) => r,
-            Err(error) => {
-                return EntityStep::Failed {
-                    entity_id: eid.to_string(),
-                    error,
-                }
-            }
-        };
-        let parsed = match parse_observations(&resp.content.unwrap_or_default()) {
-            Ok(p) => p,
+        let mission = match e.store.get_bank(bank_id) {
+            Ok(bank) => bank.and_then(|b| e.scoped_mission(&b, "observations_mission")),
             Err(error) => {
                 return EntityStep::Failed {
                     entity_id: eid.to_string(),
@@ -261,94 +249,64 @@ fn consolidate_entity<'a>(
             }
         };
         let now = e.clock.now_ms();
-        // (observation id, text) pairs awaiting the embedding backfill
-        // below. Tracking ids (not just texts) means each observation gets
-        // its own embedding even when two observations share identical text.
-        let mut obs_pending: Vec<(String, String)> = vec![];
+        let llm = e.llm_for_consolidate();
+        let max_facts = e.config.consolidate_max_facts_per_entity.max(1);
         let mut wrote = 0usize;
-        for p in parsed {
-            let mut evidence: Vec<Evidence> = vec![];
-            for (idx, quote) in &p.evidence {
-                if let Some(f) = facts.get(*idx) {
-                    let quote = if quote.trim().is_empty() {
-                        f.text.chars().take(160).collect()
-                    } else {
-                        quote.clone()
-                    };
-                    if !evidence.iter().any(|ev| ev.memory_id == f.id) {
-                        evidence.push(Evidence {
-                            memory_id: f.id.clone(),
-                            quote,
-                        });
-                    }
-                }
+        // (observation id, text) pairs needing (re-)embedding, across all
+        // of this entity's windows — one batched embed at the end.
+        let mut obs_pending: Vec<(String, String)> = vec![];
+        for window in facts.chunks(max_facts) {
+            if tokio::time::Instant::now() >= deadline {
+                return EntityStep::Deadline;
             }
-            if evidence.is_empty() {
-                if let Some(f) = facts.first() {
-                    evidence.push(Evidence {
-                        memory_id: f.id.clone(),
-                        quote: f.text.chars().take(160).collect(),
-                    });
-                }
-            }
-            if evidence.is_empty() {
-                continue;
-            }
-            let proof_count = evidence.len();
-            let target = existing
-                .iter()
-                .find(|o| string_similarity(&p.text, &o.text) >= 0.85);
-            match target {
-                Some(o) => {
-                    let mut upd = o.clone();
-                    let old_text = upd.text.clone();
-                    upd.text = p.text.clone();
-                    for ev in evidence {
-                        if !upd.evidence.iter().any(|x| x.memory_id == ev.memory_id) {
-                            upd.evidence.push(ev);
-                        }
-                    }
-                    upd.proof_count = upd.evidence.len();
-                    upd.updated_at_ms = now;
-                    if old_text != upd.text {
-                        upd.history.push(old_text);
-                    }
-                    if upd.embedding.is_none() {
-                        obs_pending.push((upd.id.clone(), upd.text.clone()));
-                    }
-                    if let Err(error) = e.store.upsert_observation(&upd) {
-                        return EntityStep::Failed {
-                            entity_id: eid.to_string(),
-                            error,
-                        };
-                    }
-                    wrote += 1;
-                }
-                None => {
-                    let o = Observation {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        bank_id: bank_id.to_string(),
+            let (system, user) = build_entity_consolidation_prompt(
+                &entity.name,
+                window,
+                &existing,
+                mission.as_deref(),
+            );
+            let request = LlmRequest {
+                system: Some(system),
+                messages: vec![ChatMessage::user(user)],
+                json_mode: true,
+                temperature: Some(0.0),
+                ..Default::default()
+            };
+            let resp = match with_retry(e, || llm.complete(&request)).await {
+                Ok(r) => r,
+                Err(error) => {
+                    return EntityStep::Failed {
                         entity_id: eid.to_string(),
-                        text: p.text.clone(),
-                        evidence,
-                        proof_count,
-                        history: vec![],
-                        updated_at_ms: now,
-                        created_at_ms: now,
-                        embedding: None,
-                    };
-                    obs_pending.push((o.id.clone(), o.text.clone()));
-                    if let Err(error) = e.store.upsert_observation(&o) {
-                        return EntityStep::Failed {
-                            entity_id: eid.to_string(),
-                            error,
-                        };
+                        error,
                     }
-                    wrote += 1;
+                }
+            };
+            let plan = match parse_consolidation_plan(&resp.content.unwrap_or_default()) {
+                Ok(p) => p,
+                Err(error) => {
+                    return EntityStep::Failed {
+                        entity_id: eid.to_string(),
+                        error,
+                    }
+                }
+            };
+            match apply_consolidation_plan(e, bank_id, eid, window, plan, now).await {
+                Ok((w, pending)) => {
+                    wrote += w;
+                    obs_pending.extend(pending);
+                    // Later windows see earlier windows' observations so the
+                    // model UPDATEs/merges instead of re-CREATEing (the
+                    // dupe guards back it up).
+                    existing = e.store.observations_for_entity(eid).unwrap_or_default();
+                }
+                Err(error) => {
+                    return EntityStep::Failed {
+                        entity_id: eid.to_string(),
+                        error,
+                    }
                 }
             }
         }
-
         if !obs_pending.is_empty() {
             let embed = Arc::clone(&e.embed);
             let texts: Vec<String> = obs_pending.iter().map(|(_, t)| t.clone()).collect();
@@ -387,6 +345,250 @@ fn consolidate_entity<'a>(
             observations: wrote,
         }
     })
+}
+
+/// Resolve a plan entry's evidence to `Evidence` pairs: exact fact ids
+/// (upstream `source_fact_ids`) and legacy fact indexes both map against
+/// the batch's facts; duplicates by memory id collapse. Entries citing no
+/// resolvable fact backfill from the batch's first fact (weak models still
+/// produce attributable observations).
+fn resolve_evidence(
+    facts: &[Memory],
+    source_fact_ids: &[String],
+    legacy: &[(usize, String)],
+) -> Vec<Evidence> {
+    let quote_for = |fact: &Memory, quote: &str| -> Evidence {
+        Evidence {
+            memory_id: fact.id.clone(),
+            quote: if quote.trim().is_empty() {
+                fact.text.chars().take(160).collect()
+            } else {
+                quote.to_string()
+            },
+        }
+    };
+    let mut evidence: Vec<Evidence> = vec![];
+    for id in source_fact_ids {
+        if let Some(fact) = facts.iter().find(|f| f.id == *id) {
+            let ev = quote_for(fact, "");
+            if !evidence.iter().any(|e| e.memory_id == ev.memory_id) {
+                evidence.push(ev);
+            }
+        }
+    }
+    for (idx, quote) in legacy {
+        if let Some(fact) = facts.get(*idx) {
+            let ev = quote_for(fact, quote);
+            if !evidence.iter().any(|e| e.memory_id == ev.memory_id) {
+                evidence.push(ev);
+            }
+        }
+    }
+    if evidence.is_empty() {
+        if let Some(fact) = facts.first() {
+            evidence.push(quote_for(fact, ""));
+        }
+    }
+    evidence
+}
+
+/// Whitespace-collapsed lowercase text — the key of the bank-level exact
+/// duplicate guard. Conservative on purpose: near-duplicates are the
+/// model's job (UPDATE over CREATE), exact repeats are the engine's.
+fn norm_text(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Apply the parsed creates/updates/deletes plan for one entity.
+///
+/// Ordering matters: updates land first (a delete's `merged_into` target
+/// must carry its new text before evidence migrates into it), then deletes
+/// (merge evidence into the survivor, then remove the row), then creates
+/// (the duplicate guards see the post-delete state, and same-batch creates
+/// that repeat an earlier create's text merge into it). Returns how many
+/// observations were written plus the (id, text) pairs the caller must
+/// (re-)embed — one batched embed per entity, not per plan.
+async fn apply_consolidation_plan(
+    e: &Engine,
+    bank_id: &str,
+    eid: &str,
+    facts: &[Memory],
+    plan: ConsolidationPlan,
+    now: i64,
+) -> Result<(usize, Vec<(String, String)>)> {
+    // id -> observation, for update/delete/merge target lookup.
+    let mut by_id: HashMap<String, Observation> = e
+        .store
+        .observations_for_bank(bank_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|o| (o.id.clone(), o))
+        .collect();
+    // normalized text -> id, the cross-entity exact-dupe guard.
+    let mut by_text: HashMap<String, String> = by_id
+        .iter()
+        .map(|(id, o)| (norm_text(&o.text), id.clone()))
+        .collect();
+
+    let mut wrote = 0usize;
+    // (observation id, text) pairs needing (re-)embedding.
+    let mut obs_pending: Vec<(String, String)> = vec![];
+
+    // ---- updates ----
+    for u in &plan.updates {
+        let Some(target) = by_id.get(&u.observation_id).cloned() else {
+            // The model named an observation we cannot see (hallucinated id
+            // or already deleted): the create pass below keeps the text.
+            continue;
+        };
+        let evidence = resolve_evidence(facts, &u.source_fact_ids, &u.legacy_evidence);
+        let mut upd = target.clone();
+        let old_text = upd.text.clone();
+        upd.text = u.text.clone();
+        for ev in evidence {
+            if !upd.evidence.iter().any(|x| x.memory_id == ev.memory_id) {
+                upd.evidence.push(ev);
+            }
+        }
+        upd.proof_count = upd.evidence.len();
+        upd.updated_at_ms = now;
+        if old_text != upd.text {
+            upd.history.push(old_text);
+            obs_pending.push((upd.id.clone(), upd.text.clone()));
+        } else if upd.embedding.is_none() {
+            obs_pending.push((upd.id.clone(), upd.text.clone()));
+        }
+        e.store.upsert_observation(&upd)?;
+        by_text.insert(norm_text(&upd.text), upd.id.clone());
+        by_id.insert(upd.id.clone(), upd);
+        wrote += 1;
+    }
+
+    // ---- deletes (after updates: merged_into targets carry new text) ----
+    for d in &plan.deletes {
+        let Some(victim) = by_id.get(&d.observation_id).cloned() else {
+            continue;
+        };
+        if let Some(target_id) = &d.merged_into {
+            if let Some(survivor) = by_id.get_mut(target_id) {
+                for ev in &victim.evidence {
+                    if !survivor
+                        .evidence
+                        .iter()
+                        .any(|x| x.memory_id == ev.memory_id)
+                    {
+                        survivor.evidence.push(ev.clone());
+                    }
+                }
+                survivor.proof_count = survivor.evidence.len();
+                survivor.updated_at_ms = now;
+                e.store.upsert_observation(survivor)?;
+                wrote += 1;
+            }
+        }
+        e.store.delete_observation(bank_id, &victim.id)?;
+        by_text.remove(&norm_text(&victim.text));
+        by_id.remove(&victim.id);
+    }
+
+    // ---- creates (dupe guards see post-delete state) ----
+    // Embed every proposed create once (batched) for the cosine near-dupe
+    // guard: paraphrase siblings the exact-text guard cannot catch were the
+    // 2026-11-12 runs' observation explosion.
+    let create_texts: Vec<String> = plan.creates.iter().map(|c| c.text.clone()).collect();
+    let mut create_embs_iter: Vec<Option<Vec<f32>>> = vec![None; plan.creates.len()];
+    if !create_texts.is_empty() {
+        let embed = Arc::clone(&e.embed);
+        let threshold = e.config.consolidate_dupe_cosine;
+        let wants_embeddings = plan
+            .creates
+            .iter()
+            .any(|c| !by_text.contains_key(&norm_text(&c.text)));
+        if wants_embeddings && threshold < 1.0 {
+            if let Ok(embeddings) = with_retry(e, || embed.embed(create_texts.clone())).await {
+                create_embs_iter = embeddings.into_iter().map(Some).collect();
+            }
+        }
+    }
+    for (c, new_emb) in plan.creates.iter().zip(create_embs_iter) {
+        let evidence = resolve_evidence(facts, &c.source_fact_ids, &c.legacy_evidence);
+        if evidence.is_empty() {
+            continue;
+        }
+        // Guard 1: exact text (free).
+        let norm = norm_text(&c.text);
+        let mut dupe_id = by_text.get(&norm).cloned();
+        // Guard 2: cosine near-dupe against every embedded observation.
+        if dupe_id.is_none() {
+            if let Some(emb) = new_emb.as_ref() {
+                let mut best: Option<(f32, &String)> = None;
+                for (id, o) in &by_id {
+                    if let Some(existing_emb) = o.embedding.as_ref() {
+                        let score = crate::cosine(emb, existing_emb);
+                        if best.as_ref().is_none_or(|(bs, _)| score > *bs) {
+                            best = Some((score, id));
+                        }
+                    }
+                }
+                if let Some((score, id)) = best {
+                    if score >= e.config.consolidate_dupe_cosine {
+                        dupe_id = Some(id.clone());
+                    }
+                }
+            }
+        }
+        if let Some(existing_id) = dupe_id {
+            // Duplicate (same entity, cross-entity, paraphrase, or earlier
+            // in this same batch): merge the evidence instead of writing a
+            // sibling.
+            if let Some(obs) = by_id.get_mut(&existing_id) {
+                for ev in evidence {
+                    if !obs.evidence.iter().any(|x| x.memory_id == ev.memory_id) {
+                        obs.evidence.push(ev);
+                    }
+                }
+                obs.proof_count = obs.evidence.len();
+                obs.updated_at_ms = now;
+                if obs.embedding.is_none() {
+                    if let Some(emb) = new_emb {
+                        obs.embedding = Some(emb);
+                    } else {
+                        obs_pending.push((obs.id.clone(), obs.text.clone()));
+                    }
+                }
+                e.store.upsert_observation(obs)?;
+                wrote += 1;
+            }
+            continue;
+        }
+        let proof_count = evidence.len();
+        let o = Observation {
+            id: uuid::Uuid::new_v4().to_string(),
+            bank_id: bank_id.to_string(),
+            entity_id: eid.to_string(),
+            text: c.text.clone(),
+            evidence,
+            proof_count,
+            history: vec![],
+            updated_at_ms: now,
+            created_at_ms: now,
+            // The create was already embedded for the guard — reuse it.
+            embedding: new_emb,
+        };
+        let id = o.id.clone();
+        if o.embedding.is_none() {
+            obs_pending.push((id.clone(), o.text.clone()));
+        }
+        e.store.upsert_observation(&o)?;
+        by_text.insert(norm, id.clone());
+        by_id.insert(id, o);
+        wrote += 1;
+    }
+
+    Ok((wrote, obs_pending))
 }
 
 /// Clear a dirty row for an entity with nothing to synthesize.

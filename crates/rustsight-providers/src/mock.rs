@@ -131,41 +131,43 @@ fn demo_extraction(content: &str) -> Value {
 }
 
 fn demo_consolidation(user: &str) -> Value {
-    let mut observations = vec![];
-    let mut indexes = vec![];
-    for (i, line) in user.lines().enumerate() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            let text = line.split("): ").nth(1).unwrap_or(line);
-            indexes.push(i);
-            let _ = text;
-        }
-    }
-    if indexes.is_empty() {
-        return json!({"observations": []});
+    // Upstream (v1.1.0) consolidation input: fact lines formatted
+    // `[uuid] text (temporal fields)`. The demo answers with the upstream
+    // creates/updates/deletes machine — one create citing every fact.
+    let ids: Vec<&str> = user
+        .lines()
+        .filter(|l| l.trim_start().starts_with('['))
+        .filter_map(|l| l.trim().strip_prefix('['))
+        .filter_map(|l| l.split(']').next())
+        .collect();
+    if ids.is_empty() {
+        return json!({"creates": [], "updates": [], "deletes": []});
     }
     let texts: Vec<&str> = user
         .lines()
-        .filter(|l| {
-            l.trim_start_matches('[')
-                .starts_with(|c: char| c.is_ascii_digit())
+        .filter_map(|l| {
+            let l = l.trim();
+            let rest = l.strip_prefix('[')?;
+            let after = rest.split("] ").nth(1)?;
+            // Strip the trailing "(temporal fields)" parenthetical.
+            Some(after.split(" (").next().unwrap_or(after))
         })
         .collect();
     let summary = if texts.is_empty() {
         "Consolidated profile.".to_string()
     } else {
-        let joined = texts
-            .iter()
-            .map(|t| t.split("): ").nth(1).unwrap_or(t))
-            .collect::<Vec<_>>()
-            .join(" ");
+        let joined = texts.join(" ");
         format!("Summary: {}", joined.chars().take(400).collect::<String>())
     };
-    let evidence: Vec<Value> = (0..texts.len())
-        .map(|i| json!({"fact_index": i, "quote": ""}))
-        .collect();
-    observations.push(json!({"text": summary, "evidence": evidence}));
-    json!({"observations": observations})
+    json!({
+        "creates": [{
+            "text": summary,
+            "source_fact_ids": ids,
+            "reason": "demo: one consolidated observation over the batch's facts"
+        }],
+        "updates": [],
+        "deletes": []
+    })
 }
 
 #[async_trait]
@@ -194,7 +196,9 @@ impl LlmProvider for MockLlm {
                         tool_calls: vec![],
                     });
                 }
-                if system.contains("OBJECTIVE OBSERVER") {
+                // Upstream (v1.1.0) consolidation system prompt header — the
+                // consolidation pipeline sends the vendored upstream prompt.
+                if system.contains("You are a memory consolidation system") {
                     let user = req
                         .messages
                         .last()
@@ -235,7 +239,7 @@ impl LlmProvider for MockLlm {
                             content: None,
                             tool_calls: vec![ToolCall {
                                 id: "c1".into(),
-                                name: "recall".into(),
+                                name: "search_observations".into(),
                                 arguments: json!({"query": query, "token_budget": 800}),
                             }],
                         });
@@ -251,6 +255,28 @@ impl LlmProvider for MockLlm {
                             name: "finish".into(),
                             arguments: json!({"answer": answer, "citations": []}),
                         }],
+                    });
+                }
+                // Final-synthesis call (upstream answer machine): the loop's
+                // finish text is discarded and this call writes the answer.
+                if system.contains("You MUST ONLY use information from retrieved tool results") {
+                    return Ok(LlmResponse {
+                        content: Some(
+                            "Synthesized from retrieved memory (demo): the loop gathered \
+                             evidence and this final call composed the answer."
+                                .into(),
+                        ),
+                        tool_calls: vec![],
+                    });
+                }
+                if system.contains("You extract evidence from retrieved memory data") {
+                    return Ok(LlmResponse {
+                        content: Some(
+                            "- (demo claim; mentioned_at: unknown; occurred: unknown; \
+                             memory_ids: none)"
+                                .into(),
+                        ),
+                        tool_calls: vec![],
                     });
                 }
                 if system.contains("MENTAL MODEL WRITER") {

@@ -162,6 +162,7 @@ async fn call_tool(
                         .and_then(|v| v.as_str())
                         .map(String::from),
                     timestamp_ms: None,
+                    ..Default::default()
                 })
                 .await
                 .map_err(|e| e.to_string())?;
@@ -191,6 +192,7 @@ async fn call_tool(
                             .unwrap_or(1000) as usize,
                     ),
                     kinds: None,
+                    ..Default::default()
                 })
                 .await
                 .map_err(|e| e.to_string())?;

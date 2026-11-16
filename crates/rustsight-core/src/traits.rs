@@ -73,6 +73,10 @@ pub struct LlmRequest {
     pub json_mode: bool,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u64>,
+    /// Force the next call to use the named tool (OpenAI `tool_choice`).
+    /// `None` leaves the choice to the model (`auto`). Used by reflect's
+    /// closing ask, mirroring upstream's `tool_choice=done`.
+    pub tool_choice: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]

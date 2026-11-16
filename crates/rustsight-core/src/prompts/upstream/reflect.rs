@@ -821,3 +821,475 @@ pub fn build_final_system_prompt(
         .collect::<Vec<_>>()
         .join("\n\n")
 }
+
+// ---------------------------------------------------------------------------
+// Final-synthesis machine (upstream reflect/prompts.py, hand-ported).
+//
+// These builders ARE vendored upstream (build_final_prompt,
+// build_done_request_prompt, build_chunk_claims_prompt, build_reduce_prompt,
+// split_context_history, _render_history_block, _bank_identity_section,
+// _length_directive, CLAIMS_SYSTEM_PROMPT) but are not yet covered by the
+// prompt-goldens generator — the texts below are copied verbatim from
+// `prompts/upstream/v1.1.0/engine/reflect/prompts.py` and unit-tested for
+// shape, not golden-pinned. Extending `scripts/prompt-goldens` to emit
+// fixtures for them is the follow-up that makes them parity-tested.
+// ---------------------------------------------------------------------------
+
+/// Upstream `_FINAL_PROMPT_CONTEXT_FRACTION`: the share of the context
+/// budget the retrieved-data section may consume.
+const FINAL_PROMPT_CONTEXT_FRACTION: f64 = 0.8;
+/// Upstream `_MIN_SPLIT_CHUNK_TOKENS`: floor for per-chunk packing budgets.
+const MIN_SPLIT_CHUNK_TOKENS: usize = 1024;
+/// Upstream `_MAX_SHARED_SIBLING_FRACTION`: a non-splittable sibling key of
+/// an over-budget block may take at most this share of a chunk budget.
+const MAX_SHARED_SIBLING_FRACTION: f64 = 0.5;
+/// Upstream `_SPLITTABLE_RESULT_KEYS`: output keys an over-budget block is
+/// split on, in priority order.
+const SPLITTABLE_RESULT_KEYS: [&str; 3] = ["observations", "memories", "results"];
+
+/// Upstream `CLAIMS_SYSTEM_PROMPT`: the intermediate (map) system prompt of
+/// split synthesis — compress one chunk into dated, cited claims.
+pub const CLAIMS_SYSTEM_PROMPT: &str = r#"You extract evidence from retrieved memory data. You MUST ONLY use information from the provided data. NEVER make up names, people, events, or entities.
+
+Output a markdown bulleted list of factual claims relevant to the question. For EVERY claim:
+- state the fact in one sentence, in the same language as the question;
+- append its provenance in parentheses, exactly: (mentioned_at: <ISO date or unknown>; occurred: <ISO date/range or unknown>; memory_ids: <comma-separated ids>)
+
+Rules:
+- Be exhaustive over RELEVANT evidence; skip clearly irrelevant entries.
+- Do NOT synthesize, conclude, resolve conflicts, or answer the question — report conflicting claims as separate bullets with their dates; a later pass reconciles them.
+- Copy memory ids exactly as they appear in the data.
+- If nothing in the data is relevant, output exactly: (no relevant evidence)"#;
+
+/// One tool result as the synthesis prompts see it: the tool's name and its
+/// serialized output (a JSON object — e.g. `{"memories": [...]}` from
+/// recall, `{"observations": [...]}` from search_observations).
+#[derive(Debug, Clone)]
+pub struct ContextHistoryEntry {
+    pub tool: String,
+    pub output: serde_json::Value,
+}
+
+impl ContextHistoryEntry {
+    pub fn new(tool: &str, output: serde_json::Value) -> Self {
+        Self {
+            tool: tool.to_string(),
+            output,
+        }
+    }
+}
+
+/// Upstream `_render_history_block`: one entry as a fenced JSON block.
+pub fn render_history_block(entry: &ContextHistoryEntry) -> String {
+    let output_str =
+        serde_json::to_string(&entry.output).unwrap_or_else(|_| entry.output.to_string());
+    format!("\n### From {}:\n```json\n{}\n```", entry.tool, output_str)
+}
+
+/// Upstream `_length_directive`: soft visible-length directive, or `None`.
+fn length_directive(max_tokens: Option<usize>) -> Option<String> {
+    let max_tokens = max_tokens?;
+    Some(format!(
+        "\n## Length\nAim for a complete, self-contained answer of approximately {max_tokens} \
+         tokens. Finishing cleanly matters more than length: end on a complete sentence and \
+         NEVER stop mid-word, mid-list, or mid-code-fence. If you near the budget, wrap up \
+         gracefully rather than cutting off."
+    ))
+}
+
+/// Upstream `_cut_entry_to_budget`: token-bound one indivisible over-budget
+/// entry by cutting its serialized text (proportional shrink, wrapped back
+/// into a `{"truncated": true, "content": ...}` output).
+fn cut_entry_to_budget(
+    entry: &ContextHistoryEntry,
+    token_budget: usize,
+    count_tokens: &dyn Fn(&str) -> usize,
+) -> ContextHistoryEntry {
+    let mut output_str = serde_json::to_string(&entry.output).unwrap_or_default();
+    let mut cut = ContextHistoryEntry {
+        tool: entry.tool.clone(),
+        output: serde_json::json!({"truncated": true, "content": output_str.clone()}),
+    };
+    let mut tokens = count_tokens(&render_history_block(&cut));
+    while !output_str.is_empty() && tokens > token_budget {
+        // Proportional shrink with a safety margin; always makes progress.
+        let keep = (output_str.len().saturating_sub(1)).min(
+            ((output_str.len() as f64) * (token_budget as f64) / (tokens as f64) * 0.95) as usize,
+        );
+        let keep = keep.max(1);
+        output_str.truncate(keep);
+        cut.output = serde_json::json!({"truncated": true, "content": output_str.clone()});
+        tokens = count_tokens(&render_history_block(&cut));
+    }
+    cut
+}
+
+/// Upstream `split_context_history`: partition tool-result history into
+/// chunks that each fit the per-chunk budget (`max_context_tokens * 0.8`,
+/// floored at `MIN_SPLIT_CHUNK_TOKENS`).
+///
+/// Greedy chronological packing; an over-budget block splits on its
+/// `observations`/`memories`/`results` list so evidence is split across
+/// chunks rather than dropped; only an indivisible over-budget entry gets
+/// token-cut. Every original result entry appears in exactly one chunk.
+pub fn split_context_history(
+    context_history: &[ContextHistoryEntry],
+    max_context_tokens: usize,
+    count_tokens: &dyn Fn(&str) -> usize,
+) -> Vec<Vec<ContextHistoryEntry>> {
+    let budget = MIN_SPLIT_CHUNK_TOKENS
+        .max((max_context_tokens as f64 * FINAL_PROMPT_CONTEXT_FRACTION) as usize);
+    let mut packer = HistoryPacker::new(budget, count_tokens);
+
+    for entry in context_history {
+        let tokens = packer.count(entry);
+        if tokens <= budget {
+            packer.append_block(entry.clone(), tokens);
+            continue;
+        }
+
+        // Over-budget block: split it on result-entry boundaries.
+        let output = &entry.output;
+        let split_key = SPLITTABLE_RESULT_KEYS.iter().find_map(|k| {
+            output
+                .get(*k)
+                .and_then(|v| v.as_array())
+                .filter(|list| !list.is_empty())
+                .map(|_| *k)
+        });
+        let Some(split_key) = split_key else {
+            let cut = cut_entry_to_budget(entry, budget, count_tokens);
+            let cut_tokens = packer.count(&cut);
+            packer.append_block(cut, cut_tokens);
+            continue;
+        };
+        let items = output
+            .get(split_key)
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        // A big non-splittable sibling key is packed on its own instead of
+        // being copied into every piece (upstream #4495).
+        let allowance = (budget as f64 * MAX_SHARED_SIBLING_FRACTION) as usize;
+        let empty_map = serde_json::Map::new();
+        let obj = output.as_object().unwrap_or(&empty_map);
+        let big: Vec<String> = obj
+            .keys()
+            .filter(|k| {
+                k.as_str() != split_key && {
+                    let sibling = serde_json::json!({ (**k).clone(): obj[*k].clone() });
+                    count_tokens(&render_history_block(&ContextHistoryEntry {
+                        tool: entry.tool.clone(),
+                        output: sibling,
+                    })) > allowance
+                }
+            })
+            .cloned()
+            .collect();
+        let shared: serde_json::Map<String, serde_json::Value> = obj
+            .iter()
+            .filter(|(k, _)| k.as_str() != split_key && !big.iter().any(|b| b == *k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        packer.pack_items(entry, &shared, split_key, &items);
+        for k in big {
+            match &obj[&k] {
+                serde_json::Value::Object(map) => {
+                    let pairs: Vec<serde_json::Value> = map
+                        .iter()
+                        .map(|(ik, iv)| serde_json::json!([ik, iv]))
+                        .collect();
+                    packer.pack_items(entry, &shared, &k, &pairs);
+                }
+                serde_json::Value::Array(list) => {
+                    packer.pack_items(entry, &shared, &k, list);
+                }
+                other => {
+                    let mut o = shared.clone();
+                    o.insert(k.clone(), other.clone());
+                    let candidate = ContextHistoryEntry {
+                        tool: entry.tool.clone(),
+                        output: serde_json::Value::Object(o),
+                    };
+                    let cut = cut_entry_to_budget(&candidate, budget, count_tokens);
+                    let cut_tokens = packer.count(&cut);
+                    packer.append_block(cut, cut_tokens);
+                }
+            }
+        }
+    }
+    packer.close_current();
+    packer.chunks
+}
+
+/// Chunk-packing state for [`split_context_history`]: the greedy
+/// chronological packer (current chunk, its token load, the finished
+/// chunks), mirroring upstream's closures over local state.
+struct HistoryPacker<'a> {
+    budget: usize,
+    count_tokens: &'a dyn Fn(&str) -> usize,
+    chunks: Vec<Vec<ContextHistoryEntry>>,
+    current: Vec<ContextHistoryEntry>,
+    current_tokens: usize,
+}
+
+impl<'a> HistoryPacker<'a> {
+    fn new(budget: usize, count_tokens: &'a dyn Fn(&str) -> usize) -> Self {
+        Self {
+            budget,
+            count_tokens,
+            chunks: vec![],
+            current: vec![],
+            current_tokens: 0,
+        }
+    }
+
+    fn close_current(&mut self) {
+        if !self.current.is_empty() {
+            self.chunks.push(std::mem::take(&mut self.current));
+            self.current_tokens = 0;
+        }
+    }
+
+    fn append_block(&mut self, block: ContextHistoryEntry, tokens: usize) {
+        if !self.current.is_empty() && self.current_tokens + tokens > self.budget {
+            self.close_current();
+        }
+        self.current.push(block);
+        self.current_tokens += tokens;
+    }
+
+    fn count(&self, entry: &ContextHistoryEntry) -> usize {
+        (self.count_tokens)(&render_history_block(entry))
+    }
+
+    /// Upstream `_pack_items`: pack a list under `output[key]` into
+    /// in-budget blocks, each piece carrying the entry's other keys.
+    fn pack_items(
+        &mut self,
+        entry: &ContextHistoryEntry,
+        shared: &serde_json::Map<String, serde_json::Value>,
+        key: &str,
+        items: &[serde_json::Value],
+    ) {
+        let with_items = |piece: &[serde_json::Value]| -> ContextHistoryEntry {
+            let mut output = serde_json::Map::clone(shared);
+            output.insert(key.to_string(), serde_json::Value::Array(piece.to_vec()));
+            ContextHistoryEntry {
+                tool: entry.tool.clone(),
+                output: serde_json::Value::Object(output),
+            }
+        };
+        let mut piece: Vec<serde_json::Value> = vec![];
+        for item in items {
+            let mut candidate = with_items(&{
+                let mut next = piece.clone();
+                next.push(item.clone());
+                next
+            });
+            let candidate_tokens = self.count(&candidate);
+            if !piece.is_empty() && candidate_tokens > self.budget {
+                let partial = with_items(&piece);
+                let partial_tokens = self.count(&partial);
+                self.append_block(partial, partial_tokens);
+                piece.clear();
+                candidate = with_items(std::slice::from_ref(item));
+            }
+            let single_tokens = self.count(&candidate);
+            if piece.is_empty() && single_tokens > self.budget {
+                let cut = cut_entry_to_budget(&candidate, self.budget, self.count_tokens);
+                let cut_tokens = self.count(&cut);
+                self.append_block(cut, cut_tokens);
+            } else {
+                piece.push(item.clone());
+            }
+        }
+        if !piece.is_empty() {
+            let partial = with_items(&piece);
+            let partial_tokens = self.count(&partial);
+            self.append_block(partial, partial_tokens);
+        }
+    }
+}
+
+/// Upstream `_bank_identity_section`: the shared bank-identity head of a
+/// synthesis prompt (name, mission, disposition traits, extra context).
+fn bank_identity_section(
+    bank_profile: &ReflectBankProfile<'_>,
+    additional_context: Option<&str>,
+) -> Vec<String> {
+    let name = bank_profile.name.unwrap_or("Assistant");
+    let mut parts = vec![format!("## Memory Bank Context\nName: {name}")];
+    if let Some(mission) = bank_profile.mission.filter(|m| !m.is_empty()) {
+        parts.push(format!("Mission: {mission}"));
+    }
+    if let Some(traits) = bank_profile.disposition {
+        let mut rendered = vec![];
+        if let Some(s) = traits.skepticism {
+            rendered.push(format!("skepticism={s}"));
+        }
+        if let Some(l) = traits.literalism {
+            rendered.push(format!("literalism={l}"));
+        }
+        if let Some(e) = traits.empathy {
+            rendered.push(format!("empathy={e}"));
+        }
+        if !rendered.is_empty() {
+            parts.push(format!("Disposition: {}", rendered.join(", ")));
+        }
+    }
+    if let Some(context) = additional_context.filter(|c| !c.is_empty()) {
+        parts.push(format!("\n## Additional Context\n{context}"));
+    }
+    parts
+}
+
+/// Upstream `build_final_prompt`: the user message of the single-shot final
+/// synthesis call — bank identity, as much retrieved data as fits (newest
+/// entries preferred), the question, the instructions.
+#[allow(clippy::too_many_arguments)]
+pub fn build_final_prompt(
+    query: &str,
+    context_history: &[ContextHistoryEntry],
+    bank_profile: &ReflectBankProfile<'_>,
+    additional_context: Option<&str>,
+    max_context_tokens: usize,
+    max_tokens: Option<usize>,
+    llm_output_language: Option<&str>,
+    count_tokens: &dyn Fn(&str) -> usize,
+) -> String {
+    let mut parts = bank_identity_section(bank_profile, additional_context);
+
+    if !context_history.is_empty() {
+        parts.push("\n## Retrieved Data (synthesize and reason from this data)".to_string());
+        let mut token_budget = (max_context_tokens as f64 * FINAL_PROMPT_CONTEXT_FRACTION) as usize;
+        // Render entries newest-first, then reverse so the prompt reads
+        // chronologically.
+        let mut rendered: Vec<String> = vec![];
+        let mut truncated = false;
+        for entry in context_history.iter().rev() {
+            let block = render_history_block(entry);
+            let block_tokens = count_tokens(&block);
+            if block_tokens > token_budget {
+                truncated = true;
+                break;
+            }
+            rendered.push(block);
+            token_budget = token_budget.saturating_sub(block_tokens);
+        }
+        rendered.reverse();
+        parts.extend(rendered);
+        if truncated {
+            parts.push(
+                "\n*Note: Some earlier tool results were omitted to stay within the context \
+                 window.*"
+                    .to_string(),
+            );
+        }
+    } else {
+        parts.push("\n## Retrieved Data\nNo data was retrieved.".to_string());
+    }
+
+    parts.push(format!("\n## Question\n{query}"));
+    parts.push(format!(
+        "\n## Instructions\n{}",
+        texts::REFLECT_FINAL_INSTRUCTIONS
+    ));
+    if let Some(directive) = length_directive(max_tokens) {
+        parts.push(directive);
+    }
+    format!(
+        "{}{}",
+        parts.join("\n"),
+        output_language_directive(llm_output_language)
+    )
+}
+
+/// Upstream `build_done_request_prompt`: the closing user turn that asks a
+/// loop that has not finished for its `done` call — stop retrieving, the
+/// question, the instructions and the length target.
+pub fn build_done_request_prompt(
+    query: &str,
+    max_tokens: Option<usize>,
+    llm_output_language: Option<&str>,
+) -> String {
+    let mut parts = vec![
+        "## Answer now".to_string(),
+        "Stop retrieving. Call the `done` tool with your final answer, built from the tool \
+         results above."
+            .to_string(),
+        "This is the ANSWER, not a summary of it: carry over every relevant fact, date and \
+         number from the tool results, at the same depth you would write for a reader who \
+         cannot see them."
+            .to_string(),
+        format!("\n## Question\n{query}"),
+        format!("\n## Instructions\n{}", texts::REFLECT_FINAL_INSTRUCTIONS),
+    ];
+    if let Some(directive) = length_directive(max_tokens) {
+        parts.push(directive);
+    }
+    format!(
+        "{}{}",
+        parts.join("\n"),
+        output_language_directive(llm_output_language)
+    )
+}
+
+/// Upstream `build_chunk_claims_prompt`: the user prompt for one
+/// intermediate (map) call of split synthesis.
+pub fn build_chunk_claims_prompt(query: &str, chunk: &[ContextHistoryEntry]) -> String {
+    let mut parts = vec!["## Retrieved Data (extract relevant claims from this data)".to_string()];
+    for entry in chunk {
+        parts.push(render_history_block(entry));
+    }
+    parts.push(format!("\n## Question\n{query}"));
+    parts.push(
+        "\n## Instructions\nList every claim in the retrieved data relevant to the question, \
+         one bullet per claim, each with its (mentioned_at: ...; occurred: ...; memory_ids: \
+         ...) provenance. Do not answer the question."
+            .to_string(),
+    );
+    parts.join("\n")
+}
+
+/// Upstream `build_reduce_prompt`: the final prompt that synthesizes the
+/// answer from per-chunk claims, applying latest-statement-wins
+/// supersession across sections.
+pub fn build_reduce_prompt(
+    query: &str,
+    claim_sections: &[String],
+    bank_profile: &ReflectBankProfile<'_>,
+    additional_context: Option<&str>,
+    max_tokens: Option<usize>,
+    llm_output_language: Option<&str>,
+) -> String {
+    let mut parts = bank_identity_section(bank_profile, additional_context);
+    parts.push(
+        "\n## Retrieved Evidence (synthesize and reason from these claims)\nThe retrieved \
+         data was processed in parallel passes; each section below holds one pass's extracted \
+         claims with provenance dates and memory ids. Treat the sections as ONE evidence \
+         pool: related and conflicting claims may appear in different sections."
+            .to_string(),
+    );
+    for (i, section) in claim_sections.iter().enumerate() {
+        parts.push(format!("\n### Evidence pass {}:\n{}", i + 1, section));
+    }
+    parts.push(format!("\n## Question\n{query}"));
+    parts.push(format!(
+        "\n## Instructions\nWhen claims about the same fact conflict, the claim with the \
+         LATEST mentioned_at date is authoritative — later statements supersede earlier \
+         ones, regardless of which section they appear in. If equally-recent claims \
+         disagree and nothing resolves them, say so explicitly rather than picking \
+         one.\n\n{}",
+        texts::REFLECT_FINAL_INSTRUCTIONS
+    ));
+    if let Some(directive) = length_directive(max_tokens) {
+        parts.push(directive);
+    }
+    format!(
+        "{}{}",
+        parts.join("\n"),
+        output_language_directive(llm_output_language)
+    )
+}

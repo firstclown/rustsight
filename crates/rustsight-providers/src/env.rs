@@ -110,11 +110,26 @@ impl RerankMode {
     }
 }
 
+/// One OpenAI-compatible chat endpoint + model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmTarget {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderEnv {
     pub llm_base_url: String,
     pub llm_api_key: String,
     pub llm_model: String,
+    /// Per-operation LLM overrides (`RUSTSIGHT_RETAIN_LLM_*`,
+    /// `RUSTSIGHT_REFLECT_LLM_*`, `RUSTSIGHT_CONSOLIDATION_LLM_*`, each
+    /// with `_BASE_URL` / `_API_KEY` / `_MODEL`; unset parts inherit the
+    /// main LLM's). `None` = the operation uses the main LLM.
+    pub retain_llm: Option<LlmTarget>,
+    pub reflect_llm: Option<LlmTarget>,
+    pub consolidate_llm: Option<LlmTarget>,
     pub embed_base_url: String,
     pub embed_api_key: String,
     pub embed_model: String,
@@ -151,6 +166,43 @@ fn var(name: &str, default: &str) -> String {
         .ok()
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| default.to_string())
+}
+
+/// First non-empty value among `names`. Every LLM setting also answers to
+/// its `HINDSIGHT_API_*` name, so a supervisor that launches `hindsight-api`
+/// with that environment can launch rustsight unchanged; the `RUSTSIGHT_*`
+/// name wins when both are set.
+fn var_any(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|n| var_opt(n))
+}
+
+/// An operation's LLM override: present when any of its three settings is
+/// set, with the unset ones inherited from the main LLM.
+fn llm_override(op: &str, main: &LlmTarget) -> Option<LlmTarget> {
+    llm_override_from(op, main, &var_opt)
+}
+
+/// [`llm_override`] over an injectable variable lookup (tests pass a map
+/// instead of mutating the process environment).
+fn llm_override_from(
+    op: &str,
+    main: &LlmTarget,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> Option<LlmTarget> {
+    let get = |field: &str| {
+        lookup(&format!("RUSTSIGHT_{op}_LLM_{field}"))
+            .or_else(|| lookup(&format!("HINDSIGHT_API_{op}_LLM_{field}")))
+    };
+    let (base_url, api_key, model) = (get("BASE_URL"), get("API_KEY"), get("MODEL"));
+    if base_url.is_none() && api_key.is_none() && model.is_none() {
+        return None;
+    }
+    let target = LlmTarget {
+        base_url: base_url.unwrap_or_else(|| main.base_url.clone()),
+        api_key: api_key.unwrap_or_else(|| main.api_key.clone()),
+        model: model.unwrap_or_else(|| main.model.clone()),
+    };
+    (&target != main).then_some(target)
 }
 
 fn var_opt(name: &str) -> Option<String> {
@@ -195,9 +247,20 @@ fn parse_sha256(value: Option<&str>, name: &str) -> Result<Option<String>, Strin
 
 impl ProviderEnv {
     pub fn from_env() -> Result<Self, String> {
-        let llm_base_url = var("RUSTSIGHT_LLM_BASE_URL", "https://api.openai.com/v1");
-        let llm_api_key = var("RUSTSIGHT_LLM_API_KEY", "");
-        let llm_model = var("RUSTSIGHT_LLM_MODEL", "gpt-4o-mini");
+        let llm_base_url = var_any(&["RUSTSIGHT_LLM_BASE_URL", "HINDSIGHT_API_LLM_BASE_URL"])
+            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+        let llm_api_key =
+            var_any(&["RUSTSIGHT_LLM_API_KEY", "HINDSIGHT_API_LLM_API_KEY"]).unwrap_or_default();
+        let llm_model = var_any(&["RUSTSIGHT_LLM_MODEL", "HINDSIGHT_API_LLM_MODEL"])
+            .unwrap_or_else(|| "gpt-4o-mini".to_string());
+        let main = LlmTarget {
+            base_url: llm_base_url.clone(),
+            api_key: llm_api_key.clone(),
+            model: llm_model.clone(),
+        };
+        let retain_llm = llm_override("RETAIN", &main);
+        let reflect_llm = llm_override("REFLECT", &main);
+        let consolidate_llm = llm_override("CONSOLIDATION", &main);
         let embed_base_url = var("RUSTSIGHT_EMBED_BASE_URL", &llm_base_url);
         let embed_api_key = var("RUSTSIGHT_EMBED_API_KEY", &llm_api_key);
         let embed_model = var("RUSTSIGHT_EMBED_MODEL", "text-embedding-3-small");
@@ -218,6 +281,9 @@ impl ProviderEnv {
             llm_base_url,
             llm_api_key,
             llm_model,
+            retain_llm,
+            reflect_llm,
+            consolidate_llm,
             embed_base_url,
             embed_api_key,
             embed_model,
@@ -235,6 +301,33 @@ impl ProviderEnv {
             rerank_device,
         })
     }
+}
+
+/// Per-operation LLM providers built from the env overrides; `None` means
+/// the operation shares the main LLM.
+pub struct OperationLlms {
+    pub retain: Option<Arc<dyn LlmProvider>>,
+    pub reflect: Option<Arc<dyn LlmProvider>>,
+    pub consolidate: Option<Arc<dyn LlmProvider>>,
+}
+
+pub fn build_operation_llms(env: &ProviderEnv) -> Result<OperationLlms, String> {
+    let client = http_client()?;
+    let build = |target: &Option<LlmTarget>| -> Option<Arc<dyn LlmProvider>> {
+        target.as_ref().map(|t| {
+            Arc::new(OpenAiCompat {
+                client: client.clone(),
+                base_url: t.base_url.clone(),
+                api_key: t.api_key.clone(),
+                model: t.model.clone(),
+            }) as Arc<dyn LlmProvider>
+        })
+    };
+    Ok(OperationLlms {
+        retain: build(&env.retain_llm),
+        reflect: build(&env.reflect_llm),
+        consolidate: build(&env.consolidate_llm),
+    })
 }
 
 pub type Providers = (
@@ -333,6 +426,63 @@ pub fn build_mock_providers() -> Providers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operation_llm_overrides_inherit_unset_parts() {
+        let main = LlmTarget {
+            base_url: "https://main/v1".into(),
+            api_key: "main-key".into(),
+            model: "small".into(),
+        };
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        // Nothing set: the operation shares the main LLM.
+        assert_eq!(llm_override_from("REFLECT", &main, &env(&[])), None);
+        // Only the model set: endpoint and key are inherited.
+        assert_eq!(
+            llm_override_from(
+                "REFLECT",
+                &main,
+                &env(&[("RUSTSIGHT_REFLECT_LLM_MODEL", "large")])
+            ),
+            Some(LlmTarget {
+                model: "large".into(),
+                ..main.clone()
+            })
+        );
+        // The Hindsight spelling works; the rustsight one wins when both exist.
+        assert_eq!(
+            llm_override_from(
+                "RETAIN",
+                &main,
+                &env(&[
+                    ("HINDSIGHT_API_RETAIN_LLM_MODEL", "h-model"),
+                    ("HINDSIGHT_API_RETAIN_LLM_BASE_URL", "https://other/v1"),
+                    ("RUSTSIGHT_RETAIN_LLM_MODEL", "r-model"),
+                ])
+            ),
+            Some(LlmTarget {
+                base_url: "https://other/v1".into(),
+                api_key: "main-key".into(),
+                model: "r-model".into(),
+            })
+        );
+        // An override identical to the main LLM is no override.
+        assert_eq!(
+            llm_override_from(
+                "CONSOLIDATION",
+                &main,
+                &env(&[("HINDSIGHT_API_CONSOLIDATION_LLM_MODEL", "small")])
+            ),
+            None
+        );
+    }
 
     #[test]
     fn rerank_mode_parses_known_values() {

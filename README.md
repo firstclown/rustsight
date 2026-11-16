@@ -21,10 +21,20 @@ Four memory networks, three operations:
   rerank with combined scoring (recency + proof-count boosts) -> greedy
   token-budget cut; reflect's pool width is budget-driven (fixed MID = 300
   per arm, upstream defaults)
-- reflect: agentic tool loop (recall / read_observation / finish) shaped by the
-  bank's mission, directives, and disposition traits (skepticism, literalism,
-  empathy, bias strength); opinions are formed with confidence and reinforced
-  over time; citations are validated against retrieved ids
+- reflect: agentic tool loop (search_observations / recall / read_observation /
+  finish) shaped by the bank's mission, directives, and disposition traits
+  (skepticism, literalism, empathy, bias strength). The loop's `recall` returns
+  raw world/experience facts only; observations are searched separately
+  (upstream's kind-separated ladder), with query-decomposition guidance, the
+  #4567 sufficiency gate on premature "nothing known" finishes, and upstream
+  tool budget defaults. Upstream's answer precedence: when the loop stops, a
+  closing ask (`_ask_for_done`) forces the `finish` over the full tool
+  conversation and that answer wins; the loop's volunteered finish is the
+  fallback, and a separate final-synthesis call (map-to-claims/reduce for
+  oversized histories) is the last resort. Answers are stripped of inline
+  memory ids (harvested into citations); harness-noise content never becomes
+  an answer. Opinion formation runs in the background; citations are
+  validated against retrieved ids
 
 Background consolidation turns facts into evidence-backed observations;
 mental models are standing answers refreshed from the bank.
@@ -43,7 +53,11 @@ Crates
 
 Build
 -----
-    cargo build --release
+    cargo build                 # debug (workspace)
+    scripts/build-release       # release binary with the local ONNX reranker
+                                # (CUDA; --cpu for CPU-only) — required for
+                                # RUSTSIGHT_RERANK=local. A plain
+                                # `cargo build --release` omits the reranker.
     cargo test
 
 Configuration (non-mock mode)
@@ -51,6 +65,11 @@ Configuration (non-mock mode)
     RUSTSIGHT_LLM_BASE_URL    default https://api.openai.com/v1
     RUSTSIGHT_LLM_API_KEY     required unless --mock
     RUSTSIGHT_LLM_MODEL       default gpt-4o-mini
+    RUSTSIGHT_RETAIN_LLM_*    optional per-operation model: _BASE_URL / _API_KEY /
+    RUSTSIGHT_REFLECT_LLM_*   _MODEL for retain (extraction), reflect, and
+    RUSTSIGHT_CONSOLIDATION_LLM_*  consolidation. Unset parts inherit the main
+                              LLM's — e.g. extract with a small model and
+                              answer with a large one
     RUSTSIGHT_EMBED_BASE_URL  defaults to RUSTSIGHT_LLM_BASE_URL
     RUSTSIGHT_EMBED_MODEL     default text-embedding-3-small
     RUSTSIGHT_HTTP_TIMEOUT_SECS  total wall for one provider HTTP round trip,
@@ -68,6 +87,91 @@ Configuration (non-mock mode)
     RUSTSIGHT_API_TOKEN       optional; bearer token required by every HTTP
                               endpoint except /healthz (see below)
     RUSTSIGHT_API_TOKEN_FILE  optional; read the token from a file instead
+
+Every LLM setting above also answers to its `HINDSIGHT_API_*` name
+(`HINDSIGHT_API_LLM_BASE_URL` / `_API_KEY` / `_MODEL`, and the
+`HINDSIGHT_API_RETAIN_LLM_*`, `_REFLECT_LLM_*`, `_CONSOLIDATION_LLM_*`
+families), so a supervisor that launches `hindsight-api` with that
+environment can launch rustsight unchanged; the `RUSTSIGHT_*` name wins
+when both are set. Embeddings and reranking are *not* aliased — see the
+compatibility notes below.
+
+Hindsight-compatible API (drop-in for Hindsight clients)
+--------------------------------------------------------
+`rustsight serve` also speaks the upstream `hindsight-api` wire protocol, so
+the official clients (`@vectorize-io/hindsight-client`,
+`hindsight-client` for Python) work against it unchanged — point their
+`baseUrl` at the rustsight server. Shapes follow hindsight-api 1.2.x; errors
+use FastAPI's `{"detail": "..."}` body. The native API (`/banks/...`) is
+untouched and served side by side.
+
+    GET    /health, /version                               (public)
+    GET    /v1/default/banks
+    PUT    /v1/default/banks/{bank_id}                     create/update (PATCH too)
+    GET    /v1/default/banks/{bank_id}/profile
+    POST   /v1/default/banks/{bank_id}/memories            retain (sync or async)
+    POST   /v1/default/banks/{bank_id}/memories/recall
+    POST   /v1/default/banks/{bank_id}/reflect
+    GET    /v1/default/banks/{bank_id}/documents
+    GET    /v1/default/banks/{bank_id}/documents/{id}      (DELETE too)
+    GET    /v1/default/banks/{bank_id}/operations/{id}     async retain status
+
+`rustsight serve --host 127.0.0.1 --port 8888 --log-level warning` accepts
+the `hindsight-api` command line, and the server drains on SIGTERM as well
+as ctrl-c.
+
+What works the Hindsight way:
+
+- **Retain**: `items[]` with `content`, ISO `timestamp` (or `"unset"`),
+  `context`, `metadata`, `tags`, `entities`, `document_id`, `update_mode`
+  (`replace` deletes the old version's memories and re-extracts; `append`
+  extends the stored body and extracts only the new tail). Re-retaining a
+  document byte-for-byte is a no-op. `async: true` returns an
+  `operation_id` immediately; queued work survives a restart.
+- **Recall**: `types`, `budget` (low/mid/high → 100/300/1000 per arm),
+  `max_tokens` (default 4096), `tags` + `tags_match`
+  (any / all / any_strict / all_strict / exact), `tag_groups`
+  (and / or / not), `query_timestamp`, `prefer_observations`,
+  `min_scores.final`, `include.entities`, `include.source_facts`, `trace`.
+  Results carry `id`, `text`, `type`, `entities`, `context`, `metadata`,
+  `tags`, `document_id`, ISO `occurred_*` / `mentioned_at`, `scores.final`.
+- **Reflect**: `budget` (low/mid/high → 5/10/20 loop rounds; default low),
+  `max_tokens`, `context`, `tags` / `tags_match` / `tag_groups`,
+  `fact_types`, `response_schema` → `structured_output`,
+  `include.facts` → `based_on.memories`.
+- **Banks**: `name`, `reflect_mission` (aliases `mission`, `background`),
+  `disposition`, `retain_mission`, `observations_mission`. A bank configured
+  through this API keeps its mission for reflect only, as Hindsight does.
+- **Documents**: fetch (`original_text`, `memory_unit_count`, tags,
+  metadata), list, delete (cascades to the document's memories).
+
+Accepted but not acted on (the request succeeds, the option is ignored):
+`observation_scopes`, `strategy`, `resolve_entities`, `include.chunks`
+(no chunk store; `chunk_id` is always null), `min_scores.semantic` /
+`keyword` / `reranker`, `rerank.prune` / `dedup`, `temporal_window`,
+`exclude_mental_models*`, `apply_all_directives`, `include.tool_calls`
+(`trace` is null), the retain-tuning and retrieval-toggle fields of bank
+create. `usage` is always null. Rejected with a 400: image/file content
+blocks, `tag_groups` leaves with `resolve: "fuzzy"`.
+
+Behavioral differences to know before swapping:
+
+- **Observation scoping is derived, not partitioned.** An observation's tags
+  are the union of its evidence facts' tags and tag filters apply to that
+  union; consolidation itself still runs per entity across tags
+  (`observation_scopes` is ignored). Within one bank, an observation can
+  therefore draw on facts from several tag scopes. Use one bank per
+  tenant — as Hindsight's own guidance suggests — if tags separate users.
+- **Embeddings are API-only.** Hindsight's local embedding provider
+  (`HINDSIGHT_API_EMBEDDINGS_PROVIDER=local`) has no equivalent; set
+  `RUSTSIGHT_EMBED_*` to an OpenAI-compatible embeddings endpoint.
+- **Reranker** is configured with `RUSTSIGHT_RERANK*` (see below), not
+  `HINDSIGHT_API_RERANKER_*`.
+- **Storage is one SQLite file** (`RUSTSIGHT_DB`), not Postgres; existing
+  Hindsight data is not migrated — re-retain it.
+- Not implemented: mental-model / page / directive / webhook / file-upload
+  / bank-config / delete-bank endpoints, the HTTP MCP endpoint, opinions
+  via this API (a rustsight-native kind, never returned here).
 
 HTTP API authentication
 ------------------------
@@ -276,8 +380,9 @@ cases covering extraction (default/verbose/custom/labels/language modes and
 the chunk user message), consolidation (system/mission/input), and reflect
 (the full tools-prompt branch matrix plus final system/user prompts).
 Divergences — where the engine intentionally differs (JSON-mode output
-envelope, lenient parsing, unadopted consolidation/reflect prompts) — are
-recorded in `crates/rustsight-core/prompts/upstream/DIVERGENCES.md`.
+envelope, lenient parsing, per-entity consolidation passes, the reflect tool
+loop's own tool set) — are recorded in
+`crates/rustsight-core/prompts/upstream/DIVERGENCES.md`.
 
 Serve
 -----
@@ -298,7 +403,7 @@ Roadmap
 -------
 - sqlite-vec / HNSW ANN backend
 - knowledge-page fs mount
-- adopt upstream consolidation + reflect prompts end-to-end (see
-  prompts/upstream/DIVERGENCES.md)
+- full TEMR recall parity (per-fact_type arms; see RS-15 in NEXT_STEPS.md)
+- golden-pin the hand-ported final-synthesis builders via scripts/prompt-goldens
 - LongMemEval-S baseline run + iteration (harness shipped as `rustsight-eval`;
   see evals/RESULTS.md)

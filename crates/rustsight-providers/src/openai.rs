@@ -91,7 +91,12 @@ impl LlmProvider for OpenAiCompat {
                     })
                 })
                 .collect();
-            body["tool_choice"] = json!("auto");
+            // Forced named tool (upstream `tool_choice=done` on reflect's
+            // closing ask) or the model's choice.
+            body["tool_choice"] = match &req.tool_choice {
+                Some(name) => json!({"type": "function", "function": {"name": name}}),
+                None => json!("auto"),
+            };
         }
         if req.json_mode {
             body["response_format"] = json!({"type": "json_object"});

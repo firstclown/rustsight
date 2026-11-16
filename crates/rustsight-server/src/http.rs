@@ -30,10 +30,13 @@ pub fn router(engine: Arc<Engine>, auth: Arc<ApiAuth>) -> Router {
             "/banks/{bank_id}/mental-models",
             get(list_mental_models).post(refresh_mental_model),
         )
+        // Hindsight wire-compatible surface (`/v1/default/banks/...`).
+        .merge(crate::compat::routes())
         .with_state(engine)
         .layer(axum::middleware::from_fn_with_state(auth, require_token));
     Router::new()
         .route("/healthz", get(healthz))
+        .merge(crate::compat::public_routes())
         .merge(protected)
 }
 
@@ -64,18 +67,44 @@ pub async fn serve(
         )));
     }
     let worker = engine.spawn_worker(consolidate_interval_from_env(), 50);
+    let resumed = crate::compat::resume_pending_operations(&engine);
+    if resumed > 0 {
+        eprintln!("rustsight: resuming {resumed} unfinished async retain operation(s)");
+    }
     let listener = tokio::net::TcpListener::bind(socket)
         .await
         .map_err(|e| Error::BadInput(format!("bind {addr}: {e}")))?;
     axum::serve(listener, router(engine, Arc::new(auth)))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(|e| Error::Store(format!("server: {e}")))?;
     worker.abort();
     let _ = worker.await;
     Ok(())
+}
+
+/// Resolves on SIGINT (ctrl-c) or SIGTERM. Process supervisors — including
+/// the ones that manage `hindsight-api` — stop a server with SIGTERM and
+/// expect in-flight requests to drain.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
 }
 
 fn http_err(e: Error) -> (StatusCode, String) {
@@ -184,6 +213,7 @@ async fn retain(
             content: body.content,
             context: body.context,
             timestamp_ms: body.timestamp_ms,
+            ..Default::default()
         })
         .await
         .map(Json)
@@ -211,6 +241,7 @@ async fn recall(
                 .top_k_per_arm
                 .unwrap_or_else(|| engine.config.recall_budget.resolve(None, 1000)),
             kinds: None,
+            ..Default::default()
         })
         .await
         .map(Json)

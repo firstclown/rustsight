@@ -163,6 +163,7 @@ async fn retain_conversation(
                 content: session.clone(),
                 context: None,
                 timestamp_ms: Some(ts),
+                ..Default::default()
             })
             .await
             .map_err(|e| format!("retain for bank {bank_id} failed: {e}"))?;
@@ -934,13 +935,19 @@ mod tests {
     /// reflect failures (empty model responses). A failed first attempt
     /// must be retried once; the retry's answer becomes the question's
     /// answer.
+    ///
+    /// The reflect pipeline is loop → forced-done → final synthesis (only
+    /// when the loop produced nothing) → backgrounded opinions. Here a
+    /// provider hiccup empties the loop twice, the forced-done round still
+    /// lands a `finish`, and that closing answer IS the final answer
+    /// (upstream precedence: the loop's done call wins).
     #[tokio::test]
     async fn reflect_with_retry_recovers_a_failed_first_attempt() {
         let clock = Arc::new(FixedClock::new(1_800_000_000_000));
         let engine = test_engine(
             MockLlm::script(vec![
                 // first reflect attempt: two consecutive empty responses
-                // (the engine nudges once, then gives up)
+                // (the engine nudges once, then breaks to the answer path)
                 LlmResponse {
                     content: None,
                     tool_calls: vec![],
@@ -949,10 +956,8 @@ mod tests {
                     content: None,
                     tool_calls: vec![],
                 },
-                // retry attempt: clean finish
+                // forced-done round: clean finish — this answer wins
                 tool_resp("1", "finish", json!({"answer": "Recovered."})),
-                // form_opinions turn
-                resp(r#"{"opinions":[]}"#),
             ]),
             &clock,
         );
@@ -960,36 +965,43 @@ mod tests {
             .await
             .expect("retry must recover");
         assert_eq!(r.answer, "Recovered.");
+        assert_eq!(
+            r.answer_path,
+            rustsight_core::AnswerPath::ForcedDone,
+            "the closing finish is the answer"
+        );
     }
 
-    /// When both attempts fail, the last error surfaces for the trace.
+    /// A provider that never says anything still fails reflect (after the
+    /// harness retry) — the last error surfaces for the trace.
     #[tokio::test]
     async fn reflect_with_retry_surfaces_the_last_error() {
+        use rustsight_core::traits::LlmRequest;
+        struct ForeverEmpty;
+        #[async_trait::async_trait]
+        impl LlmProvider for ForeverEmpty {
+            async fn complete(&self, _req: &LlmRequest) -> rustsight_core::Result<LlmResponse> {
+                Ok(LlmResponse {
+                    content: None,
+                    tool_calls: vec![],
+                })
+            }
+        }
         let clock = Arc::new(FixedClock::new(1_800_000_000_000));
-        let engine = test_engine(
-            MockLlm::script(vec![
-                LlmResponse {
-                    content: None,
-                    tool_calls: vec![],
-                },
-                LlmResponse {
-                    content: None,
-                    tool_calls: vec![],
-                },
-                LlmResponse {
-                    content: None,
-                    tool_calls: vec![],
-                },
-                LlmResponse {
-                    content: None,
-                    tool_calls: vec![],
-                },
-            ]),
-            &clock,
+        let engine = Engine::new(
+            Arc::new(SqliteStore::open_in_memory_with_clock(clock.clone()).unwrap()),
+            Arc::new(ForeverEmpty),
+            Arc::new(MockEmbed::default()),
+            Arc::new(MockRerank),
+            Arc::new(SimpleTokenEstimator),
+            clock.clone(),
         );
         let err = reflect_with_retry(&engine, "b", "q", "q1")
             .await
-            .expect_err("both attempts failed");
-        assert!(err.contains("empty response"), "unexpected error: {err}");
+            .expect_err("persistent emptiness must fail both attempts");
+        assert!(
+            err.contains("produced no answer"),
+            "unexpected error: {err}"
+        );
     }
 }

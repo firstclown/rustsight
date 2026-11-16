@@ -27,6 +27,32 @@ pub struct EngineConfig {
     pub semantic_edge_cap: usize,
     pub extract: ExtractionConfig,
     pub reflect_max_rounds: usize,
+    /// Base iteration count the Hindsight-compatible API scales by the
+    /// request's `budget` (upstream `reflect_max_iterations` = 10, with
+    /// multipliers low 0.5 / mid 1 / high 2 — so the API default, `low`,
+    /// runs 5). Only used when a request names a budget; the native
+    /// `Engine::reflect` keeps `reflect_max_rounds`.
+    pub reflect_budget_base_rounds: usize,
+    /// Context budget (tokens) for reflect's final-synthesis call over the
+    /// gathered tool-result history (upstream `max_context_tokens`, default
+    /// 100k). Histories over the budget split into chunks, map to dated
+    /// claims, then reduce — evidence is split, never dropped.
+    pub reflect_max_context_tokens: usize,
+    /// Transport-level output cap (tokens) for reflect's answer-path calls
+    /// (closing ask + synthesis; upstream `reflect_max_completion_tokens`,
+    /// decoupled from the loop turns). Without it, gateways allocate a
+    /// huge default reasoning/output budget for thinking models — a
+    /// 52k-token closing ask plus a 79k allocation blew the 131k window
+    /// (2026-11-12 run, one scenario 500). `None` sends no cap.
+    pub reflect_max_completion_tokens: Option<u64>,
+    /// Visible answer-length target (tokens) for the closing ask and the
+    /// synthesis prompts — upstream `reflect_async`'s `max_tokens`
+    /// parameter, default 4096. It rides as the prompt's `## Length`
+    /// directive ("a complete, self-contained answer of approximately N
+    /// tokens"), which is why gold's answers are exhaustive while the
+    /// same model wrote 41-char one-liners for us with it unset.
+    /// `None` omits the directive.
+    pub reflect_answer_max_tokens: Option<usize>,
     /// Recall-pool sizing (upstream `recall_budget_*`): the per-arm limit a
     /// reflect/recall tool call uses, derived from the budget level and —
     /// for the adaptive function — the caller's token budget. Defaults to
@@ -65,6 +91,19 @@ pub struct EngineConfig {
     /// concurrently. Bounded on purpose: each entity is one LLM round
     /// trip, and an unbounded fan-out would trip provider rate limits.
     pub consolidate_concurrency: usize,
+    /// How many of a dirty entity's facts feed one consolidation call.
+    /// Entities with more facts page through them in windows of this size
+    /// (newest first), each window seeing the previous windows'
+    /// observations — the old fixed cap of 60 silently dropped older facts
+    /// of big entities, so they never reached an observation (2025-11:
+    /// 159 facts, the "Joe" entity alone exceeded the cap).
+    pub consolidate_max_facts_per_entity: usize,
+    /// Cosine threshold for the bank-level near-duplicate observation
+    /// guard at CREATE time: a proposed observation this similar to an
+    /// existing one merges its evidence instead of writing a sibling
+    /// (the 2026-11-12 runs: 5-8x upstream's observation count with
+    /// paraphrase siblings the exact-text guard cannot catch).
+    pub consolidate_dupe_cosine: f32,
 }
 
 impl Default for EngineConfig {
@@ -79,6 +118,10 @@ impl Default for EngineConfig {
             semantic_edge_cap: 10,
             extract: ExtractionConfig::default(),
             reflect_max_rounds: 8,
+            reflect_budget_base_rounds: 10,
+            reflect_max_context_tokens: 100_000,
+            reflect_max_completion_tokens: Some(8192),
+            reflect_answer_max_tokens: Some(4096),
             recall_budget: RecallBudgetConfig::default(),
             scoring: ScoringConfig::default(),
             reranker_max_candidates: 0,
@@ -88,6 +131,8 @@ impl Default for EngineConfig {
             retry_base_delay_ms: 400,
             consolidate_timeout_secs: 600,
             consolidate_concurrency: 4,
+            consolidate_max_facts_per_entity: 200,
+            consolidate_dupe_cosine: 0.9,
         }
     }
 }
@@ -100,6 +145,13 @@ pub struct Engine {
     pub tokens: Arc<dyn TokenEstimator>,
     pub clock: Arc<dyn Clock>,
     pub config: EngineConfig,
+    /// Per-operation LLM overrides (upstream `HINDSIGHT_API_RETAIN_LLM_*` /
+    /// `_REFLECT_LLM_*` / `_CONSOLIDATION_LLM_*`); `None` falls back to
+    /// `llm`. Lets a deployment extract with a small model and answer with
+    /// a large one.
+    pub retain_llm: Option<Arc<dyn LlmProvider>>,
+    pub reflect_llm: Option<Arc<dyn LlmProvider>>,
+    pub consolidate_llm: Option<Arc<dyn LlmProvider>>,
     /// Wakes the background worker as soon as retain marks entities dirty.
     pub(crate) wakeup: Notify,
     /// Single-flight guard: serializes consolidation passes (worker vs
@@ -125,6 +177,9 @@ impl Engine {
             tokens,
             clock,
             config: EngineConfig::default(),
+            retain_llm: None,
+            reflect_llm: None,
+            consolidate_llm: None,
             wakeup: Notify::new(),
             consolidate_lock: Mutex::new(()),
         }
@@ -133,6 +188,83 @@ impl Engine {
     pub fn with_config(mut self, config: EngineConfig) -> Self {
         self.config = config;
         self
+    }
+
+    pub fn with_retain_llm(mut self, llm: Arc<dyn LlmProvider>) -> Self {
+        self.retain_llm = Some(llm);
+        self
+    }
+
+    pub fn with_reflect_llm(mut self, llm: Arc<dyn LlmProvider>) -> Self {
+        self.reflect_llm = Some(llm);
+        self
+    }
+
+    pub fn with_consolidate_llm(mut self, llm: Arc<dyn LlmProvider>) -> Self {
+        self.consolidate_llm = Some(llm);
+        self
+    }
+
+    pub(crate) fn llm_for_retain(&self) -> Arc<dyn LlmProvider> {
+        Arc::clone(self.retain_llm.as_ref().unwrap_or(&self.llm))
+    }
+
+    pub(crate) fn llm_for_reflect(&self) -> Arc<dyn LlmProvider> {
+        Arc::clone(self.reflect_llm.as_ref().unwrap_or(&self.llm))
+    }
+
+    pub(crate) fn llm_for_consolidate(&self) -> Arc<dyn LlmProvider> {
+        Arc::clone(self.consolidate_llm.as_ref().unwrap_or(&self.llm))
+    }
+
+    /// The mission text for a non-reflect pipeline (`retain_mission` or
+    /// `observations_mission`). A bank configured the Hindsight way keeps
+    /// its `mission` for reflect only (`mission_scope: "reflect"`), so the
+    /// pipeline gets its own mission or none; a natively configured bank
+    /// keeps sharing `mission` across pipelines.
+    pub(crate) fn scoped_mission(&self, bank: &Bank, key: &str) -> Option<String> {
+        let config = self
+            .store
+            .bank_config(&bank.id)
+            .unwrap_or(serde_json::Value::Null);
+        let own = config
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if own.is_some() {
+            return own;
+        }
+        if config.get("mission_scope").and_then(|v| v.as_str()) == Some("reflect") {
+            return None;
+        }
+        bank.mission.clone()
+    }
+
+    /// Delete a document and every memory extracted from it; entities whose
+    /// facts or observations changed are re-queued for consolidation.
+    /// Returns the number of memories deleted.
+    pub fn forget_document(&self, bank_id: &str, document_id: &str) -> Result<usize> {
+        let (deleted, affected) = self.store.delete_document_memories(bank_id, document_id)?;
+        self.store.delete_document(bank_id, document_id)?;
+        if !affected.is_empty() {
+            self.store
+                .mark_entities_dirty(bank_id, &affected, "document_deleted")?;
+            self.wake_worker();
+        }
+        Ok(deleted)
+    }
+
+    /// Reflect rounds for a Hindsight budget level (upstream:
+    /// `max(1, int(reflect_max_iterations * multiplier))`).
+    pub fn reflect_rounds_for_budget(&self, budget: Budget) -> usize {
+        let base = self.config.reflect_budget_base_rounds;
+        match budget {
+            Budget::Low => (base / 2).max(1),
+            Budget::Mid => base.max(1),
+            Budget::High => (base * 2).max(1),
+        }
     }
 
     pub async fn retain(&self, req: RetainRequest) -> Result<RetainResponse> {
@@ -144,7 +276,18 @@ impl Engine {
     }
 
     pub async fn reflect(&self, bank_id: &str, query: &str) -> Result<ReflectResponse> {
-        reflect::reflect(self, bank_id, query).await
+        reflect::reflect(self, bank_id, query, &ReflectOptions::default()).await
+    }
+
+    /// Reflect with per-request options (budgeted rounds, tag scope, kind
+    /// restriction, answer length, structured output).
+    pub async fn reflect_with(
+        &self,
+        bank_id: &str,
+        query: &str,
+        options: &ReflectOptions,
+    ) -> Result<ReflectResponse> {
+        reflect::reflect(self, bank_id, query, options).await
     }
 
     /// Consolidate up to `max_entities` dirty entities in one bank.
@@ -260,7 +403,27 @@ where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
 {
-    let max_attempts = e.config.retry_max_attempts.max(1);
+    with_retry_config(
+        e.config.retry_max_attempts,
+        e.config.retry_base_delay_ms,
+        op,
+    )
+    .await
+}
+
+/// `with_retry` for detached tasks that cannot borrow the `Engine` (e.g.
+/// the backgrounded opinion extraction): same transient-failure policy,
+/// explicit retry knobs.
+pub(crate) async fn with_retry_config<T, F, Fut>(
+    max_attempts_cfg: usize,
+    base_delay_ms: u64,
+    op: F,
+) -> Result<T>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let max_attempts = max_attempts_cfg.max(1);
     let mut attempt = 1;
     loop {
         match op().await {
@@ -268,7 +431,7 @@ where
             Err(err) if err.is_transient() && attempt < max_attempts => {
                 let shift = (attempt - 1).min(5) as u32;
                 tokio::time::sleep(Duration::from_millis(
-                    e.config.retry_base_delay_ms.saturating_mul(1 << shift),
+                    base_delay_ms.saturating_mul(1 << shift),
                 ))
                 .await;
                 attempt += 1;

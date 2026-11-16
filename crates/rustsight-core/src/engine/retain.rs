@@ -8,6 +8,7 @@ use crate::{cosine, temporal_weight, Error, Result};
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// How many retain chunks extract concurrently (CR-19). Bounded on
@@ -49,9 +50,45 @@ pub(super) async fn retain(e: &Engine, req: RetainRequest) -> Result<RetainRespo
         e.config.chunk_overlap_tokens,
         e.tokens.as_ref(),
     );
-    let event_date = DateTime::from_timestamp_millis(now).map(|dt| dt.with_timezone(&Utc));
+    // `timestamp: "unset"` (timeless content): the extractor gets no event
+    // date; memories are still stamped with the retain time.
+    let event_date = if req.timestamp_unset {
+        None
+    } else {
+        DateTime::from_timestamp_millis(now).map(|dt| dt.with_timezone(&Utc))
+    };
+    let document_id = req
+        .document_id
+        .clone()
+        .filter(|d| !d.trim().is_empty())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let incoming_hash = content_hash(&req.content);
+    let existing_doc = e.store.get_document(&bank.id, &document_id)?;
+    // Re-retaining a document byte-for-byte (same scope and labels) is a
+    // no-op: the stored memories already are its extraction.
+    if let Some(doc) = &existing_doc {
+        if req.update_mode == UpdateMode::Replace
+            && doc.content_hash == incoming_hash
+            && doc.tags == req.tags
+            && doc.metadata == req.metadata
+            && doc.retain_params.get("context").and_then(|v| v.as_str()) == req.context.as_deref()
+            && e.store.count_document_memories(&bank.id, &document_id)? > 0
+        {
+            return Ok(RetainResponse {
+                memories_stored: 0,
+                entities: vec![],
+                edges_created: 0,
+                reasks: 0,
+                document_id: Some(document_id),
+            });
+        }
+    }
     let total_chunks = chunks.len();
-    let bank_mission = bank.mission.as_deref();
+    let retain_mission = e.scoped_mission(&bank, "retain_mission");
+    let bank_mission = retain_mission.as_deref();
+    // Parse-failure re-asks across all chunks of this retain, surfaced in
+    // the response so benchmark drivers can attribute retain latency.
+    let reasks = Arc::new(AtomicUsize::new(0));
     // Futures are created in a plain loop (not a stream combinator closure
     // returning a borrowing future): axum's Send check on the handler
     // future would otherwise trip rustc's higher-ranked closure
@@ -67,6 +104,7 @@ pub(super) async fn retain(e: &Engine, req: RetainRequest) -> Result<RetainRespo
                 context: req.context.as_deref(),
                 event_date,
                 bank_mission,
+                reasks: Arc::clone(&reasks),
             },
         ));
     }
@@ -76,20 +114,96 @@ pub(super) async fn retain(e: &Engine, req: RetainRequest) -> Result<RetainRespo
         .await
         .into_iter()
         .collect::<Result<Vec<_>>>()?;
-    let facts = merge_chunk_facts(per_chunk, OVERLAP_DEDUP_THRESHOLD);
+    let mut facts = merge_chunk_facts(per_chunk, OVERLAP_DEDUP_THRESHOLD);
+    let reasks = reasks.load(Ordering::Relaxed);
+    // Caller-supplied entities ride on every fact extracted from this
+    // content, next to the extractor's own (upstream `entities`).
+    for fact in &mut facts {
+        for user in &req.entities {
+            let key = normalize_name(&user.name);
+            if !key.is_empty() && !fact.entities.iter().any(|x| normalize_name(&x.name) == key) {
+                fact.entities.push(user.clone());
+            }
+        }
+    }
+
+    let mut embeddings = if facts.is_empty() {
+        vec![]
+    } else {
+        let embed = Arc::clone(&e.embed);
+        let texts: Vec<String> = facts.iter().map(|f| f.text.clone()).collect();
+        with_retry(e, || embed.embed(texts.clone())).await?
+    };
+    if embeddings.len() != facts.len() {
+        return Err(Error::Embed("embedding count mismatch".into()));
+    }
+
+    // Document bookkeeping — only after every provider call succeeded, so a
+    // failed extraction or embedding never destroys the previous version.
+    // Replace (upstream default) drops the old version's memories; append
+    // keeps them and extends the stored body with the new tail.
+    let wall_now = e.clock.now_ms();
+    let mut stale_entities: Vec<String> = vec![];
+    // An append extends the document: labels the new tail does not restate
+    // (metadata, context) stay as they were.
+    let mut doc_metadata = req.metadata.clone();
+    let mut doc_context = req.context.clone();
+    let (body, doc_tags, created_at_ms) = match (&existing_doc, req.update_mode) {
+        (Some(doc), UpdateMode::Append) => {
+            let mut tags = doc.tags.clone();
+            for t in &req.tags {
+                if !tags.contains(t) {
+                    tags.push(t.clone());
+                }
+            }
+            doc_metadata = doc_metadata.or_else(|| doc.metadata.clone());
+            doc_context = doc_context.or_else(|| {
+                doc.retain_params
+                    .get("context")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            });
+            (
+                join_document_parts(&doc.original_text, &req.content),
+                tags,
+                doc.created_at_ms,
+            )
+        }
+        (Some(doc), UpdateMode::Replace) => {
+            let (_, affected) = e.store.delete_document_memories(&bank.id, &document_id)?;
+            stale_entities = affected;
+            (req.content.clone(), req.tags.clone(), doc.created_at_ms)
+        }
+        (None, _) => (req.content.clone(), req.tags.clone(), wall_now),
+    };
+    e.store.upsert_document(&Document {
+        id: document_id.clone(),
+        bank_id: bank.id.clone(),
+        content_hash: content_hash(&body),
+        original_text: body,
+        tags: doc_tags,
+        metadata: doc_metadata,
+        retain_params: serde_json::json!({
+            "context": doc_context,
+            "event_date": event_date.map(|d| d.to_rfc3339()),
+        }),
+        created_at_ms,
+        updated_at_ms: wall_now,
+    })?;
+
     if facts.is_empty() {
+        if !stale_entities.is_empty() {
+            e.store
+                .mark_entities_dirty(&bank.id, &stale_entities, "document_replaced")?;
+            e.wake_worker();
+        }
         return Ok(RetainResponse {
             memories_stored: 0,
             entities: vec![],
             edges_created: 0,
+            reasks,
+            document_id: Some(document_id),
         });
-    }
-
-    let embed = Arc::clone(&e.embed);
-    let texts: Vec<String> = facts.iter().map(|f| f.text.clone()).collect();
-    let mut embeddings = with_retry(e, || embed.embed(texts.clone())).await?;
-    if embeddings.len() != facts.len() {
-        return Err(Error::Embed("embedding count mismatch".into()));
     }
 
     let mut alias_cache: HashMap<String, Entity> = HashMap::new();
@@ -245,6 +359,9 @@ pub(super) async fn retain(e: &Engine, req: RetainRequest) -> Result<RetainRespo
             embedding: embeddings[i].clone(),
             source: None,
             context: req.context.clone(),
+            document_id: Some(document_id.clone()),
+            tags: req.tags.clone(),
+            metadata: req.metadata.clone(),
         })
         .collect();
     let stored = e.store.insert_memories(&bank.id, &records)?;
@@ -301,6 +418,11 @@ pub(super) async fn retain(e: &Engine, req: RetainRequest) -> Result<RetainRespo
     edges.extend(build_causal_edges(&bank.id, &stored, &facts));
 
     e.store.add_edges(&edges)?;
+    if !stale_entities.is_empty() {
+        e.store
+            .mark_entities_dirty(&bank.id, &stale_entities, "document_replaced")?;
+        e.wake_worker();
+    }
     if !touched.is_empty() {
         e.store
             .mark_entities_dirty(&bank.id, &touched, "new_facts")?;
@@ -314,7 +436,40 @@ pub(super) async fn retain(e: &Engine, req: RetainRequest) -> Result<RetainRespo
         memories_stored: stored.len(),
         entities: touched,
         edges_created: edges.len(),
+        reasks,
+        document_id: Some(document_id),
     })
+}
+
+/// Stable content fingerprint for a document body (FNV-1a 64, hex). Only
+/// ever compared for equality against values this function produced.
+pub(crate) fn content_hash(text: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in text.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// How a document's stored body and an appended tail become one body
+/// (upstream `join_document_parts`): two JSON arrays of objects merge into
+/// one array so a conversation stored as JSON stays valid JSON; anything
+/// else joins with a newline.
+pub(crate) fn join_document_parts(existing: &str, incoming: &str) -> String {
+    let as_objects = |text: &str| -> Option<Vec<serde_json::Value>> {
+        match serde_json::from_str::<serde_json::Value>(text).ok()? {
+            serde_json::Value::Array(items) if items.iter().all(|v| v.is_object()) => Some(items),
+            _ => None,
+        }
+    };
+    match (as_objects(existing), as_objects(incoming)) {
+        (Some(mut a), Some(b)) => {
+            a.extend(b);
+            serde_json::Value::Array(a).to_string()
+        }
+        _ => format!("{existing}\n{incoming}"),
+    }
 }
 
 /// Entity edges: link each stored fact to its entity's other recent facts
@@ -481,6 +636,8 @@ struct ChunkExtract<'a> {
     context: Option<&'a str>,
     event_date: Option<DateTime<Utc>>,
     bank_mission: Option<&'a str>,
+    /// Shared per-retain parse-failure re-ask counter.
+    reasks: Arc<AtomicUsize>,
 }
 
 /// Extract facts from one retain chunk, retrying transient provider failures.
@@ -505,7 +662,7 @@ fn extract_chunk_at<'a>(e: &'a Engine, args: ChunkExtract<'a>, depth: usize) -> 
             args.event_date,
             args.context,
         );
-        let llm = Arc::clone(&e.llm);
+        let llm = e.llm_for_retain();
         let request = LlmRequest {
             system: Some(system),
             messages: vec![ChatMessage::user(user)],
@@ -519,10 +676,19 @@ fn extract_chunk_at<'a>(e: &'a Engine, args: ChunkExtract<'a>, depth: usize) -> 
             Err(err) => {
                 if depth == 0 {
                     if let Some((head, tail)) = split_half(args.content, e.tokens.as_ref()) {
+                        let n = args.reasks.fetch_add(1, Ordering::Relaxed) + 1;
+                        eprintln!(
+                            "rustsight: retain chunk {} of {} failed to parse ({err}); \
+                             re-asking at half size (re-ask #{n})",
+                            args.chunk_index + 1,
+                            args.total_chunks
+                        );
+                        let reasks = Arc::clone(&args.reasks);
                         let first = extract_chunk_at(
                             e,
                             ChunkExtract {
                                 content: &head,
+                                reasks: Arc::clone(&reasks),
                                 ..args
                             },
                             depth + 1,
@@ -534,6 +700,7 @@ fn extract_chunk_at<'a>(e: &'a Engine, args: ChunkExtract<'a>, depth: usize) -> 
                             e,
                             ChunkExtract {
                                 content: &tail,
+                                reasks,
                                 ..args
                             },
                             depth + 1,
@@ -620,6 +787,9 @@ mod tests {
             mentioned_at_ms: mentioned,
             source: None,
             context: None,
+            document_id: None,
+            tags: vec![],
+            metadata: None,
         }
     }
 

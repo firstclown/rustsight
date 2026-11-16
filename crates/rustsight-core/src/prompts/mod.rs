@@ -5,8 +5,9 @@ pub mod reflect;
 pub mod upstream;
 
 pub use consolidation::{
-    build_consolidation_prompt, build_opinion_reinforcement_prompt, parse_observations,
-    parse_reinforcement, ParsedObservation,
+    build_entity_consolidation_prompt, build_opinion_reinforcement_prompt,
+    parse_consolidation_plan, parse_observations, parse_reinforcement, ConsolidationPlan,
+    ParsedObservation, PlannedCreate, PlannedDelete, PlannedUpdate,
 };
 pub use extraction::{
     build_extraction_messages, parse_extraction, parse_extraction_with_reference, ExtractionConfig,
