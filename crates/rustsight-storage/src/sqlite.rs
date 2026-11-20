@@ -138,6 +138,15 @@ CREATE TABLE IF NOT EXISTS operations(
   updated_at_ms INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_ops_bank ON operations(bank_id, created_at_ms);
+CREATE TABLE IF NOT EXISTS chunks(
+  bank_id TEXT NOT NULL,
+  id TEXT NOT NULL,
+  document_id TEXT NOT NULL,
+  chunk_index INTEGER NOT NULL,
+  text TEXT NOT NULL,
+  PRIMARY KEY(bank_id, id)
+);
+CREATE INDEX IF NOT EXISTS idx_chunks_document ON chunks(bank_id, document_id, chunk_index);
 CREATE TABLE IF NOT EXISTS mental_models(
   id TEXT PRIMARY KEY,
   bank_id TEXT NOT NULL,
@@ -209,6 +218,7 @@ impl SqliteStore {
             ("memories", "document_id", "TEXT"),
             ("memories", "tags_json", "TEXT NOT NULL DEFAULT '[]'"),
             ("memories", "metadata_json", "TEXT"),
+            ("memories", "chunk_id", "TEXT"),
             ("banks", "config_json", "TEXT"),
         ];
         for (table, column, decl) in COLUMNS {
@@ -418,8 +428,8 @@ impl MemoryStore for SqliteStore {
         for item in items {
             let id = uuid::Uuid::new_v4().to_string();
             tx.execute(
-                "INSERT INTO memories(id, bank_id, kind, text, confidence, occurred_start_ms, occurred_end_ms, mentioned_at_ms, embedding, source, context, created_at_ms, document_id, tags_json, metadata_json)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                "INSERT INTO memories(id, bank_id, kind, text, confidence, occurred_start_ms, occurred_end_ms, mentioned_at_ms, embedding, source, context, created_at_ms, document_id, tags_json, metadata_json, chunk_id)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
                 params![
                     id,
                     bank_id,
@@ -435,7 +445,8 @@ impl MemoryStore for SqliteStore {
                     now,
                     item.document_id,
                     tags_to_json(&item.tags),
-                    metadata_to_json(&item.metadata)
+                    metadata_to_json(&item.metadata),
+                    item.chunk_id
                 ],
             )
             .map_err(store_err)?;
@@ -1498,7 +1509,13 @@ impl MemoryStore for SqliteStore {
                 .map_err(store_err)?;
             rows.collect::<rusqlite::Result<_>>().map_err(store_err)?
         };
+        tx.execute(
+            "DELETE FROM chunks WHERE bank_id = ?1 AND document_id = ?2",
+            params![bank_id, id],
+        )
+        .map_err(store_err)?;
         if ids.is_empty() {
+            tx.commit().map_err(store_err)?;
             return Ok((0, vec![]));
         }
         let gone: HashSet<&str> = ids.iter().map(String::as_str).collect();
@@ -1586,6 +1603,152 @@ impl MemoryStore for SqliteStore {
         )
         .map_err(store_err)?;
         Ok(())
+    }
+
+    fn insert_chunks(&self, chunks: &[Chunk]) -> Result<()> {
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction().map_err(store_err)?;
+        for c in chunks {
+            tx.execute(
+                "INSERT OR REPLACE INTO chunks(bank_id, id, document_id, chunk_index, text)
+                 VALUES (?1,?2,?3,?4,?5)",
+                params![c.bank_id, c.id, c.document_id, c.chunk_index as i64, c.text],
+            )
+            .map_err(store_err)?;
+        }
+        tx.commit().map_err(store_err)
+    }
+
+    fn next_chunk_index(&self, bank_id: &str, document_id: &str) -> Result<usize> {
+        let conn = self.lock_conn();
+        let next: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(chunk_index) + 1, 0) FROM chunks
+                 WHERE bank_id = ?1 AND document_id = ?2",
+                params![bank_id, document_id],
+                |r| r.get(0),
+            )
+            .map_err(store_err)?;
+        Ok(next as usize)
+    }
+
+    fn get_chunks(&self, bank_id: &str, ids: &[String]) -> Result<Vec<Chunk>> {
+        let conn = self.lock_conn();
+        let mut out = Vec::with_capacity(ids.len());
+        for batch in ids.chunks(400) {
+            let sql = format!(
+                "SELECT c.id, c.document_id, c.chunk_index, c.text, d.tags_json
+                 FROM chunks c JOIN documents d ON d.bank_id = c.bank_id AND d.id = c.document_id
+                 WHERE c.bank_id = ? AND c.id IN ({})",
+                placeholders(batch.len())
+            );
+            let mut stmt = conn.prepare(&sql).map_err(store_err)?;
+            let rows = stmt
+                .query_map(
+                    params_from_iter(
+                        std::iter::once(bank_id.to_string()).chain(batch.iter().cloned()),
+                    ),
+                    |r| {
+                        Ok(Chunk {
+                            id: r.get(0)?,
+                            bank_id: bank_id.to_string(),
+                            document_id: r.get(1)?,
+                            chunk_index: r.get::<_, i64>(2)? as usize,
+                            text: r.get(3)?,
+                            document_tags: parse_tags(r.get::<_, Option<String>>(4)?),
+                        })
+                    },
+                )
+                .map_err(store_err)?;
+            for row in rows {
+                out.push(row.map_err(store_err)?);
+            }
+        }
+        Ok(out)
+    }
+
+    fn memory_chunk_ids(
+        &self,
+        bank_id: &str,
+        memory_ids: &[MemoryId],
+    ) -> Result<HashMap<String, String>> {
+        let conn = self.lock_conn();
+        let mut out = HashMap::with_capacity(memory_ids.len());
+        for batch in memory_ids.chunks(400) {
+            let sql = format!(
+                "SELECT id, chunk_id FROM memories
+                 WHERE bank_id = ? AND chunk_id IS NOT NULL AND id IN ({})",
+                placeholders(batch.len())
+            );
+            let mut stmt = conn.prepare(&sql).map_err(store_err)?;
+            let rows = stmt
+                .query_map(
+                    params_from_iter(
+                        std::iter::once(bank_id.to_string()).chain(batch.iter().cloned()),
+                    ),
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                )
+                .map_err(store_err)?;
+            for row in rows {
+                let (memory, chunk) = row.map_err(store_err)?;
+                out.insert(memory, chunk);
+            }
+        }
+        Ok(out)
+    }
+
+    fn delete_bank(&self, bank_id: &str) -> Result<BankDeletion> {
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction().map_err(store_err)?;
+        tx.execute(
+            "DELETE FROM operations WHERE bank_id = ?1",
+            params![bank_id],
+        )
+        .map_err(store_err)?;
+        let exists = tx
+            .prepare("SELECT 1 FROM banks WHERE id = ?1")
+            .and_then(|mut st| st.exists(params![bank_id]))
+            .map_err(store_err)?;
+        if !exists {
+            // Every write path creates the bank row first, so there is
+            // nothing else to find (and no full FTS scan to pay for).
+            tx.commit().map_err(store_err)?;
+            return Ok(BankDeletion::default());
+        }
+        let count = |table: &str| -> Result<usize> {
+            tx.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE bank_id = ?1"),
+                params![bank_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n as usize)
+            .map_err(store_err)
+        };
+        let deleted = BankDeletion {
+            memories: count("memories")?,
+            entities: count("entities")?,
+            documents: count("documents")?,
+        };
+        for sql in [
+            "DELETE FROM memory_entities WHERE memory_id IN (SELECT id FROM memories WHERE bank_id = ?1)",
+            "DELETE FROM opinion_entities WHERE opinion_id IN (SELECT id FROM opinions WHERE bank_id = ?1)",
+            "DELETE FROM edges WHERE bank_id = ?1",
+            "DELETE FROM texts_fts WHERE bank_id = ?1",
+            "DELETE FROM dirty_entities WHERE bank_id = ?1",
+            "DELETE FROM observations WHERE bank_id = ?1",
+            "DELETE FROM opinions WHERE bank_id = ?1",
+            "DELETE FROM chunks WHERE bank_id = ?1",
+            "DELETE FROM documents WHERE bank_id = ?1",
+            "DELETE FROM mental_models WHERE bank_id = ?1",
+            "DELETE FROM memories WHERE bank_id = ?1",
+            "DELETE FROM entity_aliases WHERE bank_id = ?1",
+            "DELETE FROM entities WHERE bank_id = ?1",
+            "DELETE FROM banks WHERE id = ?1",
+        ] {
+            tx.execute(sql, params![bank_id]).map_err(store_err)?;
+        }
+        tx.commit().map_err(store_err)?;
+        Ok(deleted)
     }
 
     fn tag_index(&self, bank_id: &str) -> Result<HashMap<String, Vec<String>>> {
@@ -1682,6 +1845,42 @@ impl MemoryStore for SqliteStore {
             out.push(r.map_err(store_err)?);
         }
         Ok(out)
+    }
+
+    fn list_operations(
+        &self,
+        bank_id: &str,
+        status: Option<&str>,
+        kind: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<Operation>, usize)> {
+        const FILTER: &str =
+            "bank_id = ?1 AND (?2 IS NULL OR status = ?2) AND (?3 IS NULL OR kind = ?3)";
+        let conn = self.lock_conn();
+        let total: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM operations WHERE {FILTER}"),
+                params![bank_id, status, kind],
+                |r| r.get(0),
+            )
+            .map_err(store_err)?;
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT id, bank_id, kind, status, error, payload_json, created_at_ms, updated_at_ms
+                 FROM operations WHERE {FILTER}
+                 ORDER BY created_at_ms DESC, id LIMIT ?4 OFFSET ?5"
+            ))
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(
+                params![bank_id, status, kind, limit as i64, offset as i64],
+                Self::row_operation,
+            )
+            .map_err(store_err)?;
+        let operations: Vec<Operation> =
+            rows.collect::<rusqlite::Result<_>>().map_err(store_err)?;
+        Ok((operations, total as usize))
     }
 
     fn upsert_mental_model(&self, m: &MentalModel) -> Result<()> {
@@ -1828,6 +2027,7 @@ mod tests {
             document_id: None,
             tags: vec![],
             metadata: None,
+            chunk_id: None,
         }
     }
 
@@ -2395,6 +2595,7 @@ mod tests {
             assert_eq!(old.text, "an old fact");
             assert!(old.tags.is_empty() && old.document_id.is_none() && old.metadata.is_none());
             assert_eq!(s.bank_config("b").unwrap(), serde_json::json!({}));
+            assert!(s.memory_chunk_ids("b", &["m1".into()]).unwrap().is_empty());
         }
         let s = SqliteStore::open(&path).unwrap();
         let mut rec = new_mem("a new fact", 9);
@@ -2534,5 +2735,144 @@ mod tests {
         let back = s.get_operation("op1").unwrap().unwrap();
         assert_eq!(back.status, "completed");
         assert_eq!(back.payload["items"][0]["content"], "x");
+
+        s.upsert_operation(&Operation {
+            id: "op2".into(),
+            status: "failed".into(),
+            created_at_ms: 2,
+            ..op.clone()
+        })
+        .unwrap();
+        let (newest, total) = s.list_operations("b", None, None, 1, 0).unwrap();
+        assert_eq!((newest[0].id.as_str(), total), ("op2", 2));
+        let (rest, _) = s.list_operations("b", None, None, 5, 1).unwrap();
+        assert_eq!(rest[0].id, "op1");
+        let (failed, total) = s
+            .list_operations("b", Some("failed"), Some("retain"), 5, 0)
+            .unwrap();
+        assert_eq!((failed.len(), total), (1, 1));
+        assert_eq!(s.list_operations("x", None, None, 5, 0).unwrap().1, 0);
+    }
+
+    #[test]
+    fn delete_bank_leaves_no_rows_behind_and_spares_other_banks() {
+        let s = store();
+        for bank in ["gone", "kept"] {
+            s.ensure_bank(&Bank {
+                id: bank.into(),
+                mission: None,
+                directives: None,
+                background: None,
+                disposition: Disposition::default(),
+            })
+            .unwrap();
+            let entity = s
+                .create_entity(&NewEntity {
+                    bank_id: bank.into(),
+                    name: format!("{bank} entity"),
+                    etype: EntityType::Other,
+                })
+                .unwrap();
+            let memory = s.insert_memories(bank, &[new_mem("a fact", 1)]).unwrap();
+            s.link_memory_entities(&memory[0].id, &[(entity.id.clone(), "e".into())], 1)
+                .unwrap();
+            s.mark_entities_dirty(bank, &[entity.id], "new_facts")
+                .unwrap();
+            s.upsert_document(&Document {
+                id: "d".into(),
+                bank_id: bank.into(),
+                original_text: "a fact".into(),
+                content_hash: "h".into(),
+                tags: vec![],
+                metadata: None,
+                retain_params: serde_json::json!({}),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            })
+            .unwrap();
+            s.insert_chunks(&[Chunk {
+                id: format!("{bank}_d_0"),
+                bank_id: bank.into(),
+                document_id: "d".into(),
+                chunk_index: 0,
+                text: "a fact".into(),
+                document_tags: vec![],
+            }])
+            .unwrap();
+        }
+        let deleted = s.delete_bank("gone").unwrap();
+        assert_eq!(
+            (deleted.memories, deleted.entities, deleted.documents),
+            (1, 1, 1)
+        );
+        let conn = s.lock_conn();
+        for table in [
+            "memories",
+            "entities",
+            "entity_aliases",
+            "dirty_entities",
+            "documents",
+            "chunks",
+            "texts_fts",
+        ] {
+            let count = |bank: &str| -> i64 {
+                conn.query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE bank_id = ?1"),
+                    params![bank],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            };
+            assert_eq!(count("gone"), 0, "{table}");
+            if table != "entity_aliases" {
+                assert!(count("kept") > 0, "{table}");
+            }
+        }
+        let links: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory_entities", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(links, 1);
+        drop(conn);
+        assert_eq!(s.delete_bank("gone").unwrap(), BankDeletion::default());
+    }
+
+    #[test]
+    fn chunks_follow_their_document() {
+        let s = store();
+        s.ensure_bank(&Bank {
+            id: "b".into(),
+            mission: None,
+            directives: None,
+            background: None,
+            disposition: Disposition::default(),
+        })
+        .unwrap();
+        s.upsert_document(&Document {
+            id: "d".into(),
+            bank_id: "b".into(),
+            original_text: "text".into(),
+            content_hash: "h".into(),
+            tags: vec!["t".into()],
+            metadata: None,
+            retain_params: serde_json::json!({}),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        })
+        .unwrap();
+        assert_eq!(s.next_chunk_index("b", "d").unwrap(), 0);
+        s.insert_chunks(&[Chunk {
+            id: "b_d_0".into(),
+            bank_id: "b".into(),
+            document_id: "d".into(),
+            chunk_index: 0,
+            text: "text".into(),
+            document_tags: vec![],
+        }])
+        .unwrap();
+        assert_eq!(s.next_chunk_index("b", "d").unwrap(), 1);
+        let chunks = s.get_chunks("b", &["b_d_0".into()]).unwrap();
+        assert_eq!(chunks[0].document_tags, vec!["t".to_string()]);
+        s.delete_document_memories("b", "d").unwrap();
+        assert!(s.get_chunks("b", &["b_d_0".into()]).unwrap().is_empty());
     }
 }

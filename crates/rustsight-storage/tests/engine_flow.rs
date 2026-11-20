@@ -188,6 +188,7 @@ async fn recall_strategies_used_keeps_fixed_order() {
                     document_id: None,
                     tags: vec![],
                     metadata: None,
+                    chunk_id: None,
                 },
                 NewMemoryRecord {
                     kind: MemoryKind::World,
@@ -202,6 +203,7 @@ async fn recall_strategies_used_keeps_fixed_order() {
                     document_id: None,
                     tags: vec![],
                     metadata: None,
+                    chunk_id: None,
                 },
             ],
         )

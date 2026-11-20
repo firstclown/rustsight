@@ -99,6 +99,8 @@ pub struct NewMemoryRecord {
     pub document_id: Option<String>,
     pub tags: Vec<String>,
     pub metadata: Option<BTreeMap<String, String>>,
+    /// The source chunk this fact was extracted from.
+    pub chunk_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -435,6 +437,27 @@ pub struct Document {
     pub updated_at_ms: i64,
 }
 
+/// A passage of a retained document, as sent to the extractor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chunk {
+    pub id: String,
+    pub bank_id: String,
+    pub document_id: String,
+    pub chunk_index: usize,
+    pub text: String,
+    /// The owning document's tags: source text is visible to a tag scope
+    /// only when its document is.
+    pub document_tags: Vec<String>,
+}
+
+/// What deleting a bank removed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BankDeletion {
+    pub memories: usize,
+    pub entities: usize,
+    pub documents: usize,
+}
+
 /// Lifecycle record of an async retain (Hindsight operations API).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Operation {
@@ -544,6 +567,13 @@ pub struct ExtractedFact {
     pub occurred_start_ms: Option<i64>,
     pub occurred_end_ms: Option<i64>,
     pub causal: Vec<CausalRef>,
+    /// Index of the retain chunk the fact came from.
+    pub chunk_index: usize,
+    /// The extractor's raw `labels` object, consumed by
+    /// [`crate::labels::BankLabels::apply`].
+    pub labels: Option<serde_json::Value>,
+    /// Tags derived for this fact alone (from `tag: true` label groups).
+    pub tags: Vec<String>,
 }
 
 #[cfg(test)]

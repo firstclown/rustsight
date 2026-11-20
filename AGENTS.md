@@ -21,7 +21,7 @@ scripts/build-release                    # release binary WITH the local ONNX
                                          # overwrites the binary WITHOUT the
                                          # reranker feature and it refuses to
                                          # start under RUSTSIGHT_RERANK=local
-cargo test                               # all 259 tests; fully offline, mock providers, no API key needed
+cargo test                               # all tests; fully offline, mock providers, no API key needed
 cargo test -p rustsight-storage --test engine_flow   # just the end-to-end integration suite
 cargo test -p rustsight-core --test upstream_prompt_parity   # upstream prompt parity suite (35 cases)
 cargo fmt --check                        # formatting check (must pass; no rustfmt.toml, defaults only)
@@ -221,6 +221,13 @@ Key source map:
   `Engine::reflect` runs `reflect_max_rounds` (8); only requests that name
   a budget (the compat API, default `low`) use upstream's
   `reflect_budget_base_rounds` (10) x 0.5/1/2.
+- **Bank deletion goes through `Engine::delete_bank`.** Anything writing to
+  a bank across an await holds a `BankGuard` (`engine/bank_gate.rs`) and runs
+  under `until_deleted`, so a delete cancels it and cannot interleave with
+  it. Never take a second guard for the same bank in one task: a queued
+  delete would deadlock it; pass the guard (`Engine::retain_guarded`).
+- **`enable_observations: false` gates consolidation, not retain.** Dirty
+  entities keep queueing so re-enabling catches up.
 - Schema changes are additive column migrations in `SqliteStore::migrate`
   (`CREATE TABLE IF NOT EXISTS` never alters an existing table) — add new
   columns there, with a test that opens an old-schema file.
@@ -270,6 +277,9 @@ Env vars, read in `crates/rustsight-providers/src/env.rs`:
 - `RUSTSIGHT_DB` (default `~/.rustsight/rustsight.db`)
 - `RUSTSIGHT_CONSOLIDATE_INTERVAL_MS` (default 5000; worker cadence, invalid
   values fall back to default with a warning)
+- `RUSTSIGHT_ASYNC_RETAIN_CONCURRENCY` (default 2, clamped 1–64; async
+  retains running at once through the compat API, invalid values fall back
+  to default with a warning)
 - `RUSTSIGHT_API_TOKEN` / `RUSTSIGHT_API_TOKEN_FILE` (optional; bearer-token
   auth for the HTTP API — without one, `serve` refuses non-loopback binds
   unless `--allow-unauth`. MCP stdio needs no auth.)

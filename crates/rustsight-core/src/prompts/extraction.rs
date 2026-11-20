@@ -69,6 +69,10 @@ impl ExtractionConfig {
 /// mode only, so the envelope is stated in the prompt.
 const OUTPUT_ENVELOPE: &str = "\n\nOUTPUT: respond with a single JSON object, no prose, in this exact shape: {\"facts\":[{\"what\":\"...\",\"when\":\"...\",\"where\":\"...\",\"who\":\"...\",\"why\":\"...\",\"fact_kind\":\"event\"|\"conversation\",\"occurred_start\":\"2026-03-14\"|null,\"occurred_end\":\"2026-03-20\"|null,\"fact_type\":\"world\"|\"assistant\",\"entities\":[\"...\"],\"causal_relations\":[{\"target_index\":0,\"relation_type\":\"caused_by\"}]}]}";
 
+/// Added when the bank configures entity labels: without a response schema
+/// the model has to be told where the classification goes.
+const LABELS_ENVELOPE: &str = " Every fact must also carry a \"labels\" object holding the ENTITY LABELS fields described above.";
+
 /// Build the (system, user) extraction messages for one retain chunk from
 /// the upstream-parity builders.
 #[allow(clippy::too_many_arguments)]
@@ -81,7 +85,10 @@ pub fn build_extraction_messages(
     event_date: Option<DateTime<Utc>>,
     context: Option<&str>,
 ) -> (String, String) {
-    let system = build_extraction_system_prompt(&cfg.to_upstream()) + OUTPUT_ENVELOPE;
+    let mut system = build_extraction_system_prompt(&cfg.to_upstream()) + OUTPUT_ENVELOPE;
+    if cfg.entity_labels.as_ref().is_some_and(|l| !l.is_empty()) {
+        system.push_str(LABELS_ENVELOPE);
+    }
     let user = build_chunk_user_message(&ChunkUserMessage {
         chunk,
         chunk_index,
@@ -357,6 +364,9 @@ pub fn parse_extraction_with_reference(
             occurred_start_ms,
             occurred_end_ms,
             causal,
+            chunk_index: 0,
+            labels: f.get("labels").filter(|l| l.is_object()).cloned(),
+            tags: vec![],
         });
     }
     Ok(out)

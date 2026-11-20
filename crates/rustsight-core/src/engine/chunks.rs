@@ -189,6 +189,9 @@ mod tests {
                     relation: relation.into(),
                 })
                 .collect(),
+            chunk_index: 0,
+            labels: None,
+            tags: vec![],
         }
     }
 

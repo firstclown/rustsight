@@ -543,10 +543,11 @@ client). Facts for later tickets:
      tags.
   2. Local embeddings (upstream `embeddings.provider = local`,
      bge-small-en-v1.5): rustsight needs an embeddings endpoint.
-  3. Chunk storage (`include.chunks`, `chunk_id`), `usage` token counts,
-     reflect `trace` (tool/LLM call log).
+  3. `usage` token counts, reflect `trace` (tool/LLM call log). Chunk
+     storage is done; chunks are still split at 3000 tokens where upstream
+     uses 3000 characters.
   4. Directives as first-class resources, mental models through this API,
-     bank delete / bank config endpoints, HTTP MCP at `/mcp/{bank_id}/`.
+     HTTP MCP at `/mcp/{bank_id}/`.
   5. Delta retain: `replace` re-extracts the whole document (upstream
      reuses unchanged chunks' facts); only byte-identical re-retains are
      skipped.

@@ -1,7 +1,10 @@
 use crate::engine::chunks::{merge_chunk_facts, split_chunks, split_half, OVERLAP_DEDUP_THRESHOLD};
 use crate::engine::{with_retry, Engine, EngineConfig};
 use crate::entity::{collapse_ws, normalize_name, score_candidate};
-use crate::prompts::extraction::{build_extraction_messages, parse_extraction_with_reference};
+use crate::labels::BankLabels;
+use crate::prompts::extraction::{
+    build_extraction_messages, parse_extraction_with_reference, ExtractionConfig,
+};
 use crate::traits::{ChatMessage, LlmRequest};
 use crate::types::*;
 use crate::{cosine, temporal_weight, Error, Result};
@@ -86,6 +89,17 @@ pub(super) async fn retain(e: &Engine, req: RetainRequest) -> Result<RetainRespo
     let total_chunks = chunks.len();
     let retain_mission = e.scoped_mission(&bank, "retain_mission");
     let bank_mission = retain_mission.as_deref();
+    let bank_config = e.store.bank_config(&bank.id)?;
+    let free_form = bank_config
+        .get("entities_allow_free_form")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let labels = BankLabels::parse(bank_config.get("entity_labels"), free_form)?;
+    let mut extract_config = e.config.extract.clone();
+    if let Some(labels) = &labels {
+        extract_config.entity_labels = Some(labels.groups.clone()).filter(|g| !g.is_empty());
+        extract_config.entities_allow_free_form = labels.free_form;
+    }
     // Parse-failure re-asks across all chunks of this retain, surfaced in
     // the response so benchmark drivers can attribute retain latency.
     let reasks = Arc::new(AtomicUsize::new(0));
@@ -104,21 +118,30 @@ pub(super) async fn retain(e: &Engine, req: RetainRequest) -> Result<RetainRespo
                 context: req.context.as_deref(),
                 event_date,
                 bank_mission,
+                extract: &extract_config,
                 reasks: Arc::clone(&reasks),
             },
         ));
     }
-    let per_chunk: Vec<Vec<ExtractedFact>> = futures::stream::iter(chunk_futs)
+    let mut per_chunk: Vec<Vec<ExtractedFact>> = futures::stream::iter(chunk_futs)
         .buffered(CHUNK_EXTRACT_CONCURRENCY)
         .collect::<Vec<_>>()
         .await
         .into_iter()
         .collect::<Result<Vec<_>>>()?;
+    for (index, chunk_facts) in per_chunk.iter_mut().enumerate() {
+        for fact in chunk_facts {
+            fact.chunk_index = index;
+        }
+    }
     let mut facts = merge_chunk_facts(per_chunk, OVERLAP_DEDUP_THRESHOLD);
     let reasks = reasks.load(Ordering::Relaxed);
     // Caller-supplied entities ride on every fact extracted from this
     // content, next to the extractor's own (upstream `entities`).
     for fact in &mut facts {
+        if let Some(labels) = &labels {
+            labels.apply(fact);
+        }
         for user in &req.entities {
             let key = normalize_name(&user.name);
             if !key.is_empty() && !fact.entities.iter().any(|x| normalize_name(&x.name) == key) {
@@ -190,6 +213,26 @@ pub(super) async fn retain(e: &Engine, req: RetainRequest) -> Result<RetainRespo
         created_at_ms,
         updated_at_ms: wall_now,
     })?;
+    // An append continues the document's numbering; a replace already
+    // dropped the old chunks with the old memories.
+    let first_chunk = if existing_doc.is_some() && req.update_mode == UpdateMode::Append {
+        e.store.next_chunk_index(&bank.id, &document_id)?
+    } else {
+        0
+    };
+    let stored_chunks: Vec<Chunk> = chunks
+        .iter()
+        .enumerate()
+        .map(|(i, text)| Chunk {
+            id: format!("{}_{}_{}", bank.id, document_id, first_chunk + i),
+            bank_id: bank.id.clone(),
+            document_id: document_id.clone(),
+            chunk_index: first_chunk + i,
+            text: text.clone(),
+            document_tags: vec![],
+        })
+        .collect();
+    e.store.insert_chunks(&stored_chunks)?;
 
     if facts.is_empty() {
         if !stale_entities.is_empty() {
@@ -360,8 +403,17 @@ pub(super) async fn retain(e: &Engine, req: RetainRequest) -> Result<RetainRespo
             source: None,
             context: req.context.clone(),
             document_id: Some(document_id.clone()),
-            tags: req.tags.clone(),
+            tags: {
+                let mut tags = req.tags.clone();
+                for tag in &f.tags {
+                    if !tags.contains(tag) {
+                        tags.push(tag.clone());
+                    }
+                }
+                tags
+            },
             metadata: req.metadata.clone(),
+            chunk_id: stored_chunks.get(f.chunk_index).map(|c| c.id.clone()),
         })
         .collect();
     let stored = e.store.insert_memories(&bank.id, &records)?;
@@ -636,6 +688,8 @@ struct ChunkExtract<'a> {
     context: Option<&'a str>,
     event_date: Option<DateTime<Utc>>,
     bank_mission: Option<&'a str>,
+    /// The engine's extraction settings plus this bank's entity labels.
+    extract: &'a ExtractionConfig,
     /// Shared per-retain parse-failure re-ask counter.
     reasks: Arc<AtomicUsize>,
 }
@@ -654,7 +708,7 @@ fn extract_chunk<'a>(e: &'a Engine, args: ChunkExtract<'a>) -> ChunkFut<'a> {
 fn extract_chunk_at<'a>(e: &'a Engine, args: ChunkExtract<'a>, depth: usize) -> ChunkFut<'a> {
     Box::pin(async move {
         let (system, user) = build_extraction_messages(
-            &e.config.extract,
+            args.extract,
             args.bank_mission,
             args.content,
             args.chunk_index,
@@ -818,6 +872,9 @@ mod tests {
                     relation: relation.into(),
                 })
                 .collect(),
+            chunk_index: 0,
+            labels: None,
+            tags: vec![],
         }
     }
 

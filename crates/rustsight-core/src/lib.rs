@@ -2,15 +2,19 @@ mod engine;
 mod entity;
 mod error;
 mod fusion;
+pub mod labels;
 mod links;
 pub mod prompts;
 mod store;
+pub mod tag_resolution;
 mod temporal;
 pub mod traits;
 pub mod trigram;
 pub mod types;
 
-pub use engine::{Budget, BudgetFunction, Engine, EngineConfig, RecallBudgetConfig, ScoringConfig};
+pub use engine::{
+    BankGuard, Budget, BudgetFunction, Engine, EngineConfig, RecallBudgetConfig, ScoringConfig,
+};
 pub use entity::{
     cluster_new_entity_names, collapse_ws, normalize_name, score_candidate, sequence_ratio,
     string_similarity, tokens_are_compatible, ResolverConfig,

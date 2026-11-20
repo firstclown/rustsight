@@ -1,3 +1,4 @@
+use crate::engine::bank_gate::BankGates;
 use crate::engine::{with_retry, with_retry_config, Engine};
 use crate::entity::{
     collapse_ws, normalize_name, score_candidate, string_similarity, ResolverConfig,
@@ -907,6 +908,7 @@ fn parse_finish_shaped_content(raw: &str) -> Option<(String, Vec<String>, Option
 /// The handles the backgrounded opinion extraction needs — everything
 /// `form_opinions` used off `Engine`, cloned into a detached task.
 struct OpinionCtx {
+    gates: Arc<BankGates>,
     store: Arc<dyn MemoryStore>,
     llm: Arc<dyn LlmProvider>,
     embed: Arc<dyn EmbedProvider>,
@@ -927,6 +929,7 @@ fn spawn_form_opinions(e: &Engine, bank_id: &str, question: &str, answer: &str) 
         return;
     }
     let ctx = OpinionCtx {
+        gates: Arc::clone(&e.bank_gates),
         store: Arc::clone(&e.store),
         llm: e.llm_for_reflect(),
         embed: Arc::clone(&e.embed),
@@ -940,7 +943,14 @@ fn spawn_form_opinions(e: &Engine, bank_id: &str, question: &str, answer: &str) 
     let question = question.to_string();
     let answer = answer.to_string();
     tokio::spawn(async move {
-        if let Err(err) = form_opinions(&ctx, &bank_id, &question, &answer).await {
+        // The answer may outlive its bank: never write opinions into one
+        // that was deleted in the meantime.
+        let guard = ctx.gates.read(&bank_id).await;
+        if !matches!(ctx.store.get_bank(&bank_id), Ok(Some(_))) {
+            return;
+        }
+        let formed = guard.until_deleted(form_opinions(&ctx, &bank_id, &question, &answer));
+        if let Err(err) = formed.await {
             eprintln!("rustsight: opinion extraction for bank {bank_id} failed: {err}");
         }
     });

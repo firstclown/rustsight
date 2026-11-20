@@ -107,7 +107,8 @@ pub trait MemoryStore: Send + Sync {
 
     /// Free-form per-bank settings that have no column of their own — a
     /// JSON object (`{}` when unset). Known keys: `name` (display label),
-    /// `retain_mission`, `observations_mission`, and `mission_scope`
+    /// `retain_mission`, `observations_mission`, `enable_observations`,
+    /// `entity_labels`, `entities_allow_free_form`, and `mission_scope`
     /// (`"reflect"` when the bank's `mission` must steer reflect only, as
     /// Hindsight's `reflect_mission` does).
     fn bank_config(&self, bank_id: &str) -> Result<serde_json::Value>;
@@ -128,6 +129,23 @@ pub trait MemoryStore: Send + Sync {
     fn delete_document_memories(&self, bank_id: &str, id: &str) -> Result<(usize, Vec<String>)>;
     fn delete_document(&self, bank_id: &str, id: &str) -> Result<()>;
 
+    /// Store source chunks (insert or replace by bank + id).
+    fn insert_chunks(&self, chunks: &[Chunk]) -> Result<()>;
+    /// The index the next chunk appended to a document should take.
+    fn next_chunk_index(&self, bank_id: &str, document_id: &str) -> Result<usize>;
+    /// Chunks by id, with their document's tags. Unknown ids are absent.
+    fn get_chunks(&self, bank_id: &str, ids: &[String]) -> Result<Vec<Chunk>>;
+    /// Source chunk id per memory; memories without one are absent.
+    fn memory_chunk_ids(
+        &self,
+        bank_id: &str,
+        memory_ids: &[MemoryId],
+    ) -> Result<HashMap<String, String>>;
+
+    /// Delete a bank and everything filed under it. A bank that does not
+    /// exist reports zero counts.
+    fn delete_bank(&self, bank_id: &str) -> Result<BankDeletion>;
+
     /// Tags per item id for a bank: raw memories carry their own tags,
     /// observations the union of their evidence facts' tags. Untagged items
     /// are absent from the map.
@@ -137,6 +155,16 @@ pub trait MemoryStore: Send + Sync {
     fn get_operation(&self, id: &str) -> Result<Option<Operation>>;
     /// Operations still `pending`, oldest first — resumed at server start.
     fn pending_operations(&self) -> Result<Vec<Operation>>;
+    /// A bank's operations, newest first, with the total matching count
+    /// before `limit`/`offset`.
+    fn list_operations(
+        &self,
+        bank_id: &str,
+        status: Option<&str>,
+        kind: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<Operation>, usize)>;
 
     fn upsert_mental_model(&self, m: &MentalModel) -> Result<()>;
     fn list_mental_models(&self, bank_id: &str) -> Result<Vec<MentalModel>>;

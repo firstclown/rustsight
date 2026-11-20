@@ -31,7 +31,8 @@ the *engine* intentionally deviates from upstream, and what was not ported.
    OpenAI-compat provider uses JSON mode only, so the engine-facing wrapper
    (`prompts::extraction::build_extraction_messages`) appends an `OUTPUT:`
    section stating the exact `{"facts":[...]}` envelope after the
-   byte-parity system prompt.
+   byte-parity system prompt, plus one sentence naming the `labels` object
+   when the bank configures entity labels.
 2. **Lenient extraction parsing.** `parse_extraction` accepts upstream's
    schema *and* rustsight's legacy schema (`text` key, `fact_type:
    "experience"`, entities as `{name, etype}` objects, `causal[].fact_index`)

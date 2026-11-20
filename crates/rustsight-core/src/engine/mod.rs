@@ -1,3 +1,4 @@
+mod bank_gate;
 mod chunks;
 mod consolidate;
 mod mental;
@@ -10,6 +11,8 @@ use crate::prompts::extraction::ExtractionConfig;
 use crate::traits::{Clock, EmbedProvider, LlmProvider, RerankProvider, TokenEstimator};
 use crate::types::*;
 use crate::{Error, MemoryStore, ResolverConfig, Result};
+use bank_gate::BankGates;
+pub use bank_gate::BankGuard;
 pub use scoring::{Budget, BudgetFunction, RecallBudgetConfig, ScoringConfig};
 use std::sync::Arc;
 use std::time::Duration;
@@ -163,6 +166,8 @@ pub struct Engine {
     /// explicit `consolidate_once` calls) so dirty entities are never
     /// double-processed.
     pub(crate) consolidate_lock: Mutex<()>,
+    /// Keeps bank deletion from interleaving with work writing to the bank.
+    pub(crate) bank_gates: Arc<BankGates>,
 }
 
 impl Engine {
@@ -187,6 +192,7 @@ impl Engine {
             consolidate_llm: None,
             wakeup: Notify::new(),
             consolidate_lock: Mutex::new(()),
+            bank_gates: Arc::default(),
         }
     }
 
@@ -261,6 +267,31 @@ impl Engine {
         Ok(deleted)
     }
 
+    /// Whether consolidation may build observations for this bank (on unless
+    /// its config says otherwise). Retain keeps queueing dirty entities
+    /// either way, so re-enabling picks up everything retained meanwhile.
+    pub fn observations_enabled(&self, bank_id: &str) -> Result<bool> {
+        Ok(self
+            .store
+            .bank_config(bank_id)?
+            .get("enable_observations")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true))
+    }
+
+    /// Shared access to a bank for a multi-step write; see
+    /// [`Engine::retain_guarded`].
+    pub async fn bank_read(&self, bank_id: &str) -> BankGuard {
+        self.bank_gates.read(bank_id).await
+    }
+
+    /// Delete a bank and everything in it. In-flight retains, consolidation
+    /// and opinion formation for the bank are cancelled first.
+    pub async fn delete_bank(&self, bank_id: &str) -> Result<BankDeletion> {
+        let _exclusive = self.bank_gates.exclusive(bank_id).await;
+        self.store.delete_bank(bank_id)
+    }
+
     /// Reflect rounds for a Hindsight budget level (upstream:
     /// `max(1, int(reflect_max_iterations * multiplier))`).
     pub fn reflect_rounds_for_budget(&self, budget: Budget) -> usize {
@@ -273,7 +304,18 @@ impl Engine {
     }
 
     pub async fn retain(&self, req: RetainRequest) -> Result<RetainResponse> {
-        retain::retain(self, req).await
+        let guard = self.bank_read(&req.bank_id).await;
+        self.retain_guarded(&guard, req).await
+    }
+
+    /// [`Engine::retain`] under a guard the caller already holds, so several
+    /// retains and their bookkeeping stay one unit against a bank delete.
+    pub async fn retain_guarded(
+        &self,
+        guard: &BankGuard,
+        req: RetainRequest,
+    ) -> Result<RetainResponse> {
+        guard.until_deleted(retain::retain(self, req)).await
     }
 
     pub async fn recall(&self, req: RecallRequest) -> Result<RecallResponse> {
@@ -311,7 +353,20 @@ impl Engine {
     /// every completed entity's work; unfinished entities stay dirty and
     /// retry on the next pass.
     pub async fn consolidate_once(&self, bank_id: &str, max_entities: usize) -> Result<usize> {
+        let bank = self.bank_read(bank_id).await;
+        let pass = bank.until_deleted(self.consolidate_serialized(bank_id, max_entities));
+        match pass.await {
+            // The bank went away mid-pass: there is nothing left to do.
+            Err(Error::NotFound(_)) if bank.is_deleting() => Ok(0),
+            result => result,
+        }
+    }
+
+    async fn consolidate_serialized(&self, bank_id: &str, max_entities: usize) -> Result<usize> {
         let _guard = self.consolidate_lock.lock().await;
+        if !self.observations_enabled(bank_id)? {
+            return Ok(0);
+        }
         // The hard wall fires at twice the pass budget: entities stop
         // *starting* at the budget (see `consolidate_timeout_secs`), and the
         // extra budget of grace lets those in-flight calls land instead of
@@ -392,7 +447,10 @@ impl Engine {
         question: &str,
         path: Option<&str>,
     ) -> Result<MentalModel> {
-        mental::refresh(self, bank_id, question, path).await
+        let guard = self.bank_read(bank_id).await;
+        guard
+            .until_deleted(mental::refresh(self, bank_id, question, path))
+            .await
     }
 }
 

@@ -88,6 +88,8 @@ Configuration (non-mock mode)
                               file whose hash differs is refused
     RUSTSIGHT_RERANK_DEVICE   auto | cpu | cuda (default auto)
     RUSTSIGHT_DB              default ~/.rustsight/rustsight.db
+    RUSTSIGHT_ASYNC_RETAIN_CONCURRENCY  async retains run at once through the
+                              Hindsight API (default 2, range 1-64)
     RUSTSIGHT_API_TOKEN       optional; bearer token required by every HTTP
                               endpoint except /healthz (see below)
     RUSTSIGHT_API_TOKEN_FILE  optional; read the token from a file instead
@@ -109,16 +111,20 @@ the official clients (`@vectorize-io/hindsight-client`,
 use FastAPI's `{"detail": "..."}` body. The native API (`/banks/...`) is
 untouched and served side by side.
 
-    GET    /health, /version                               (public)
+    GET    /health, /version, /openapi.json                (public)
     GET    /v1/default/banks
     PUT    /v1/default/banks/{bank_id}                     create/update (PATCH too)
+    DELETE /v1/default/banks/{bank_id}                     delete bank and contents
     GET    /v1/default/banks/{bank_id}/profile
+    GET    /v1/default/banks/{bank_id}/config              (PATCH, DELETE too)
     POST   /v1/default/banks/{bank_id}/memories            retain (sync or async)
     POST   /v1/default/banks/{bank_id}/memories/recall
     POST   /v1/default/banks/{bank_id}/reflect
     GET    /v1/default/banks/{bank_id}/documents
     GET    /v1/default/banks/{bank_id}/documents/{id}      (DELETE too)
+    GET    /v1/default/banks/{bank_id}/operations          list, newest first
     GET    /v1/default/banks/{bank_id}/operations/{id}     async retain status
+    POST   /v1/default/banks/{bank_id}/operations/{id}/retry
 
 `rustsight serve --host 127.0.0.1 --port 8888 --log-level warning` accepts
 the `hindsight-api` command line, and the server drains on SIGTERM as well
@@ -131,32 +137,40 @@ What works the Hindsight way:
   (`replace` deletes the old version's memories and re-extracts; `append`
   extends the stored body and extracts only the new tail). Re-retaining a
   document byte-for-byte is a no-op. `async: true` returns an
-  `operation_id` immediately; queued work survives a restart.
+  `operation_id` immediately; queued work survives a restart, and
+  `RUSTSIGHT_ASYNC_RETAIN_CONCURRENCY` sets how many run at once.
 - **Recall**: `types`, `budget` (low/mid/high → 100/300/1000 per arm),
   `max_tokens` (default 4096), `tags` + `tags_match`
   (any / all / any_strict / all_strict / exact), `tag_groups`
-  (and / or / not), `query_timestamp`, `prefer_observations`,
-  `min_scores.final`, `include.entities`, `include.source_facts`, `trace`.
-  Results carry `id`, `text`, `type`, `entities`, `context`, `metadata`,
-  `tags`, `document_id`, ISO `occurred_*` / `mentioned_at`, `scores.final`.
+  (and / or / not, with `resolve: "fuzzy"` leaves), `query_timestamp`,
+  `prefer_observations`, `min_scores.final`, `include.entities`,
+  `include.source_facts`, `include.chunks`, `trace`. Results carry `id`,
+  `text`, `type`, `entities`, `context`, `metadata`, `tags`, `document_id`,
+  `chunk_id`, ISO `occurred_*` / `mentioned_at`, `scores.final`.
 - **Reflect**: `budget` (low/mid/high → 5/10/20 loop rounds; default low),
   `max_tokens`, `context`, `tags` / `tags_match` / `tag_groups`,
   `fact_types`, `response_schema` → `structured_output`,
   `include.facts` → `based_on.memories`.
 - **Banks**: `name`, `reflect_mission` (aliases `mission`, `background`),
-  `disposition`, `retain_mission`, `observations_mission`. A bank configured
-  through this API keeps its mission for reflect only, as Hindsight does.
+  `disposition`, `retain_mission`, `observations_mission`,
+  `enable_observations`, `entity_labels`, `entities_allow_free_form`. A bank
+  configured through this API keeps its mission for reflect only, as
+  Hindsight does. `PATCH .../config` takes those settings under `updates`
+  (plain or `HINDSIGHT_API_*` names) and refuses any other key. Deleting a
+  bank cancels its in-flight retains and consolidation.
+- **Operations**: list by `status` / `type`, retry failed retains. While
+  consolidation has queued work, it appears as one pending `consolidation`
+  operation, so waiting for zero open operations includes observations.
 - **Documents**: fetch (`original_text`, `memory_unit_count`, tags,
   metadata), list, delete (cascades to the document's memories).
 
 Accepted but not acted on (the request succeeds, the option is ignored):
-`observation_scopes`, `strategy`, `resolve_entities`, `include.chunks`
-(no chunk store; `chunk_id` is always null), `min_scores.semantic` /
+`observation_scopes`, `strategy`, `resolve_entities`, `min_scores.semantic` /
 `keyword` / `reranker`, `rerank.prune` / `dedup`, `temporal_window`,
 `exclude_mental_models*`, `apply_all_directives`, `include.tool_calls`
 (`trace` is null), the retain-tuning and retrieval-toggle fields of bank
 create. `usage` is always null. Rejected with a 400: image/file content
-blocks, `tag_groups` leaves with `resolve: "fuzzy"`.
+blocks.
 
 Behavioral differences to know before swapping:
 
@@ -173,8 +187,12 @@ Behavioral differences to know before swapping:
   `HINDSIGHT_API_RERANKER_*`.
 - **Storage is one SQLite file** (`RUSTSIGHT_DB`), not Postgres; existing
   Hindsight data is not migrated — re-retain it.
+- **Chunks differ in two ways.** Retain splits at 3000 tokens where
+  Hindsight splits at 3000 characters, so each chunk holds more text. And
+  `include.chunks` draws on the results that survived `max_tokens`, where
+  Hindsight uses the ranked results from before that cut.
 - Not implemented: mental-model / page / directive / webhook / file-upload
-  / bank-config / delete-bank endpoints, the HTTP MCP endpoint, opinions
+  endpoints, cancelling or deleting operations, the HTTP MCP endpoint, opinions
   via this API (a rustsight-native kind, never returned here).
 
 HTTP API authentication

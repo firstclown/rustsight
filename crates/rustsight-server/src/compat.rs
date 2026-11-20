@@ -7,32 +7,38 @@
 //! unchanged:
 //!
 //! - `GET /health`, `GET /version`
-//! - `GET /v1/default/banks`, `PUT|PATCH /v1/default/banks/{bank_id}`,
-//!   `GET /v1/default/banks/{bank_id}/profile`
+//! - `GET /openapi.json` (the request fields this server acts on)
+//! - `GET /v1/default/banks`, `PUT|PATCH|DELETE /v1/default/banks/{bank_id}`,
+//!   `GET /v1/default/banks/{bank_id}/profile`,
+//!   `GET|PATCH|DELETE /v1/default/banks/{bank_id}/config`
 //! - `POST /v1/default/banks/{bank_id}/memories` (retain, sync or async)
 //! - `POST /v1/default/banks/{bank_id}/memories/recall`
 //! - `POST /v1/default/banks/{bank_id}/reflect`
 //! - `GET /v1/default/banks/{bank_id}/documents`,
 //!   `GET|DELETE /v1/default/banks/{bank_id}/documents/{document_id}`
-//! - `GET /v1/default/banks/{bank_id}/operations/{operation_id}`
+//! - `GET /v1/default/banks/{bank_id}/operations`,
+//!   `GET /v1/default/banks/{bank_id}/operations/{operation_id}`,
+//!   `POST /v1/default/banks/{bank_id}/operations/{operation_id}/retry`
 //!
 //! Shapes follow hindsight-api 1.2.x (`api/http.py`). Errors use FastAPI's
 //! `{"detail": "..."}` body. What is accepted but not acted on is listed in
 //! the README's compatibility matrix.
 
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use rustsight_core::labels::BankLabels;
+use rustsight_core::tag_resolution::{resolve_fuzzy_leaf, tag_vocabulary};
 use rustsight_core::types::*;
-use rustsight_core::{Budget, Engine, Error};
+use rustsight_core::{BankGuard, Budget, Engine, Error};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::Semaphore;
 
 /// The upstream release whose behavior this server mirrors (the prompt pin).
@@ -49,10 +55,36 @@ const RECALL_KINDS: [MemoryKind; 3] = [
     MemoryKind::Observation,
 ];
 
+const DEFAULT_ASYNC_RETAIN_CONCURRENCY: usize = 2;
+const MAX_ASYNC_RETAIN_CONCURRENCY: usize = 64;
+
+/// `RUSTSIGHT_ASYNC_RETAIN_CONCURRENCY`: a whole number, clamped to the
+/// supported range. Anything else falls back to the default with a warning.
+fn parse_retain_concurrency(raw: Option<&str>) -> usize {
+    let Some(raw) = raw.map(str::trim).filter(|r| !r.is_empty()) else {
+        return DEFAULT_ASYNC_RETAIN_CONCURRENCY;
+    };
+    match raw.parse::<usize>() {
+        Ok(n) => n.clamp(1, MAX_ASYNC_RETAIN_CONCURRENCY),
+        Err(_) => {
+            eprintln!(
+                "rustsight: invalid RUSTSIGHT_ASYNC_RETAIN_CONCURRENCY {raw:?}, using {DEFAULT_ASYNC_RETAIN_CONCURRENCY}"
+            );
+            DEFAULT_ASYNC_RETAIN_CONCURRENCY
+        }
+    }
+}
+
 /// Background (async) retains run at most this many at a time; the rest
 /// queue. Each one is a chain of LLM calls, so an unbounded fan-out would
 /// trip provider rate limits.
-static ASYNC_RETAIN_SLOTS: Semaphore = Semaphore::const_new(2);
+fn async_retain_slots() -> &'static Semaphore {
+    static SLOTS: OnceLock<Semaphore> = OnceLock::new();
+    SLOTS.get_or_init(|| {
+        let raw = std::env::var("RUSTSIGHT_ASYNC_RETAIN_CONCURRENCY").ok();
+        Semaphore::new(parse_retain_concurrency(raw.as_deref()))
+    })
+}
 
 /// Routes that need no token (liveness and version probes).
 pub fn public_routes() -> Router {
@@ -62,6 +94,7 @@ pub fn public_routes() -> Router {
         .route("/health/ready", get(health))
         .route("/version", get(version))
         .route("/v1/version", get(version))
+        .route("/openapi.json", get(openapi))
 }
 
 /// Bank-scoped routes; the caller wraps them in the token middleware.
@@ -70,7 +103,13 @@ pub fn routes() -> Router<Arc<Engine>> {
         .route("/v1/default/banks", get(list_banks))
         .route(
             "/v1/default/banks/{bank_id}",
-            put(upsert_bank).patch(upsert_bank),
+            put(upsert_bank).patch(upsert_bank).delete(delete_bank),
+        )
+        .route(
+            "/v1/default/banks/{bank_id}/config",
+            get(get_bank_config)
+                .patch(patch_bank_config)
+                .delete(reset_bank_config),
         )
         .route("/v1/default/banks/{bank_id}/profile", get(bank_profile))
         .route("/v1/default/banks/{bank_id}/memories", post(retain))
@@ -82,8 +121,16 @@ pub fn routes() -> Router<Arc<Engine>> {
             get(get_document).delete(delete_document),
         )
         .route(
+            "/v1/default/banks/{bank_id}/operations",
+            get(list_operations),
+        )
+        .route(
             "/v1/default/banks/{bank_id}/operations/{operation_id}",
             get(get_operation),
+        )
+        .route(
+            "/v1/default/banks/{bank_id}/operations/{operation_id}/retry",
+            post(retry_operation),
         )
 }
 
@@ -177,7 +224,7 @@ async fn version() -> Json<Value> {
             "observations": true,
             "mcp": false,
             "worker": true,
-            "bank_config_api": false,
+            "bank_config_api": true,
             "bank_llm_health": false,
             "file_upload_api": false,
             "document_export_api": false,
@@ -186,6 +233,58 @@ async fn version() -> Json<Value> {
             "llm_trace": false,
             "store_document_text": true,
         },
+    }))
+}
+
+/// The API description, limited to what clients probe for: a recall field
+/// is listed only when this server acts on it, so a client checking for a
+/// feature gets an honest answer.
+async fn openapi() -> Json<Value> {
+    let recall_fields = [
+        "query",
+        "types",
+        "prefer_observations",
+        "budget",
+        "max_tokens",
+        "trace",
+        "query_timestamp",
+        "include",
+        "tags",
+        "tags_match",
+        "tag_groups",
+        "min_scores",
+    ];
+    let properties: Map<String, Value> = recall_fields
+        .iter()
+        .map(|field| (field.to_string(), json!({})))
+        .collect();
+    let bank = "/v1/default/banks/{bank_id}";
+    Json(json!({
+        "openapi": "3.1.0",
+        "info": { "title": "rustsight", "version": HINDSIGHT_API_VERSION },
+        "paths": {
+            "/v1/default/banks": { "get": {} },
+            (bank): { "put": {}, "patch": {}, "delete": {} },
+            (format!("{bank}/config")): { "get": {}, "patch": {}, "delete": {} },
+            (format!("{bank}/profile")): { "get": {} },
+            (format!("{bank}/memories")): { "post": {} },
+            (format!("{bank}/memories/recall")): {
+                "post": { "requestBody": { "content": { "application/json": {
+                    "schema": { "$ref": "#/components/schemas/RecallRequest" }
+                } } } }
+            },
+            (format!("{bank}/reflect")): { "post": {} },
+            (format!("{bank}/documents")): { "get": {} },
+            (format!("{bank}/documents/{{document_id}}")): { "get": {}, "delete": {} },
+            (format!("{bank}/operations")): { "get": {} },
+            (format!("{bank}/operations/{{operation_id}}")): { "get": {} },
+            (format!("{bank}/operations/{{operation_id}}/retry")): { "post": {} },
+        },
+        "components": { "schemas": { "RecallRequest": {
+            "type": "object",
+            "required": ["query"],
+            "properties": properties,
+        } } },
     }))
 }
 
@@ -210,6 +309,9 @@ struct BankBody {
     disposition_empathy: Option<i64>,
     retain_mission: Option<String>,
     observations_mission: Option<String>,
+    enable_observations: Option<bool>,
+    entity_labels: Option<Value>,
+    entities_allow_free_form: Option<bool>,
 }
 
 fn bank_or_default(engine: &Engine, bank_id: &str) -> Result<Bank, ApiError> {
@@ -258,6 +360,9 @@ async fn upsert_bank(
     body: Result<Json<BankBody>, JsonRejection>,
 ) -> ApiResult {
     let Json(body) = body?;
+    if let Some(labels) = &body.entity_labels {
+        BankLabels::parse(Some(labels), true)?;
+    }
     let mut bank = bank_or_default(&engine, &bank_id)?;
     // `reflect_mission` is the current name; `mission` and `background` are
     // upstream's deprecated aliases for it.
@@ -293,10 +398,212 @@ async fn upsert_bank(
             config.insert(key.into(), json!(v));
         }
     }
+    for (key, value) in [
+        ("enable_observations", body.enable_observations),
+        ("entities_allow_free_form", body.entities_allow_free_form),
+    ] {
+        if let Some(v) = value {
+            config.insert(key.into(), json!(v));
+        }
+    }
+    if let Some(labels) = body.entity_labels {
+        config.insert("entity_labels".into(), labels);
+    }
     engine
         .store
         .set_bank_config(&bank_id, &Value::Object(config))?;
+    // Observations may have just been switched back on.
+    engine.wake_worker();
     Ok(Json(profile_json(&engine, &bank)?))
+}
+
+async fn delete_bank(State(engine): State<Arc<Engine>>, Path(bank_id): Path<String>) -> ApiResult {
+    let deleted = engine.delete_bank(&bank_id).await?;
+    Ok(Json(json!({
+        "success": true,
+        "message": format!("Bank '{bank_id}' and all associated data deleted successfully"),
+        "deleted_count": deleted.memories + deleted.entities + deleted.documents,
+    })))
+}
+
+// ── Bank config ──────────────────────────────────────────────────────────
+
+/// The per-bank settings this server acts on. Anything else is refused:
+/// accepting a setting that changes nothing would misreport what ran.
+const CONFIG_KEYS: [&str; 9] = [
+    "retain_mission",
+    "observations_mission",
+    "reflect_mission",
+    "enable_observations",
+    "entity_labels",
+    "entities_allow_free_form",
+    "disposition_skepticism",
+    "disposition_literalism",
+    "disposition_empathy",
+];
+
+fn is_config_key(key: &str) -> bool {
+    CONFIG_KEYS.contains(&key)
+}
+
+/// Upstream accepts both `retain_mission` and `HINDSIGHT_API_RETAIN_MISSION`.
+fn config_key(raw: &str) -> String {
+    let lower = raw.to_lowercase();
+    lower
+        .strip_prefix("hindsight_api_")
+        .unwrap_or(&lower)
+        .to_string()
+}
+
+#[derive(Deserialize)]
+struct BankConfigUpdate {
+    updates: Map<String, Value>,
+}
+
+fn bank_config_map(engine: &Engine, bank_id: &str) -> Result<Map<String, Value>, ApiError> {
+    Ok(match engine.store.bank_config(bank_id)? {
+        Value::Object(map) => map,
+        _ => Map::new(),
+    })
+}
+
+fn bank_config_json(engine: &Engine, bank: &Bank) -> Result<Value, ApiError> {
+    let stored = bank_config_map(engine, &bank.id)?;
+    let overrides: Map<String, Value> = stored
+        .iter()
+        .filter(|(key, _)| is_config_key(key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let setting = |key: &str, default: Value| stored.get(key).cloned().unwrap_or(default);
+    Ok(json!({
+        "bank_id": bank.id,
+        "config": {
+            "retain_mission": setting("retain_mission", Value::Null),
+            "observations_mission": setting("observations_mission", Value::Null),
+            "reflect_mission": bank.mission,
+            "enable_observations": setting("enable_observations", json!(true)),
+            "entity_labels": setting("entity_labels", Value::Null),
+            "entities_allow_free_form": setting("entities_allow_free_form", json!(true)),
+            "disposition_skepticism": bank.disposition.skepticism,
+            "disposition_literalism": bank.disposition.literalism,
+            "disposition_empathy": bank.disposition.empathy,
+        },
+        "overrides": overrides,
+    }))
+}
+
+/// Validate one update and apply it to the in-memory bank; nothing is
+/// stored until every update in the request has passed.
+fn apply_config_update(bank: &mut Bank, key: &str, value: &Value) -> Result<(), ApiError> {
+    let wrong_type = |expected: &str| ApiError::bad_request(format!("{key} must be {expected}"));
+    match key {
+        "retain_mission" | "observations_mission" | "reflect_mission" => {
+            if !(value.is_string() || value.is_null()) {
+                return Err(wrong_type("a string or null"));
+            }
+            if key == "reflect_mission" {
+                bank.mission = value
+                    .as_str()
+                    .filter(|m| !m.trim().is_empty())
+                    .map(str::to_string);
+            }
+        }
+        "enable_observations" | "entities_allow_free_form" => {
+            if !(value.is_boolean() || value.is_null()) {
+                return Err(wrong_type("a boolean or null"));
+            }
+        }
+        "entity_labels" => {
+            BankLabels::parse(Some(value), true)?;
+        }
+        _ => {
+            let name = key.trim_start_matches("disposition_");
+            let defaults = Disposition::default();
+            let (slot, default) = match name {
+                "skepticism" => (&mut bank.disposition.skepticism, defaults.skepticism),
+                "literalism" => (&mut bank.disposition.literalism, defaults.literalism),
+                _ => (&mut bank.disposition.empathy, defaults.empathy),
+            };
+            *slot = match value {
+                Value::Null => default,
+                other => {
+                    let raw = other.as_i64().ok_or_else(|| wrong_type("an integer"))?;
+                    trait_value(name, raw).map_err(|ApiError(_, m)| ApiError::bad_request(m))?
+                }
+            };
+        }
+    }
+    Ok(())
+}
+
+fn store_bank_settings(
+    engine: &Engine,
+    bank: &Bank,
+    mut config: Map<String, Value>,
+) -> Result<(), ApiError> {
+    // A bank configured through this API follows Hindsight's mission split.
+    config.insert("mission_scope".into(), json!("reflect"));
+    engine.store.ensure_bank(bank)?;
+    engine.store.update_bank(bank)?;
+    engine
+        .store
+        .set_bank_config(&bank.id, &Value::Object(config))?;
+    engine.wake_worker();
+    Ok(())
+}
+
+async fn get_bank_config(
+    State(engine): State<Arc<Engine>>,
+    Path(bank_id): Path<String>,
+) -> ApiResult {
+    let bank = bank_or_default(&engine, &bank_id)?;
+    Ok(Json(bank_config_json(&engine, &bank)?))
+}
+
+async fn patch_bank_config(
+    State(engine): State<Arc<Engine>>,
+    Path(bank_id): Path<String>,
+    body: Result<Json<BankConfigUpdate>, JsonRejection>,
+) -> ApiResult {
+    let Json(body) = body?;
+    let mut bank = bank_or_default(&engine, &bank_id)?;
+    let mut config = bank_config_map(&engine, &bank_id)?;
+    for (raw_key, value) in &body.updates {
+        let key = config_key(raw_key);
+        if !is_config_key(&key) {
+            return Err(ApiError::bad_request(format!(
+                "Unsupported bank config key {raw_key:?}; supported keys: {}",
+                CONFIG_KEYS.join(", ")
+            )));
+        }
+        apply_config_update(&mut bank, &key, value)?;
+        if value.is_null() {
+            config.remove(&key);
+        } else {
+            config.insert(key, value.clone());
+        }
+    }
+    store_bank_settings(&engine, &bank, config)?;
+    Ok(Json(bank_config_json(&engine, &bank)?))
+}
+
+async fn reset_bank_config(
+    State(engine): State<Arc<Engine>>,
+    Path(bank_id): Path<String>,
+) -> ApiResult {
+    let mut bank = bank_or_default(&engine, &bank_id)?;
+    let mut config = bank_config_map(&engine, &bank_id)?;
+    let overridden: Vec<String> = config
+        .keys()
+        .filter(|key| is_config_key(key))
+        .cloned()
+        .collect();
+    for key in overridden {
+        apply_config_update(&mut bank, &key, &Value::Null)?;
+        config.remove(&key);
+    }
+    store_bank_settings(&engine, &bank, config)?;
+    Ok(Json(bank_config_json(&engine, &bank)?))
 }
 
 async fn bank_profile(State(engine): State<Arc<Engine>>, Path(bank_id): Path<String>) -> ApiResult {
@@ -539,6 +846,7 @@ fn assign_document_ids(items: &mut [Value]) {
 /// rest append to it.
 async fn run_retain(
     engine: &Engine,
+    guard: &BankGuard,
     bank_id: &str,
     items: &[Value],
     document_tags: &[String],
@@ -562,18 +870,21 @@ async fn run_retain(
             item.update_mode.unwrap_or_default()
         };
         engine
-            .retain(RetainRequest {
-                bank_id: bank_id.to_string(),
-                content: item.content,
-                context: item.context,
-                timestamp_ms: item.timestamp_ms,
-                timestamp_unset: item.timestamp_unset,
-                document_id: item.document_id,
-                update_mode,
-                tags,
-                metadata: item.metadata,
-                entities: item.entities,
-            })
+            .retain_guarded(
+                guard,
+                RetainRequest {
+                    bank_id: bank_id.to_string(),
+                    content: item.content,
+                    context: item.context,
+                    timestamp_ms: item.timestamp_ms,
+                    timestamp_unset: item.timestamp_unset,
+                    document_id: item.document_id,
+                    update_mode,
+                    tags,
+                    metadata: item.metadata,
+                    entities: item.entities,
+                },
+            )
             .await?;
     }
     Ok(items.len())
@@ -595,7 +906,14 @@ async fn finish_operation(engine: &Engine, mut op: Operation, outcome: Result<us
 
 fn spawn_operation(engine: Arc<Engine>, op: Operation) {
     tokio::spawn(async move {
-        let _slot = ASYNC_RETAIN_SLOTS.acquire().await;
+        let _slot = async_retain_slots().acquire().await;
+        // Held through the final status write, so a bank delete either
+        // waits for that write or removes the operation before it starts.
+        let guard = engine.bank_read(&op.bank_id).await;
+        match engine.store.get_operation(&op.id) {
+            Ok(Some(current)) if current.status == "pending" => {}
+            _ => return,
+        }
         let items: Vec<Value> = op
             .payload
             .get("items")
@@ -607,7 +925,7 @@ fn spawn_operation(engine: Arc<Engine>, op: Operation) {
             "document_tags",
         )
         .unwrap_or_default();
-        let outcome = run_retain(&engine, &op.bank_id, &items, &document_tags).await;
+        let outcome = run_retain(&engine, &guard, &op.bank_id, &items, &document_tags).await;
         if let Err(ApiError(_, detail)) = &outcome {
             eprintln!(
                 "rustsight: async retain {} (bank {}) failed: {detail}",
@@ -653,7 +971,8 @@ async fn retain(
     let document_tags = body.document_tags.clone().unwrap_or_default();
 
     if !body.is_async {
-        let count = run_retain(&engine, &bank_id, &body.items, &document_tags).await?;
+        let guard = engine.bank_read(&bank_id).await;
+        let count = run_retain(&engine, &guard, &bank_id, &body.items, &document_tags).await?;
         return Ok(Json(json!({
             "success": true,
             "bank_id": bank_id,
@@ -702,10 +1021,155 @@ async fn retain(
     })))
 }
 
+/// Consolidation runs as a queue rather than as operation rows. While a bank
+/// has work queued it is reported as one pending operation under this id, so
+/// a client waiting for "no operations left" also waits for observations.
+fn consolidation_operation_id(bank_id: &str) -> String {
+    format!("consolidation-{bank_id}")
+}
+
+fn consolidation_pending(engine: &Engine, bank_id: &str) -> Result<bool, ApiError> {
+    Ok(engine.observations_enabled(bank_id)? && engine.store.count_dirty_entities(bank_id)? > 0)
+}
+
+fn operation_json(op: &Operation) -> Value {
+    let items = op.payload.get("items").and_then(|v| v.as_array());
+    let mut documents = items
+        .into_iter()
+        .flatten()
+        .map(|item| item.get("document_id").and_then(|d| d.as_str()));
+    let first = documents.next().flatten();
+    let document_id = first.filter(|_| documents.all(|d| d == first));
+    json!({
+        "id": op.id,
+        "task_type": op.kind,
+        "items_count": items.map_or(0, Vec::len),
+        "document_id": document_id,
+        "created_at": iso(op.created_at_ms),
+        "updated_at": iso(op.updated_at_ms),
+        "completed_at": if op.status == "pending" { None } else { iso(op.updated_at_ms) },
+        "status": op.status,
+        "error_message": op.error,
+    })
+}
+
+#[derive(Deserialize)]
+struct OperationsQuery {
+    status: Option<String>,
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+async fn list_operations(
+    State(engine): State<Arc<Engine>>,
+    Path(bank_id): Path<String>,
+    Query(query): Query<OperationsQuery>,
+) -> ApiResult {
+    let limit = query.limit.unwrap_or(20);
+    if !(1..=100).contains(&limit) {
+        return Err(ApiError::unprocessable("limit must be between 1 and 100"));
+    }
+    let offset = query.offset.unwrap_or(0);
+    let status = query.status.as_deref();
+    let kind = query.kind.as_deref();
+    let consolidating = matches!(status, None | Some("pending"))
+        && matches!(kind, None | Some("consolidation"))
+        && consolidation_pending(&engine, &bank_id)?;
+    let synthetic = usize::from(consolidating);
+    // The consolidation entry sits first, ahead of the stored rows.
+    let stored_offset = offset.saturating_sub(synthetic);
+    let stored_limit = limit - usize::from(consolidating && offset == 0);
+    let (rows, stored_total) =
+        engine
+            .store
+            .list_operations(&bank_id, status, kind, stored_limit, stored_offset)?;
+    let mut operations = Vec::with_capacity(limit);
+    if consolidating && offset == 0 {
+        let now = iso(engine.clock.now_ms());
+        operations.push(json!({
+            "id": consolidation_operation_id(&bank_id),
+            "task_type": "consolidation",
+            "items_count": 0,
+            "document_id": Value::Null,
+            "created_at": now,
+            "updated_at": now,
+            "completed_at": Value::Null,
+            "status": "pending",
+            "error_message": Value::Null,
+        }));
+    }
+    operations.extend(rows.iter().map(operation_json));
+    Ok(Json(json!({
+        "bank_id": bank_id,
+        "total": stored_total + synthetic,
+        "limit": limit,
+        "offset": offset,
+        "operations": operations,
+    })))
+}
+
+async fn retry_operation(
+    State(engine): State<Arc<Engine>>,
+    Path((bank_id, operation_id)): Path<(String, String)>,
+) -> ApiResult {
+    if uuid::Uuid::parse_str(&operation_id).is_err() {
+        return Err(ApiError::bad_request(format!(
+            "Invalid operation_id: {operation_id}"
+        )));
+    }
+    // Under the bank guard so a concurrent delete cannot be undone by the
+    // status write below.
+    let guard = engine.bank_read(&bank_id).await;
+    let mut op = engine
+        .store
+        .get_operation(&operation_id)?
+        .filter(|op| op.bank_id == bank_id)
+        .ok_or_else(|| ApiError::not_found(format!("Operation {operation_id} not found")))?;
+    if op.status != "failed" {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            format!(
+                "Operation {operation_id} is {} and cannot be retried",
+                op.status
+            ),
+        ));
+    }
+    op.status = "pending".into();
+    op.error = None;
+    op.updated_at_ms = engine.clock.now_ms();
+    engine.store.upsert_operation(&op)?;
+    drop(guard);
+    spawn_operation(Arc::clone(&engine), op);
+    Ok(Json(json!({
+        "success": true,
+        "message": format!("Operation {operation_id} queued for retry"),
+        "operation_id": operation_id,
+    })))
+}
+
 async fn get_operation(
     State(engine): State<Arc<Engine>>,
     Path((bank_id, operation_id)): Path<(String, String)>,
 ) -> ApiResult {
+    if operation_id == consolidation_operation_id(&bank_id) {
+        let status = if consolidation_pending(&engine, &bank_id)? {
+            "pending"
+        } else {
+            "completed"
+        };
+        return Ok(Json(json!({
+            "operation_id": operation_id,
+            "id": operation_id,
+            "status": status,
+            "operation_type": "consolidation",
+            "created_at": Value::Null,
+            "updated_at": Value::Null,
+            "completed_at": Value::Null,
+            "error_message": Value::Null,
+        })));
+    }
     let op = engine
         .store
         .get_operation(&operation_id)?
@@ -740,43 +1204,70 @@ fn parse_tags_match(raw: Option<&str>, default: TagsMatch) -> Result<TagsMatch, 
     }
 }
 
-fn parse_tag_group(v: &Value) -> Result<TagGroup, ApiError> {
+/// The bank's tag vocabulary, read only if a fuzzy leaf asks for it and at
+/// most once per request.
+struct TagVocabulary<'a> {
+    engine: &'a Engine,
+    bank_id: &'a str,
+    tags: Option<Vec<String>>,
+}
+
+impl TagVocabulary<'_> {
+    fn get(&mut self) -> Result<&[String], ApiError> {
+        if self.tags.is_none() {
+            let index = self.engine.store.tag_index(self.bank_id)?;
+            self.tags = Some(tag_vocabulary(&index).map_err(ApiError::unprocessable)?);
+        }
+        Ok(self.tags.as_deref().unwrap_or_default())
+    }
+}
+
+fn parse_tag_group_list(
+    v: &Value,
+    vocabulary: &mut TagVocabulary<'_>,
+) -> Result<Vec<TagGroup>, ApiError> {
+    v.as_array()
+        .ok_or_else(|| ApiError::unprocessable("tag group 'and'/'or' must be a list"))?
+        .iter()
+        .map(|group| parse_tag_group(group, vocabulary))
+        .collect()
+}
+
+fn parse_tag_group(v: &Value, vocabulary: &mut TagVocabulary<'_>) -> Result<TagGroup, ApiError> {
     let obj = v
         .as_object()
         .ok_or_else(|| ApiError::unprocessable("each tag group must be an object"))?;
-    let list = |v: &Value| -> Result<Vec<TagGroup>, ApiError> {
-        v.as_array()
-            .ok_or_else(|| ApiError::unprocessable("tag group 'and'/'or' must be a list"))?
-            .iter()
-            .map(parse_tag_group)
-            .collect()
-    };
     if let Some(inner) = obj.get("and") {
-        return Ok(TagGroup::And(list(inner)?));
+        return Ok(TagGroup::And(parse_tag_group_list(inner, vocabulary)?));
     }
     if let Some(inner) = obj.get("or") {
-        return Ok(TagGroup::Or(list(inner)?));
+        return Ok(TagGroup::Or(parse_tag_group_list(inner, vocabulary)?));
     }
     if let Some(inner) = obj.get("not") {
-        return Ok(TagGroup::Not(Box::new(parse_tag_group(inner)?)));
+        return Ok(TagGroup::Not(Box::new(parse_tag_group(inner, vocabulary)?)));
     }
-    if obj.get("resolve").and_then(|r| r.as_str()) == Some("fuzzy") {
-        return Err(ApiError::bad_request(
-            "tag group resolve='fuzzy' is not supported by this server",
-        ));
+    let tags = string_list(obj.get("tags").unwrap_or(&Value::Null), "tags")?;
+    // A leaf defaults to any_strict upstream (unlike the flat filter).
+    let mode = parse_tags_match(
+        obj.get("match").and_then(|m| m.as_str()),
+        TagsMatch::AnyStrict,
+    )?;
+    match obj.get("resolve") {
+        None | Some(Value::Null) => Ok(TagGroup::Leaf { tags, mode }),
+        Some(Value::String(r)) if r == "exact" => Ok(TagGroup::Leaf { tags, mode }),
+        Some(Value::String(r)) if r == "fuzzy" => {
+            resolve_fuzzy_leaf(tags, mode, vocabulary.get()?).map_err(ApiError::unprocessable)
+        }
+        Some(other) => Err(ApiError::unprocessable(format!(
+            "tag group resolve must be 'exact' or 'fuzzy', got {other}"
+        ))),
     }
-    Ok(TagGroup::Leaf {
-        tags: string_list(obj.get("tags").unwrap_or(&Value::Null), "tags")?,
-        // A leaf defaults to any_strict upstream (unlike the flat filter).
-        mode: parse_tags_match(
-            obj.get("match").and_then(|m| m.as_str()),
-            TagsMatch::AnyStrict,
-        )?,
-    })
 }
 
 /// The request's tag scope from `tags` + `tags_match`, or `tag_groups`.
 fn tag_filter(
+    engine: &Engine,
+    bank_id: &str,
     tags: &Option<Value>,
     tags_match: Option<&str>,
     tag_groups: &Option<Vec<Value>>,
@@ -787,6 +1278,11 @@ fn tag_filter(
             "'tags' and 'tag_groups' are mutually exclusive. Use 'tag_groups' for compound filtering.",
         ));
     }
+    let mut vocabulary = TagVocabulary {
+        engine,
+        bank_id,
+        tags: None,
+    };
     let filter = TagFilter {
         tags: match tags {
             Some(v) => string_list(v, "tags")?,
@@ -796,7 +1292,7 @@ fn tag_filter(
         groups: match tag_groups {
             Some(groups) => groups
                 .iter()
-                .map(parse_tag_group)
+                .map(|group| parse_tag_group(group, &mut vocabulary))
                 .collect::<Result<_, _>>()?,
             None => vec![],
         },
@@ -831,6 +1327,8 @@ struct RecallInclude {
     entities: Option<Option<MaxTokens>>,
     #[serde(default)]
     source_facts: Option<MaxTokens>,
+    #[serde(default)]
+    chunks: Option<MaxTokens>,
 }
 
 /// Deserialize a field so that an explicit `null` is distinguishable from
@@ -904,6 +1402,76 @@ fn fact_json(m: &MemoryRef, entity_names: &HashMap<String, String>) -> Value {
     })
 }
 
+/// The longest prefix of `text` within `max_tokens`.
+fn truncate_to_tokens(engine: &Engine, text: &str, max_tokens: usize) -> String {
+    let boundaries: Vec<usize> = text
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain([text.len()])
+        .collect();
+    let (mut fits, mut too_long) = (0, boundaries.len());
+    while too_long - fits > 1 {
+        let middle = (fits + too_long) / 2;
+        if engine.tokens.count(&text[..boundaries[middle]]) <= max_tokens {
+            fits = middle;
+        } else {
+            too_long = middle;
+        }
+    }
+    text[..boundaries[fits]].to_string()
+}
+
+/// Source chunks for ranked results, best result first, each chunk once. An
+/// observation contributes the chunks of its evidence at its own rank. The
+/// chunk that crosses the budget is cut to fit and ends the list. Under a
+/// tag scope a chunk is visible only if its document is: it can hold text
+/// from outside the scope that the fact extracted from it does not.
+fn recall_chunks(
+    engine: &Engine,
+    bank_id: &str,
+    ordered_ids: &[String],
+    scope: Option<&TagFilter>,
+    max_tokens: usize,
+) -> Result<Map<String, Value>, ApiError> {
+    let mut chunks: HashMap<String, Chunk> = engine
+        .store
+        .get_chunks(bank_id, ordered_ids)?
+        .into_iter()
+        .map(|chunk| (chunk.id.clone(), chunk))
+        .collect();
+    let mut remaining = max_tokens;
+    let mut out = Map::new();
+    for id in ordered_ids {
+        if remaining == 0 {
+            break;
+        }
+        let Some(chunk) = chunks.remove(id) else {
+            continue;
+        };
+        if scope.is_some_and(|f| !f.matches(&chunk.document_tags)) {
+            continue;
+        }
+        let cost = engine.tokens.count(&chunk.text);
+        let truncated = cost > remaining;
+        let text = if truncated {
+            truncate_to_tokens(engine, &chunk.text, remaining)
+        } else {
+            chunk.text
+        };
+        remaining = if truncated { 0 } else { remaining - cost };
+        out.insert(
+            chunk.id.clone(),
+            json!({
+                "id": chunk.id,
+                "text": text,
+                "chunk_index": chunk.chunk_index,
+                "truncated": truncated,
+            }),
+        );
+    }
+    Ok(out)
+}
+
 async fn recall(
     State(engine): State<Arc<Engine>>,
     Path(bank_id): Path<String>,
@@ -930,7 +1498,14 @@ async fn recall(
     };
     let budget = parse_budget(body.budget.as_deref(), Budget::Mid)?;
     let max_tokens = body.max_tokens.unwrap_or(4096).max(1);
-    let tags = tag_filter(&body.tags, body.tags_match.as_deref(), &body.tag_groups)?;
+    let tags = tag_filter(
+        &engine,
+        &bank_id,
+        &body.tags,
+        body.tags_match.as_deref(),
+        &body.tag_groups,
+    )?;
+    let chunk_scope = tags.clone();
 
     let response = engine
         .recall(RecallRequest {
@@ -956,6 +1531,7 @@ async fn recall(
     let has_observations = memories.iter().any(|m| m.kind == MemoryKind::Observation);
     let want_source_facts = body.include.source_facts.is_some();
     let include_entities = !matches!(body.include.entities, Some(None));
+    let want_chunks = body.include.chunks.is_some();
     let observations = if has_observations || include_entities {
         engine.store.observations_for_bank(&bank_id)?
     } else {
@@ -990,6 +1566,36 @@ async fn recall(
         .map(|e| (e.id, e.name))
         .collect();
 
+    // Facts in rank order, with an observation standing in for its evidence.
+    let ranked_fact_ids: Vec<String> = memories
+        .iter()
+        .flat_map(|m| match evidence_of.get(m.id.as_str()) {
+            Some(evidence) if m.kind == MemoryKind::Observation => {
+                evidence.iter().map(|id| id.to_string()).collect()
+            }
+            _ => vec![m.id.clone()],
+        })
+        .collect();
+    let chunk_of = engine.store.memory_chunk_ids(&bank_id, &ranked_fact_ids)?;
+    let chunks = match &body.include.chunks {
+        Some(options) => {
+            let mut seen = HashSet::new();
+            let ordered: Vec<String> = ranked_fact_ids
+                .iter()
+                .filter_map(|id| chunk_of.get(id))
+                .filter(|id| seen.insert(id.as_str()))
+                .cloned()
+                .collect();
+            let budget = options.max_tokens.unwrap_or(8192).max(0) as usize;
+            recall_chunks(&engine, &bank_id, &ordered, chunk_scope.as_ref(), budget)?
+        }
+        None => Map::new(),
+    };
+    let with_chunk_id = |mut fact: Value, id: &str| {
+        fact["chunk_id"] = json!(chunk_of.get(id));
+        fact
+    };
+
     let mut results: Vec<Value> = Vec::with_capacity(memories.len());
     let mut source_facts = Map::new();
     let mut source_facts_truncated = false;
@@ -1000,7 +1606,7 @@ async fn recall(
         .map(|s| s.max_tokens.unwrap_or(4096))
         .unwrap_or(0);
     for m in &memories {
-        let mut fact = fact_json(m, &entity_names);
+        let mut fact = with_chunk_id(fact_json(m, &entity_names), &m.id);
         fact["scores"] = json!({ "final": m.score });
         if want_source_facts && m.kind == MemoryKind::Observation {
             let ids: Vec<String> = evidence_of
@@ -1021,7 +1627,10 @@ async fn recall(
                 if source_budget >= 0 {
                     source_budget -= cost;
                 }
-                source_facts.insert(source.id.clone(), fact_json(&source, &entity_names));
+                source_facts.insert(
+                    source.id.clone(),
+                    with_chunk_id(fact_json(&source, &entity_names), &source.id),
+                );
             }
             fact["source_fact_ids"] = json!(ids);
         }
@@ -1082,7 +1691,7 @@ async fn recall(
         "results": results,
         "trace": trace,
         "entities": entities,
-        "chunks": Value::Null,
+        "chunks": if want_chunks { Value::Object(chunks) } else { Value::Null },
         "source_facts": if want_source_facts { Value::Object(source_facts) } else { Value::Null },
         "source_facts_truncated": want_source_facts.then_some(source_facts_truncated),
     })))
@@ -1145,7 +1754,13 @@ async fn reflect(
         context,
         max_rounds: Some(engine.reflect_rounds_for_budget(budget)),
         max_tokens: Some(body.max_tokens.unwrap_or(4096).max(1)),
-        tags: tag_filter(&body.tags, body.tags_match.as_deref(), &body.tag_groups)?,
+        tags: tag_filter(
+            &engine,
+            &bank_id,
+            &body.tags,
+            body.tags_match.as_deref(),
+            &body.tag_groups,
+        )?,
         kinds,
         response_schema: body.response_schema,
     };
@@ -1310,6 +1925,368 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["success"], true);
         assert_eq!(body["async"], false);
+    }
+
+    async fn wait_for_operation(app: &Router, bank: &str, id: &str) -> Value {
+        let uri = format!("/v1/default/banks/{bank}/operations/{id}");
+        for _ in 0..500 {
+            let state = call(app, Method::GET, &uri, None).await.1;
+            if state["status"] != "pending" {
+                return state;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("operation {id} did not finish");
+    }
+
+    fn scripted_engine(responses: Vec<&str>) -> Arc<Engine> {
+        let responses = responses
+            .into_iter()
+            .map(|content| rustsight_core::LlmResponse {
+                content: Some(content.to_string()),
+                ..Default::default()
+            })
+            .collect();
+        Arc::new(Engine::new(
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+            Arc::new(MockLlm::script(responses)),
+            Arc::new(MockEmbed::default()),
+            Arc::new(MockRerank),
+            Arc::new(SimpleTokenEstimator),
+            Arc::new(SystemClock),
+        ))
+    }
+
+    #[test]
+    fn retain_concurrency_parses_clamps_and_falls_back() {
+        assert_eq!(parse_retain_concurrency(None), 2);
+        assert_eq!(parse_retain_concurrency(Some(" 8 ")), 8);
+        assert_eq!(parse_retain_concurrency(Some("0")), 1);
+        assert_eq!(parse_retain_concurrency(Some("9999")), 64);
+        assert_eq!(parse_retain_concurrency(Some("many")), 2);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_bank_removes_everything_and_a_recreated_bank_is_empty() {
+        let engine = engine();
+        let app = app(&engine);
+        retain_one(
+            &app,
+            "gone",
+            json!({"content": "Alice joined Google.", "document_id": "d1"}),
+        )
+        .await;
+        retain_one(&app, "kept", json!({"content": "Bob moved to Oslo."})).await;
+        let (status, body) = call(&app, Method::DELETE, "/v1/default/banks/gone", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["deleted_count"].as_u64().unwrap() > 0);
+        assert!(engine.store.get_bank("gone").unwrap().is_none());
+        assert!(!engine.store.list_memories("kept", 10).unwrap().is_empty());
+
+        call(&app, Method::PUT, "/v1/default/banks/gone", Some(json!({}))).await;
+        let (_, recalled) = call(
+            &app,
+            Method::POST,
+            "/v1/default/banks/gone/memories/recall",
+            Some(json!({"query": "Where does Alice work?"})),
+        )
+        .await;
+        assert_eq!(recalled["results"], json!([]));
+        let (status, again) = call(&app, Method::DELETE, "/v1/default/banks/never", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(again["deleted_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn operations_list_and_retry_a_failed_retain() {
+        let engine = scripted_engine(vec!["not json", "not json"]);
+        let app = app(&engine);
+        let id = "6f1c1fb0-1111-4a55-9d0a-1c7f5a3d2e11";
+        let (status, _) = call(
+            &app,
+            Method::POST,
+            "/v1/default/banks/ops/memories",
+            Some(json!({
+                "items": [{"content": "word", "document_id": "d1"}],
+                "async": true,
+                "operation_id": id,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            wait_for_operation(&app, "ops", id).await["status"],
+            "failed"
+        );
+
+        let (_, listed) = call(
+            &app,
+            Method::GET,
+            "/v1/default/banks/ops/operations?status=failed&limit=1",
+            None,
+        )
+        .await;
+        assert_eq!(listed["total"], 1);
+        let op = &listed["operations"][0];
+        assert_eq!(op["id"], id);
+        assert_eq!(op["task_type"], "retain");
+        assert_eq!(op["items_count"], 1);
+        assert_eq!(op["document_id"], "d1");
+        assert!(op["error_message"].is_string());
+
+        let retry = format!("/v1/default/banks/ops/operations/{id}/retry");
+        let (status, body) = call(&app, Method::POST, &retry, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["operation_id"], id);
+        wait_for_operation(&app, "ops", id).await;
+        let (status, _) = call(
+            &app,
+            Method::POST,
+            "/v1/default/banks/ops/operations/nope/retry",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn queued_consolidation_counts_as_an_open_operation_only_when_enabled() {
+        let engine = engine();
+        let app = app(&engine);
+        retain_one(&app, "b", json!({"content": "Alice joined Google."})).await;
+        let list = "/v1/default/banks/b/operations?limit=1";
+        let (_, listed) = call(&app, Method::GET, list, None).await;
+        assert_eq!(listed["total"], 1);
+        assert_eq!(listed["operations"][0]["task_type"], "consolidation");
+
+        call(
+            &app,
+            Method::PUT,
+            "/v1/default/banks/b",
+            Some(json!({"enable_observations": false})),
+        )
+        .await;
+        let (_, listed) = call(&app, Method::GET, list, None).await;
+        assert_eq!(listed["total"], 0);
+        assert_eq!(engine.consolidate_once("b", 10).await.unwrap(), 0);
+        assert!(engine.store.observations_for_bank("b").unwrap().is_empty());
+        assert!(engine.store.count_dirty_entities("b").unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn recall_returns_source_chunks_within_budget_and_tag_scope() {
+        let engine = engine();
+        let app = app(&engine);
+        retain_one(
+            &app,
+            "c",
+            json!({"content": "Alice joined Google today.", "document_id": "d1", "tags": ["a"]}),
+        )
+        .await;
+        let recall = "/v1/default/banks/c/memories/recall";
+        let (_, body) = call(
+            &app,
+            Method::POST,
+            recall,
+            Some(json!({"query": "Alice", "include": {"chunks": {"max_tokens": 100}}})),
+        )
+        .await;
+        let chunk_id = body["results"][0]["chunk_id"].as_str().unwrap().to_string();
+        assert_eq!(chunk_id, "c_d1_0");
+        assert_eq!(
+            body["chunks"][&chunk_id]["text"],
+            "Alice joined Google today."
+        );
+        assert_eq!(body["chunks"][&chunk_id]["truncated"], false);
+
+        let (_, body) = call(
+            &app,
+            Method::POST,
+            recall,
+            Some(json!({"query": "Alice", "include": {"chunks": {"max_tokens": 1}}})),
+        )
+        .await;
+        assert_eq!(body["chunks"][&chunk_id]["truncated"], true);
+        let cut = body["chunks"][&chunk_id]["text"].as_str().unwrap();
+        assert!(cut.len() < "Alice joined Google today.".len());
+
+        let (_, body) = call(
+            &app,
+            Method::POST,
+            recall,
+            Some(json!({
+                "query": "Alice",
+                "tags": ["a", "other"],
+                "tags_match": "any",
+                "include": {"chunks": {}},
+            })),
+        )
+        .await;
+        assert!(body["chunks"].get(&chunk_id).is_some());
+        let (_, without) = call(&app, Method::POST, recall, Some(json!({"query": "Alice"}))).await;
+        assert_eq!(without["chunks"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn appended_content_gets_the_next_chunk_and_replace_starts_over() {
+        let engine = engine();
+        let app = app(&engine);
+        let chunk_ids = |engine: &Arc<Engine>| {
+            let memories: Vec<String> = engine
+                .store
+                .list_memories("c", 10)
+                .unwrap()
+                .into_iter()
+                .map(|m| m.id)
+                .collect();
+            let found = engine.store.memory_chunk_ids("c", &memories).unwrap();
+            let mut ids: Vec<String> = found.into_values().collect();
+            ids.sort();
+            ids.dedup();
+            ids
+        };
+        retain_one(
+            &app,
+            "c",
+            json!({"content": "Alice joined Google.", "document_id": "d"}),
+        )
+        .await;
+        retain_one(
+            &app,
+            "c",
+            json!({"content": "Bob moved to Oslo.", "document_id": "d", "update_mode": "append"}),
+        )
+        .await;
+        assert_eq!(chunk_ids(&engine), vec!["c_d_0", "c_d_1"]);
+        retain_one(
+            &app,
+            "c",
+            json!({"content": "Carol sails.", "document_id": "d"}),
+        )
+        .await;
+        assert_eq!(chunk_ids(&engine), vec!["c_d_0"]);
+    }
+
+    struct HangingLlm;
+
+    #[async_trait::async_trait]
+    impl rustsight_core::LlmProvider for HangingLlm {
+        async fn complete(
+            &self,
+            _req: &rustsight_core::LlmRequest,
+        ) -> rustsight_core::Result<rustsight_core::LlmResponse> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_a_bank_cancels_its_running_retain_without_leftovers() {
+        let engine = Arc::new(Engine::new(
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+            Arc::new(HangingLlm),
+            Arc::new(MockEmbed::default()),
+            Arc::new(MockRerank),
+            Arc::new(SimpleTokenEstimator),
+            Arc::new(SystemClock),
+        ));
+        let app = app(&engine);
+        let id = "7a2c1fb0-2222-4a55-9d0a-1c7f5a3d2e11";
+        call(
+            &app,
+            Method::POST,
+            "/v1/default/banks/busy/memories",
+            Some(json!({"items": [{"content": "word"}], "async": true, "operation_id": id})),
+        )
+        .await;
+        for _ in 0..200 {
+            if engine.store.get_bank("busy").unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let deleted = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            call(&app, Method::DELETE, "/v1/default/banks/busy", None),
+        )
+        .await
+        .expect("delete must not wait for the provider");
+        assert_eq!(deleted.0, StatusCode::OK);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(engine.store.get_operation(id).unwrap().is_none());
+        assert!(engine.store.get_bank("busy").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn config_labels_become_tags_that_fuzzy_filters_find() {
+        let extraction = r#"{"facts":[{"what":"Kubernetes runs the cluster","fact_type":"world",
+            "entities":["Kubernetes"],"labels":{"name":["kubernetes"]}}]}"#;
+        let engine = scripted_engine(vec![extraction]);
+        let app = app(&engine);
+        let config = "/v1/default/banks/l/config";
+        let (status, body) = call(
+            &app,
+            Method::PATCH,
+            config,
+            Some(json!({"updates": {
+                "HINDSIGHT_API_ENTITY_LABELS": [{"key": "name", "type": "multi-text", "tag": true}],
+                "retain_mission": "Keep names.",
+            }})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["config"]["retain_mission"], "Keep names.");
+        assert!(body["overrides"]["entity_labels"].is_array());
+        let (status, _) = call(
+            &app,
+            Method::PATCH,
+            config,
+            Some(json!({"updates": {"llm_model": "x"}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        retain_one(
+            &app,
+            "l",
+            json!({"content": "Kubernetes runs the cluster."}),
+        )
+        .await;
+        let memories = engine.store.list_memories("l", 10).unwrap();
+        assert_eq!(memories[0].tags, vec!["name:kubernetes"]);
+
+        let recall = "/v1/default/banks/l/memories/recall";
+        let filter = |token: &str| {
+            json!({"query": "cluster", "tag_groups": [
+                {"tags": [token], "match": "any_strict", "resolve": "fuzzy"}
+            ]})
+        };
+        let (status, hit) = call(&app, Method::POST, recall, Some(filter("name:kubernetis"))).await;
+        assert_eq!(status, StatusCode::OK, "{hit}");
+        assert_eq!(hit["results"].as_array().unwrap().len(), 1);
+        let (_, miss) = call(&app, Method::POST, recall, Some(filter("name:zzzz"))).await;
+        assert_eq!(miss["results"], json!([]));
+        let (status, _) = call(
+            &app,
+            Method::POST,
+            recall,
+            Some(json!({"query": "cluster", "tag_groups": [{"tags": ["x"], "resolve": "nope"}]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let (_, reset) = call(&app, Method::DELETE, config, None).await;
+        assert_eq!(reset["overrides"], json!({}));
+        assert_eq!(reset["config"]["entity_labels"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn openapi_lists_only_recall_fields_that_work() {
+        let engine = engine();
+        let (status, spec) = call(&app(&engine), Method::GET, "/openapi.json", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let fields = &spec["components"]["schemas"]["RecallRequest"]["properties"];
+        assert!(fields.get("tag_groups").is_some());
+        assert!(fields.get("query_tag_gate").is_none());
     }
 
     #[tokio::test]
