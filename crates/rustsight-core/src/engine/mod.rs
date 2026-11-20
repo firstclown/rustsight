@@ -72,6 +72,10 @@ pub struct EngineConfig {
     /// Token overlap between consecutive retain chunks; the overlap usually
     /// re-extracts boundary facts, which are deduped on merge.
     pub chunk_overlap_tokens: usize,
+    /// Output cap on each fact-extraction call (upstream
+    /// `retain_max_completion_tokens`, default 64000). A reply cut off here
+    /// fails to parse and takes the half-size re-ask path.
+    pub retain_max_completion_tokens: Option<u64>,
     /// Total attempts for transient provider failures (HTTP 429/5xx and
     /// transport-level drops/timeouts).
     pub retry_max_attempts: usize,
@@ -127,6 +131,7 @@ impl Default for EngineConfig {
             reranker_max_candidates: 0,
             chunk_size_tokens: 3000,
             chunk_overlap_tokens: 200,
+            retain_max_completion_tokens: Some(64_000),
             retry_max_attempts: 3,
             retry_base_delay_ms: 400,
             consolidate_timeout_secs: 600,

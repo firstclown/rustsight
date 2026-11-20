@@ -261,6 +261,9 @@ Env vars, read in `crates/rustsight-providers/src/env.rs`:
 - `RUSTSIGHT_HTTP_TIMEOUT_SECS` (default 300, clamped 5–3600; total wall for
   one provider HTTP round trip, connect through last body byte; invalid
   values fall back to default with a warning)
+- `RUSTSIGHT_RETAIN_MAX_COMPLETION_TOKENS` (or its `HINDSIGHT_API_*` spelling;
+  default 64000; output cap per fact-extraction call, lowered per model in
+  `OpenAiCompat`; invalid values fall back to default with a warning)
 - `RUSTSIGHT_RERANK_URL` optional (Jina/Cohere-style `/rerank`); unset →
   `NoopRerank` (raw RRF ordering — accuracy caveat, RS-4 tracks a local ONNX
   reranker)

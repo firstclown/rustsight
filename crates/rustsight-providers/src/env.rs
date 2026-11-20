@@ -223,6 +223,37 @@ fn var_num(name: &str, default: usize, min: usize, max: usize) -> usize {
     }
 }
 
+/// Upstream's `DEFAULT_RETAIN_MAX_COMPLETION_TOKENS`.
+pub const DEFAULT_RETAIN_MAX_COMPLETION_TOKENS: u64 = 64_000;
+
+/// Output cap for fact extraction, from
+/// `RUSTSIGHT_RETAIN_MAX_COMPLETION_TOKENS` or its `HINDSIGHT_API_*` spelling.
+pub fn retain_max_completion_tokens() -> u64 {
+    retain_max_completion_tokens_from(&var_opt)
+}
+
+fn retain_max_completion_tokens_from(lookup: &dyn Fn(&str) -> Option<String>) -> u64 {
+    let found = [
+        "RUSTSIGHT_RETAIN_MAX_COMPLETION_TOKENS",
+        "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS",
+    ]
+    .into_iter()
+    .find_map(|name| lookup(name).map(|value| (name, value)));
+    let Some((name, value)) = found else {
+        return DEFAULT_RETAIN_MAX_COMPLETION_TOKENS;
+    };
+    match value.trim().parse::<u64>() {
+        Ok(n) if n > 0 => n,
+        _ => {
+            eprintln!(
+                "rustsight: invalid {name}={value:?}, using default \
+                 {DEFAULT_RETAIN_MAX_COMPLETION_TOKENS}"
+            );
+            DEFAULT_RETAIN_MAX_COMPLETION_TOKENS
+        }
+    }
+}
+
 /// Reads an optional sha256 pin env var, rejecting malformed values at
 /// startup — a typo would otherwise only surface as a mismatch after the
 /// multi-hundred-MB download finished.
@@ -426,6 +457,33 @@ pub fn build_mock_providers() -> Providers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retain_output_cap_prefers_rustsight_name_and_rejects_bad_values() {
+        let read = |pairs: &[(&str, &str)]| {
+            let map: std::collections::HashMap<String, String> = pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            retain_max_completion_tokens_from(&|name| map.get(name).cloned())
+        };
+        assert_eq!(read(&[]), DEFAULT_RETAIN_MAX_COMPLETION_TOKENS);
+        assert_eq!(
+            read(&[("HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS", "9000")]),
+            9000
+        );
+        assert_eq!(
+            read(&[
+                ("HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS", "9000"),
+                ("RUSTSIGHT_RETAIN_MAX_COMPLETION_TOKENS", "8000"),
+            ]),
+            8000
+        );
+        assert_eq!(
+            read(&[("RUSTSIGHT_RETAIN_MAX_COMPLETION_TOKENS", "0")]),
+            DEFAULT_RETAIN_MAX_COMPLETION_TOKENS
+        );
+    }
 
     #[test]
     fn operation_llm_overrides_inherit_unset_parts() {

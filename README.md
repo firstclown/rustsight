@@ -77,6 +77,10 @@ Configuration (non-mock mode)
                               clamped 5-3600). Transport-level failures
                               (dropped connection, timeout) are retried like
                               429/5xx
+    RUSTSIGHT_RETAIN_MAX_COMPLETION_TOKENS  output cap per fact-extraction
+                              call (default 64000, as in Hindsight; lowered
+                              automatically for gpt-4o and gpt-4.1). Lower it
+                              if your model rejects the default
     RUSTSIGHT_RERANK          local | api | off | auto (default auto; see below)
     RUSTSIGHT_RERANK_URL      optional; any /rerank endpoint (Jina/Cohere style)
     RUSTSIGHT_RERANK_MODEL_PATH  pre-placed ONNX model (file or dir); skips download

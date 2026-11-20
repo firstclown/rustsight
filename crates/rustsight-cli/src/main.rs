@@ -2,8 +2,8 @@ use clap::{Parser, Subcommand};
 use rustsight_core::types::*;
 use rustsight_core::{Engine, SystemClock};
 use rustsight_providers::{
-    build_mock_providers, build_operation_llms, build_providers, OperationLlms, ProviderEnv,
-    SimpleTokenEstimator,
+    build_mock_providers, build_operation_llms, build_providers, retain_max_completion_tokens,
+    OperationLlms, ProviderEnv, SimpleTokenEstimator,
 };
 use rustsight_server::{auth::ApiAuth, http, mcp};
 use rustsight_storage::SqliteStore;
@@ -170,6 +170,7 @@ async fn build_engine(db: &PathBuf, mock: bool) -> Arc<Engine> {
     engine.retain_llm = operation_llms.retain;
     engine.reflect_llm = operation_llms.reflect;
     engine.consolidate_llm = operation_llms.consolidate;
+    engine.config.retain_max_completion_tokens = Some(retain_max_completion_tokens());
     Arc::new(engine)
 }
 

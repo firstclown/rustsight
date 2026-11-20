@@ -21,7 +21,8 @@ use rustsight_core::traits::{EmbedProvider, LlmProvider, TokenEstimator};
 use rustsight_core::types::{ReflectResponse, RetainRequest};
 use rustsight_core::{Engine, EngineConfig, FixedClock};
 use rustsight_providers::{
-    build_mock_providers, build_providers, ProviderEnv, SimpleTokenEstimator,
+    build_mock_providers, build_providers, retain_max_completion_tokens, ProviderEnv,
+    SimpleTokenEstimator,
 };
 use rustsight_storage::SqliteStore;
 use std::collections::{BTreeMap, HashSet};
@@ -298,6 +299,7 @@ async fn build_setup(cfg: &RunConfig) -> Result<ProviderSetup, String> {
         Engine::new(Arc::new(store), llm, embed, rerank, est, clock.clone()).with_config(
             EngineConfig {
                 consolidate_concurrency: cfg.consolidate_concurrency.max(1),
+                retain_max_completion_tokens: Some(retain_max_completion_tokens()),
                 ..Default::default()
             },
         ),

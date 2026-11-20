@@ -668,6 +668,7 @@ fn extract_chunk_at<'a>(e: &'a Engine, args: ChunkExtract<'a>, depth: usize) -> 
             messages: vec![ChatMessage::user(user)],
             json_mode: true,
             temperature: Some(0.0),
+            max_tokens: e.config.retain_max_completion_tokens,
             ..Default::default()
         };
         let resp = with_retry(e, || llm.complete(&request)).await?;

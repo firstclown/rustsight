@@ -6,8 +6,8 @@ pub mod mock;
 pub mod openai;
 
 pub use env::{
-    build_mock_providers, build_operation_llms, build_providers, http_client, LlmTarget,
-    OperationLlms, ProviderEnv, RerankDevice, RerankMode,
+    build_mock_providers, build_operation_llms, build_providers, http_client,
+    retain_max_completion_tokens, LlmTarget, OperationLlms, ProviderEnv, RerankDevice, RerankMode,
 };
 pub use mock::{FlakyEmbed, FlakyLlm, MockEmbed, MockLlm, MockRerank, SimpleTokenEstimator};
 #[cfg(feature = "onnx-rerank")]

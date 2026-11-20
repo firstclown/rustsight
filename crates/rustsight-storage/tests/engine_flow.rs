@@ -2816,6 +2816,48 @@ async fn reflect_closing_ask_caps_output_and_forces_finish() {
     assert!(loop_reqs.iter().all(|r| r.max_tokens.is_none()));
 }
 
+/// Extraction carries upstream's output cap, and the config can change it.
+#[tokio::test]
+async fn retain_extraction_caps_output() {
+    use rustsight_core::traits::LlmRequest;
+
+    #[derive(Default)]
+    struct ReqCapture {
+        caps: std::sync::Mutex<Vec<Option<u64>>>,
+    }
+    #[async_trait]
+    impl LlmProvider for ReqCapture {
+        async fn complete(&self, req: &LlmRequest) -> rustsight_core::Result<LlmResponse> {
+            self.caps.lock().unwrap().push(req.max_tokens);
+            Ok(extraction_resp())
+        }
+    }
+
+    for (config, expected) in [
+        (EngineConfig::default(), 64_000),
+        (
+            EngineConfig {
+                retain_max_completion_tokens: Some(9_000),
+                ..Default::default()
+            },
+            9_000,
+        ),
+    ] {
+        let capture = Arc::new(ReqCapture::default());
+        let e = Engine::new(
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+            capture.clone(),
+            Arc::new(MockEmbed::default()),
+            Arc::new(MockRerank),
+            Arc::new(SimpleTokenEstimator),
+            Arc::new(FixedClock::new(1_800_000_000_000)),
+        )
+        .with_config(config);
+        retain(&e, "cap", "Alice joined Google.").await;
+        assert_eq!(*capture.caps.lock().unwrap(), vec![Some(expected)]);
+    }
+}
+
 /// gpt-oss harness noise (channel/constrain special tokens leaked through
 /// the gateway as content) must never become the answer — the turn counts
 /// as empty and the closing ask recovers (2026-11-12 parity run: one

@@ -33,6 +33,56 @@ fn error_chain(e: &dyn std::error::Error) -> String {
     out
 }
 
+/// Models that take `max_completion_tokens` only and need room for hidden
+/// reasoning (upstream `_supports_reasoning_model`).
+fn is_reasoning_model(model: &str) -> bool {
+    let model = model.to_lowercase();
+    if model.contains("deepseek") {
+        return ["v4-pro", "reasoner", "r1", "thinking"]
+            .iter()
+            .any(|m| model.contains(m));
+    }
+    ["gpt-5", "gpt-6", "o1", "o3"]
+        .iter()
+        .any(|m| model.contains(m))
+}
+
+/// The request field and value for an output cap, following upstream's
+/// per-model limits so a large default stays valid on smaller models.
+fn output_limit(model: &str, base_url: &str, requested: u64) -> (&'static str, u64) {
+    let lowered = model.to_lowercase();
+    let mut limit = requested;
+    if lowered.contains("gpt-4.1") || lowered.contains("gpt-4-") {
+        limit = limit.min(32_000);
+    } else if lowered.contains("gpt-4o") {
+        limit = limit.min(16_384);
+    }
+    let reasoning = is_reasoning_model(model);
+    if reasoning {
+        limit = limit.max(16_000);
+    }
+    let native_openai =
+        base_url.contains("api.openai.com") || base_url.contains(".openai.azure.com");
+    let field = if reasoning || native_openai {
+        "max_completion_tokens"
+    } else {
+        "max_tokens"
+    };
+    (field, limit)
+}
+
+/// OpenRouter load-balances a model across upstreams, and one that ignores
+/// `response_format` can answer with empty content and a normal finish
+/// reason. Limit routing to upstreams that honour every parameter sent
+/// (upstream `require_parameters`).
+fn require_supported_parameters(body: &mut Value, base_url: &str) {
+    let is_openrouter =
+        reqwest::Url::parse(base_url).is_ok_and(|url| url.host_str() == Some("openrouter.ai"));
+    if is_openrouter && body.get("response_format").is_some() {
+        body["provider"] = json!({"require_parameters": true});
+    }
+}
+
 fn map_req(req: &LlmRequest) -> Vec<Value> {
     let mut messages: Vec<Value> = vec![];
     if let Some(s) = &req.system {
@@ -100,9 +150,11 @@ impl LlmProvider for OpenAiCompat {
         }
         if req.json_mode {
             body["response_format"] = json!({"type": "json_object"});
+            require_supported_parameters(&mut body, &self.base_url);
         }
         if let Some(mt) = req.max_tokens {
-            body["max_tokens"] = json!(mt);
+            let (field, limit) = output_limit(&self.model, &self.base_url, mt);
+            body[field] = json!(limit);
         }
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let resp = self
@@ -323,6 +375,49 @@ mod tests {
                 .as_deref()
                 .map(|inner| inner as &(dyn std::error::Error + 'static))
         }
+    }
+
+    #[test]
+    fn json_requests_to_openrouter_require_supported_parameters() {
+        let json_body = || json!({"response_format": {"type": "json_object"}});
+
+        let mut body = json_body();
+        require_supported_parameters(&mut body, "https://openrouter.ai/api/v1");
+        assert_eq!(body["provider"], json!({"require_parameters": true}));
+
+        let mut body = json_body();
+        require_supported_parameters(&mut body, "https://api.openai.com/v1");
+        assert!(body.get("provider").is_none());
+
+        let mut body = json_body();
+        require_supported_parameters(&mut body, "https://openrouter.ai.example.com/v1");
+        assert!(body.get("provider").is_none());
+
+        let mut body = json!({});
+        require_supported_parameters(&mut body, "https://openrouter.ai/api/v1");
+        assert!(body.get("provider").is_none());
+    }
+
+    #[test]
+    fn output_limit_follows_the_model_and_endpoint() {
+        let openrouter = "https://openrouter.ai/api/v1";
+        let openai = "https://api.openai.com/v1";
+        assert_eq!(
+            output_limit("openai/gpt-oss-120b", openrouter, 64_000),
+            ("max_tokens", 64_000)
+        );
+        assert_eq!(
+            output_limit("gpt-4o-mini", openai, 64_000),
+            ("max_completion_tokens", 16_384)
+        );
+        assert_eq!(
+            output_limit("openai/gpt-4.1", openrouter, 64_000),
+            ("max_tokens", 32_000)
+        );
+        assert_eq!(
+            output_limit("openai/gpt-5", openrouter, 8_192),
+            ("max_completion_tokens", 16_000)
+        );
     }
 
     /// The chain must surface the layers reqwest's Display hides: a bare
