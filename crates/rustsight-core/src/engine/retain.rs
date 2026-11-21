@@ -27,7 +27,46 @@ const CHUNK_EXTRACT_CONCURRENCY: usize = 2;
 type ChunkFut<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<ExtractedFact>>> + Send + 'a>>;
 
-pub(super) async fn retain(e: &Engine, req: RetainRequest) -> Result<RetainResponse> {
+pub(super) async fn retain(e: &Engine, mut req: RetainRequest) -> Result<RetainResponse> {
+    let defense = screen_content(e, &mut req)?;
+    let mut resp = retain_screened(e, req).await?;
+    resp.defense = defense;
+    Ok(resp)
+}
+
+/// Memory Defense pre-parse hook (RS-10a): screen the content under the
+/// bank's `memory_defense` policy before anything is chunked, extracted or
+/// stored. `redact` rewrites `req.content` in place — the document body,
+/// chunks and facts are all derived from it, so none sees the secret;
+/// `block` refuses the item. A malformed policy fails the retain rather
+/// than skipping screening (a security control must not fail open).
+fn screen_content(
+    e: &Engine,
+    req: &mut RetainRequest,
+) -> Result<Option<crate::defense::DefenseReport>> {
+    use crate::defense::{parse_policy, screen, DefenseAction, DefenseReport};
+    let config = e.store.bank_config(&req.bank_id)?;
+    let policy = parse_policy(config.get("memory_defense"))?;
+    if !policy.enabled {
+        return Ok(None);
+    }
+    let decision = screen(&policy, &req.content);
+    match decision.action {
+        DefenseAction::Allow => Ok(None),
+        DefenseAction::Redact => {
+            if let Some(redacted) = &decision.redacted_content {
+                req.content = redacted.clone();
+            }
+            Ok(Some(DefenseReport::from(&decision)))
+        }
+        DefenseAction::Block => Err(Error::Blocked {
+            detector: decision.detector.unwrap_or_default(),
+            message: decision.message,
+        }),
+    }
+}
+
+async fn retain_screened(e: &Engine, req: RetainRequest) -> Result<RetainResponse> {
     if req.content.trim().is_empty() {
         return Err(Error::BadInput("content is empty".into()));
     }
@@ -83,6 +122,7 @@ pub(super) async fn retain(e: &Engine, req: RetainRequest) -> Result<RetainRespo
                 edges_created: 0,
                 reasks: 0,
                 document_id: Some(document_id),
+                defense: None,
             });
         }
     }
@@ -246,6 +286,7 @@ pub(super) async fn retain(e: &Engine, req: RetainRequest) -> Result<RetainRespo
             edges_created: 0,
             reasks,
             document_id: Some(document_id),
+            defense: None,
         });
     }
 
@@ -501,6 +542,7 @@ pub(super) async fn retain(e: &Engine, req: RetainRequest) -> Result<RetainRespo
         edges_created: edges.len(),
         reasks,
         document_id: Some(document_id),
+        defense: None,
     })
 }
 

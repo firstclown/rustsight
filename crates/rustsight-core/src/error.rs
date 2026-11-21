@@ -28,6 +28,9 @@ pub enum Error {
     BadInput(String),
     #[error("not found: {0}")]
     NotFound(String),
+    /// A retain item refused by the bank's Memory Defense policy (RS-10a).
+    #[error("blocked by memory defense: {message}")]
+    Blocked { detector: String, message: String },
 }
 
 impl Error {

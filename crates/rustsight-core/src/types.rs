@@ -330,6 +330,10 @@ pub struct RetainResponse {
     /// The document the memories were filed under (given or generated).
     #[serde(default)]
     pub document_id: Option<String>,
+    /// What Memory Defense did to the content (`None` = nothing matched or
+    /// no policy). A `redact` here means the stored text is scrubbed.
+    #[serde(default)]
+    pub defense: Option<crate::defense::DefenseReport>,
 }
 
 /// Hindsight `tags_match`: how a tag filter compares against a memory's tags.

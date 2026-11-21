@@ -99,6 +99,11 @@ enum Cmd {
         literalism: Option<u8>,
         #[arg(long)]
         empathy: Option<u8>,
+        /// Memory Defense policy as JSON, e.g.
+        /// '{"enabled":true,"rules":[{"on":"sensitive_data","action":"redact"}]}';
+        /// `off` removes it.
+        #[arg(long)]
+        memory_defense: Option<String>,
     },
     /// Rebuild the sqlite-vec KNN index from stored embeddings (RS-7): the
     /// migration path for banks written before the index existed or by a
@@ -332,6 +337,7 @@ async fn main() {
             skepticism,
             literalism,
             empathy,
+            memory_defense,
         } => (|| -> rustsight_core::Result<()> {
             let existing = engine.store.get_bank(&bank)?.unwrap_or(Bank {
                 id: bank.clone(),
@@ -358,6 +364,24 @@ async fn main() {
             }
             engine.store.ensure_bank(&b)?;
             engine.store.update_bank(&b)?;
+            if let Some(raw) = memory_defense {
+                let mut config = match engine.store.bank_config(&bank)? {
+                    serde_json::Value::Object(map) => map,
+                    _ => serde_json::Map::new(),
+                };
+                if raw == "off" {
+                    config.remove("memory_defense");
+                } else {
+                    let policy: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+                        rustsight_core::Error::BadInput(format!("--memory-defense: {e}"))
+                    })?;
+                    rustsight_core::defense::parse_policy(Some(&policy))?;
+                    config.insert("memory_defense".into(), policy);
+                }
+                engine
+                    .store
+                    .set_bank_config(&bank, &serde_json::Value::Object(config))?;
+            }
             print_json(&b);
             Ok(())
         })(),

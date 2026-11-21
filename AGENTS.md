@@ -213,6 +213,13 @@ Key source map:
   under `until_deleted`, so a delete cancels it and cannot interleave with
   it. Never take a second guard for the same bank in one task: a queued
   delete would deadlock it; pass the guard (`Engine::retain_guarded`).
+- **Memory Defense screens before anything is derived from content**
+  (RS-10a, `defense.rs`, `retain.rs::screen_content`): the bank's
+  `memory_defense` policy runs on `req.content` before chunking, so a
+  `redact` reaches the document body, chunks, facts and embeddings alike.
+  A malformed policy fails the retain — never skip screening (fail closed).
+  The pattern catalog is held to upstream by `memory_defense_parity.rs`;
+  regenerate with `scripts/defense-goldens`, never hand-edit the fixture.
 - **`enable_observations: false` gates consolidation, not retain.** Dirty
   entities keep queueing so re-enabling catches up.
 - **Embeddings are mirrored write-through into the vec0 index** (RS-7,

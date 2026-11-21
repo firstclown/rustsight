@@ -3331,3 +3331,130 @@ async fn reflect_budgeted_rounds_follow_upstream_multipliers() {
         20
     );
 }
+
+// ── RS-10a: Memory Defense ───────────────────────────────────────────────
+
+fn set_defense(e: &Engine, bank: &str, action: &str, enabled: bool) {
+    e.store
+        .ensure_bank(&Bank {
+            id: bank.into(),
+            mission: None,
+            directives: None,
+            background: None,
+            disposition: Disposition::default(),
+        })
+        .unwrap();
+    e.store
+        .set_bank_config(
+            bank,
+            &json!({"memory_defense": {
+                "enabled": enabled,
+                "rules": [{"on": "sensitive_data", "action": action}]
+            }}),
+        )
+        .unwrap();
+}
+
+const GH_TOKEN: &str = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+
+/// Every place a retained secret could land: memory texts, the document
+/// body, and the source chunks the memories point at.
+fn stored_text(e: &Engine, bank: &str) -> String {
+    let mut all = String::new();
+    let memories = e.store.list_memories(bank, 1000).unwrap();
+    for m in &memories {
+        all.push_str(&m.text);
+        all.push('\n');
+    }
+    for d in e.store.list_documents(bank, 100).unwrap() {
+        all.push_str(&d.original_text);
+        all.push('\n');
+    }
+    let ids: Vec<String> = memories.iter().map(|m| m.id.clone()).collect();
+    let chunk_ids: Vec<String> = e
+        .store
+        .memory_chunk_ids(bank, &ids)
+        .unwrap()
+        .into_values()
+        .collect();
+    for c in e.store.get_chunks(bank, &chunk_ids).unwrap() {
+        all.push_str(&c.text);
+        all.push('\n');
+    }
+    all
+}
+
+#[tokio::test]
+async fn memory_defense_redact_keeps_secrets_out_of_every_store() {
+    let e = engine();
+    set_defense(&e, "md", "redact", true);
+    let r = retain(
+        &e,
+        "md",
+        &format!("Alice joined Google. Alice's deploy token is {GH_TOKEN} for the CI."),
+    )
+    .await;
+    assert!(r.memories_stored >= 1, "{r:?}");
+    let report = r.defense.expect("redaction reported");
+    assert_eq!(report.action, defense::DefenseAction::Redact);
+    assert_eq!(report.matched_types, vec!["github_token"]);
+    assert_eq!(report.hits[0].preview, "ghp_...6789");
+    let stored = stored_text(&e, "md");
+    assert!(!stored.contains(GH_TOKEN), "secret leaked: {stored}");
+    assert!(stored.contains("[REDACTED:github_token]"), "{stored}");
+}
+
+#[tokio::test]
+async fn memory_defense_block_refuses_and_stores_nothing() {
+    let e = engine();
+    set_defense(&e, "mb", "block", true);
+    let err = e
+        .retain(RetainRequest {
+            bank_id: "mb".into(),
+            content: format!("Alice pasted {GH_TOKEN} into chat."),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Blocked { .. }), "{err:?}");
+    assert!(err.to_string().contains("github_token"), "{err}");
+    assert!(e.store.list_memories("mb", 100).unwrap().is_empty());
+    assert!(e.store.list_documents("mb", 100).unwrap().is_empty());
+    // Clean content still goes through under the same policy.
+    let r = retain(&e, "mb", "Alice joined Google.").await;
+    assert!(r.memories_stored >= 1 && r.defense.is_none(), "{r:?}");
+}
+
+#[tokio::test]
+async fn memory_defense_disabled_or_absent_is_a_no_op() {
+    let e = engine();
+    set_defense(&e, "off", "redact", false);
+    let content = format!("Alice's token is {GH_TOKEN} today.");
+    let r = retain(&e, "off", &content).await;
+    assert!(r.defense.is_none());
+    assert!(stored_text(&e, "off").contains(GH_TOKEN));
+    let r = retain(&e, "none", &content).await;
+    assert!(r.defense.is_none());
+}
+
+#[tokio::test]
+async fn memory_defense_malformed_policy_fails_closed() {
+    let e = engine();
+    retain(&e, "bad", "Alice joined Google.").await;
+    e.store
+        .set_bank_config(
+            "bad",
+            &json!({"memory_defense": {"enabled": true, "rules": [{"on": "sensitive_data", "action": "nuke"}]}}),
+        )
+        .unwrap();
+    let err = e
+        .retain(RetainRequest {
+            bank_id: "bad".into(),
+            content: format!("token {GH_TOKEN}"),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::BadInput(_)), "{err:?}");
+    assert!(!stored_text(&e, "bad").contains(GH_TOKEN));
+}

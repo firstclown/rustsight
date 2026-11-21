@@ -138,39 +138,45 @@ pub fn routes() -> Router<Arc<Engine>> {
 
 /// FastAPI-shaped error: `{"detail": "..."}` with the matching status.
 #[derive(Debug)]
-pub struct ApiError(StatusCode, String);
+/// Status, message, and an optional structured `detail` that replaces the
+/// message on the wire (upstream sends objects for some errors, e.g. the
+/// Memory Defense `{"violations": [...]}`).
+pub struct ApiError(StatusCode, String, Option<Value>);
 
 impl ApiError {
+    fn new(status: StatusCode, msg: impl Into<String>) -> Self {
+        Self(status, msg.into(), None)
+    }
+
     fn bad_request(msg: impl Into<String>) -> Self {
-        Self(StatusCode::BAD_REQUEST, msg.into())
+        Self::new(StatusCode::BAD_REQUEST, msg)
     }
 
     fn unprocessable(msg: impl Into<String>) -> Self {
-        Self(StatusCode::UNPROCESSABLE_ENTITY, msg.into())
+        Self::new(StatusCode::UNPROCESSABLE_ENTITY, msg)
     }
 
     fn not_found(msg: impl Into<String>) -> Self {
-        Self(StatusCode::NOT_FOUND, msg.into())
+        Self::new(StatusCode::NOT_FOUND, msg)
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.0, Json(json!({ "detail": self.1 }))).into_response()
+        let detail = self.2.unwrap_or(Value::String(self.1));
+        (self.0, Json(json!({ "detail": detail }))).into_response()
     }
 }
 
 impl From<Error> for ApiError {
     fn from(e: Error) -> Self {
         match &e {
-            Error::NotFound(_) => Self(StatusCode::NOT_FOUND, e.to_string()),
-            Error::BadInput(_) | Error::Parse(_) => Self(StatusCode::BAD_REQUEST, e.to_string()),
+            Error::NotFound(_) => Self::new(StatusCode::NOT_FOUND, e.to_string()),
+            Error::BadInput(_) | Error::Parse(_) => Self::bad_request(e.to_string()),
+            Error::Blocked { .. } => Self::unprocessable(e.to_string()),
             _ => {
                 eprintln!("rustsight http: internal error: {e}");
-                Self(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Internal server error".into(),
-                )
+                Self::new(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
             }
         }
     }
@@ -433,7 +439,7 @@ async fn delete_bank(State(engine): State<Arc<Engine>>, Path(bank_id): Path<Stri
 
 /// The per-bank settings this server acts on. Anything else is refused:
 /// accepting a setting that changes nothing would misreport what ran.
-const CONFIG_KEYS: [&str; 9] = [
+const CONFIG_KEYS: [&str; 10] = [
     "retain_mission",
     "observations_mission",
     "reflect_mission",
@@ -443,6 +449,7 @@ const CONFIG_KEYS: [&str; 9] = [
     "disposition_skepticism",
     "disposition_literalism",
     "disposition_empathy",
+    "memory_defense",
 ];
 
 fn is_config_key(key: &str) -> bool {
@@ -490,6 +497,7 @@ fn bank_config_json(engine: &Engine, bank: &Bank) -> Result<Value, ApiError> {
             "disposition_skepticism": bank.disposition.skepticism,
             "disposition_literalism": bank.disposition.literalism,
             "disposition_empathy": bank.disposition.empathy,
+            "memory_defense": setting("memory_defense", Value::Null),
         },
         "overrides": overrides,
     }))
@@ -519,6 +527,11 @@ fn apply_config_update(bank: &mut Bank, key: &str, value: &Value) -> Result<(), 
         "entity_labels" => {
             BankLabels::parse(Some(value), true)?;
         }
+        "memory_defense" => {
+            // Validated on write so a bad policy never reaches retain, which
+            // refuses to run under one (screening must not fail open).
+            rustsight_core::defense::parse_policy(Some(value))?;
+        }
         _ => {
             let name = key.trim_start_matches("disposition_");
             let defaults = Disposition::default();
@@ -531,7 +544,7 @@ fn apply_config_update(bank: &mut Bank, key: &str, value: &Value) -> Result<(), 
                 Value::Null => default,
                 other => {
                     let raw = other.as_i64().ok_or_else(|| wrong_type("an integer"))?;
-                    trait_value(name, raw).map_err(|ApiError(_, m)| ApiError::bad_request(m))?
+                    trait_value(name, raw).map_err(|ApiError(_, m, _)| ApiError::bad_request(m))?
                 }
             };
         }
@@ -844,6 +857,51 @@ fn assign_document_ids(items: &mut [Value]) {
     }
 }
 
+/// Memory Defense over a whole batch, upstream-style: items the bank's
+/// policy blocks are dropped from the batch; when every item is blocked the
+/// request fails with 422 and `{"violations": [{index, detector, message}]}`.
+/// (Each surviving item is screened again inside `Engine::retain`, which
+/// applies `redact`.)
+fn blocked_items(
+    engine: &Engine,
+    bank_id: &str,
+    items: &[Value],
+) -> Result<HashSet<usize>, ApiError> {
+    use rustsight_core::defense::{parse_policy, screen, DefenseAction};
+    let config = engine.store.bank_config(bank_id)?;
+    let policy = parse_policy(config.get("memory_defense"))?;
+    if !policy.enabled {
+        return Ok(HashSet::new());
+    }
+    let mut violations = vec![];
+    for (index, raw) in items.iter().enumerate() {
+        let item = parse_item(raw, index)?;
+        let decision = screen(&policy, &item.content);
+        if decision.action == DefenseAction::Block {
+            violations.push(json!({
+                "index": index,
+                "detector": decision.detector,
+                "message": decision.message,
+            }));
+        }
+    }
+    if !violations.is_empty() && violations.len() == items.len() {
+        let message = format!(
+            "all {} items blocked by Memory Defense policy",
+            violations.len()
+        );
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            message,
+            Some(json!({ "violations": violations })),
+        ));
+    }
+    Ok(violations
+        .iter()
+        .filter_map(|v| v["index"].as_u64().map(|i| i as usize))
+        .collect())
+}
+
 /// Retain every item in order. Items that share a `document_id` within one
 /// request build one document: the first applies its `update_mode`, the
 /// rest append to it.
@@ -854,8 +912,12 @@ async fn run_retain(
     items: &[Value],
     document_tags: &[String],
 ) -> Result<usize, ApiError> {
+    let blocked = blocked_items(engine, bank_id, items)?;
     let mut seen_documents: HashSet<String> = HashSet::new();
     for (index, raw) in items.iter().enumerate() {
+        if blocked.contains(&index) {
+            continue;
+        }
         let item = parse_item(raw, index)?;
         let mut tags = item.tags;
         for t in document_tags {
@@ -896,7 +958,7 @@ async fn run_retain(
 async fn finish_operation(engine: &Engine, mut op: Operation, outcome: Result<usize, ApiError>) {
     match outcome {
         Ok(_) => op.status = "completed".into(),
-        Err(ApiError(_, detail)) => {
+        Err(ApiError(_, detail, _)) => {
             op.status = "failed".into();
             op.error = Some(detail);
         }
@@ -929,7 +991,7 @@ fn spawn_operation(engine: Arc<Engine>, op: Operation) {
         )
         .unwrap_or_default();
         let outcome = run_retain(&engine, &guard, &op.bank_id, &items, &document_tags).await;
-        if let Err(ApiError(_, detail)) = &outcome {
+        if let Err(ApiError(_, detail, _)) = &outcome {
             eprintln!(
                 "rustsight: async retain {} (bank {}) failed: {detail}",
                 op.id, op.bank_id
@@ -995,9 +1057,9 @@ async fn retain(
     // no new work (idempotent async retries).
     if let Some(existing) = engine.store.get_operation(&operation_id)? {
         if existing.bank_id != bank_id {
-            return Err(ApiError(
+            return Err(ApiError::new(
                 StatusCode::CONFLICT,
-                "operation_id belongs to a different operation".into(),
+                "operation_id belongs to a different operation",
             ));
         }
     } else {
@@ -1131,7 +1193,7 @@ async fn retry_operation(
         .filter(|op| op.bank_id == bank_id)
         .ok_or_else(|| ApiError::not_found(format!("Operation {operation_id} not found")))?;
     if op.status != "failed" {
-        return Err(ApiError(
+        return Err(ApiError::new(
             StatusCode::CONFLICT,
             format!(
                 "Operation {operation_id} is {} and cannot be retried",
@@ -2217,6 +2279,80 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(engine.store.get_operation(id).unwrap().is_none());
         assert!(engine.store.get_bank("busy").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn memory_defense_config_validates_and_screens_batches() {
+        let engine = engine();
+        let app = app(&engine);
+        let config = "/v1/default/banks/md/config";
+        let (status, body) = call(
+            &app,
+            Method::PATCH,
+            config,
+            Some(json!({"updates": {"memory_defense": {
+                "enabled": true, "rules": [{"on": "sensitive_data", "action": "explode"}]
+            }}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body["detail"].as_str().unwrap().contains("invalid action"));
+        let policy =
+            json!({"enabled": true, "rules": [{"on": "sensitive_data", "action": "block"}]});
+        let (status, body) = call(
+            &app,
+            Method::PATCH,
+            config,
+            Some(json!({"updates": {"memory_defense": policy}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["config"]["memory_defense"], policy);
+        assert_eq!(body["overrides"]["memory_defense"], policy);
+
+        let secret = "AKIAIOSFODNN7EXAMPLE";
+        let memories = "/v1/default/banks/md/memories";
+        // Partially blocked: the clean item is retained, the other dropped.
+        let (status, body) = call(
+            &app,
+            Method::POST,
+            memories,
+            Some(json!({"items": [
+                {"content": format!("The AWS key is {secret}."), "document_id": "leak"},
+                {"content": "Alice joined Google.", "document_id": "clean"},
+            ]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(engine.store.get_document("md", "leak").unwrap().is_none());
+        assert!(engine.store.get_document("md", "clean").unwrap().is_some());
+        // All blocked: 422 with upstream's violations detail.
+        let (status, body) = call(
+            &app,
+            Method::POST,
+            memories,
+            Some(json!({"items": [{"content": format!("key {secret}")}]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        let violation = &body["detail"]["violations"][0];
+        assert_eq!(violation["index"], 0);
+        assert_eq!(violation["detector"], "sensitive_data");
+        assert!(violation["message"]
+            .as_str()
+            .unwrap()
+            .contains("aws_access_key"));
+
+        // Clearing the policy turns screening off again.
+        let (status, body) = call(
+            &app,
+            Method::PATCH,
+            config,
+            Some(json!({"updates": {"memory_defense": null}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["config"]["memory_defense"].is_null());
     }
 
     #[tokio::test]

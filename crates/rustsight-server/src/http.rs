@@ -177,10 +177,13 @@ fn http_err(e: Error) -> (StatusCode, String) {
     let status = match &e {
         Error::NotFound(_) => StatusCode::NOT_FOUND,
         Error::BadInput(_) | Error::Parse(_) => StatusCode::BAD_REQUEST,
+        Error::Blocked { .. } => StatusCode::UNPROCESSABLE_ENTITY,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     let body = match &e {
-        Error::NotFound(_) | Error::BadInput(_) | Error::Parse(_) => e.to_string(),
+        Error::NotFound(_) | Error::BadInput(_) | Error::Parse(_) | Error::Blocked { .. } => {
+            e.to_string()
+        }
         _ => {
             eprintln!("rustsight http: internal error: {e}");
             "internal error".to_string()
@@ -868,6 +871,7 @@ mod tests {
                 edges_created: 0,
                 reasks: 0,
                 document_id: None,
+                defense: None,
             },
         );
         assert_schema_matches(

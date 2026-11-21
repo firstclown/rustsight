@@ -34,3 +34,13 @@ Licensed, Copyright (c) 2025 Vectorize AI, Inc. See
 those files' prompt-building logic; see
 `crates/rustsight-core/prompts/upstream/DIVERGENCES.md` for intentional
 differences.
+
+Vendored hindsight-api 1.2.1 sources
+------------------------------------
+Features that postdate the `v1.1.0` prompt pin are ported from the released
+`hindsight-api` 1.2.1 package and vendored verbatim under
+`crates/rustsight-core/upstream/hindsight-api-1.2.1/` (MIT License, Copyright
+(c) 2025 Vectorize AI, Inc.): `extensions/memory_defense.py` (the Memory
+Defense pattern catalog and redaction rules, ported to
+`crates/rustsight-core/src/defense.rs` and held to parity by
+`scripts/defense-goldens`). See that directory's README for the file list.

@@ -47,6 +47,8 @@ ort = { version = "=2.0.0-rc.15", default-features = false, features = [
     "copy-dylibs",
     "tls-rustls",
 ] }
+# Look-around regexes for the Memory Defense pattern catalog (RS-10a)
+fancy-regex = "0.14"
 tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
 # dlopen probe for the CUDA runtime stack (onnx-rerank-cuda only)
 libloading = "0.8"

@@ -156,7 +156,8 @@ What works the Hindsight way:
   `include.facts` → `based_on.memories`.
 - **Banks**: `name`, `reflect_mission` (aliases `mission`, `background`),
   `disposition`, `retain_mission`, `observations_mission`,
-  `enable_observations`, `entity_labels`, `entities_allow_free_form`. A bank
+  `enable_observations`, `entity_labels`, `entities_allow_free_form`,
+  `memory_defense` (see [Memory Defense](#memory-defense)). A bank
   configured through this API keeps its mission for reflect only, as
   Hindsight does. `PATCH .../config` takes those settings under `updates`
   (plain or `HINDSIGHT_API_*` names) and refuses any other key. Deleting a
@@ -380,6 +381,45 @@ and `retry_base_delay_ms`; other errors (auth, bad requests) fail fast. If a
 chunk's extraction output fails to parse (e.g. JSON truncated by an output
 token limit), the chunk is re-asked once at half size before the error
 surfaces.
+
+## Memory Defense
+Opt-in, per-bank screening of everything retained for secrets and PII — a
+port of upstream hindsight-api 1.2.1's regex Memory Defense. The catalog is
+upstream's 46 patterns verbatim: LLM-provider keys (Anthropic, OpenAI,
+Google, xAI, Groq, Hugging Face, …), cloud and CI credentials (AWS, GitHub,
+GitLab, npm, PyPI, DigitalOcean), payment and chat tokens (Stripe, Square,
+Slack, Twilio, SendGrid, Discord, Telegram, …), database URLs with embedded
+passwords, PEM private-key headers, JWTs, Luhn-checked card numbers and US
+SSNs. Token boundaries are ASCII-only, so a key embedded in Chinese or
+Japanese prose still matches. `tests/memory_defense_parity.rs` holds the
+Rust port to upstream's own output (`scripts/defense-goldens` regenerates the
+fixture from the vendored source).
+
+Configure it with the bank setting `memory_defense`:
+
+```json
+{"enabled": true, "rules": [{"on": "sensitive_data", "action": "redact"}]}
+```
+
+- `redact` replaces each match with `[REDACTED:<label>]` (e.g.
+  `[REDACTED:github_token]`) **before** chunking and extraction, so the
+  document body, chunks, facts and embeddings never see the secret. The
+  retain response's `defense` field lists the matched labels with
+  fingerprinted previews (`ghp_...AAAA`), never the raw value.
+- `block` refuses the item: native retain answers 422; a Hindsight-API batch
+  drops blocked items and retains the rest, or answers 422 with
+  `{"detail": {"violations": [{"index", "detector", "message"}]}}` when every
+  item is blocked.
+- `allow`, `enabled: false`, or no setting: no screening. Rules naming
+  another detector are accepted and ignored. A malformed policy is refused
+  when written, and a retain under one fails rather than skipping screening.
+
+Set it with `PATCH /v1/default/banks/{id}/config`
+(`{"updates": {"memory_defense": {...}}}`) or
+`rustsight bank-set --bank b --memory-defense '<json>'` (`off` removes it).
+The patterns target high-confidence prefixes; context-dependent secrets
+(a bare 40-character string next to the word "cohere") are out of scope, as
+upstream.
 
 ## Offline demo (no API key)
     rustsight --mock --db /tmp/demo.db retain --bank demo \

@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""Regenerate the Memory Defense parity fixture (RS-10a).
+
+Runs the VENDORED upstream redactor
+(crates/rustsight-core/upstream/hindsight-api-1.2.1/extensions/memory_defense.py)
+over a battery of inputs and writes its exact output to:
+
+  crates/rustsight-core/tests/fixtures/memory_defense.json
+
+crates/rustsight-core/tests/memory_defense_parity.rs asserts the Rust port
+(src/defense.rs) reproduces every case: redacted content, matched labels in
+order, and the fingerprinted hit previews.
+
+Plain python3, no third-party packages, no network.
+"""
+import importlib.util
+import json
+import sys
+import types
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+SOURCE = ROOT / "crates/rustsight-core/upstream/hindsight-api-1.2.1/extensions/memory_defense.py"
+OUT = ROOT / "crates/rustsight-core/tests/fixtures/memory_defense.json"
+
+# The module imports one base class; stub it so the file loads standalone.
+pkg = types.ModuleType("hindsight_api")
+ext = types.ModuleType("hindsight_api.extensions")
+base = types.ModuleType("hindsight_api.extensions.base")
+base.Extension = type("Extension", (), {})
+sys.modules.update(
+    {"hindsight_api": pkg, "hindsight_api.extensions": ext, "hindsight_api.extensions.base": base}
+)
+spec = importlib.util.spec_from_file_location("memory_defense", SOURCE)
+md = importlib.util.module_from_spec(spec)
+sys.modules["memory_defense"] = md
+spec.loader.exec_module(md)
+
+A = "A" * 64
+H = "a1b2c3d4" * 8
+CASES = [
+    # One case per catalog label.
+    f"anthropic sk-ant-api03-{A[:30]} end",
+    f"project sk-proj-{A[:50]}",
+    f"admin sk-admin-{A[:44]}",
+    f"plain sk-{A[:24]}",
+    f"google AIza{A[:35]}",
+    f"oauth ya29.{A[:25]}",
+    f"xai xai-{A[:44]}",
+    f"groq gsk_{A[:24]}",
+    f"hindsight hsk_{H[:32]} and hsk_sys_{H[:32]}_deadbeef00",
+    f"hf hf_{A[:34]}",
+    f"replicate r8_{A[:34]}",
+    f"pplx pplx-{A[:44]}",
+    f"databricks dapi{A[:32]}",
+    "aws AKIAIOSFODNN7EXAMPLE and ASIAIOSFODNN7EXAMPLE",
+    'aws_secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"',
+    f"do dop_v1_{H[:64]}",
+    f"gh github_pat_{A[:62]}",
+    f"ghp_{A[:36]} ghs_{A[:36]} ghu_{A[:36]} ghr_{A[:36]} gho_{A[:36]}",
+    f"gitlab glpat-{A[:22]}",
+    f"npm npm_{A[:34]}",
+    f"pypi pypi-AgEIcHlwaS5vcmc{A[:24]}",
+    f"stripe sk_live_{A[:24]} rk_test_{A[:24]}",
+    f"square sq0atp-{A[:24]}",
+    f"braintree access_token$production${'a' * 16}${H[:32]}",
+    "slack xoxb-1234567890-abcdefghij",
+    "hook https://hooks.slack.com/services/T01234567/B01234567/abcdefghijklmnopqrstuvwx",
+    f"twilio SK{H[:32]} AC{H[:32]}",
+    f"sendgrid SG.{A[:22]}.{A[:43]}",
+    f"mailgun key-{A[:32]}",
+    f"discord M{A[:23]}.{A[:6]}.{A[:27]}",
+    f"telegram 123456789:{A[:35]}",
+    f"shopify shpat_{H[:32]}",
+    "pg postgres://user:pass@db.example.com:5432/app and postgresql://u:p@h/d",
+    "mysql://root:hunter2@localhost/db",
+    "mongodb+srv://admin:s3cret@cluster0.example.net/test",
+    "-----BEGIN RSA PRIVATE KEY----- and -----BEGIN PGP PRIVATE KEY BLOCK-----",
+    f"jwt eyJ{A[:12]}.eyJ{A[:12]}.{A[:12]}",
+    "card 4111 1111 1111 1111 and 5500-0000-0000-0004",
+    "ssn 123-45-6789",
+    # Boundaries.
+    f"凭证为sk_test_{A[:24]}请保密",
+    f"prefix_ghp_{A[:36]}",
+    f"ghp_{A[:36]}suffix",
+    f"ghp_{A[:36]}-dash",
+    # Cards: Luhn, placeholders, decimals, UUIDs, rejected-then-valid.
+    "ts 2026 1121 0930 1234 not a card",
+    "0000 0000 0000 0000",
+    "2026 4111 1111 1111 1111",
+    "price 4111111111111111.50",
+    "v1.4111111111111111",
+    "id 4111a111-1111-1111-1111-111111111111 uuid",
+    "uuid 41111111-1111-1111-1111-111111111111",
+    "４１１１ １１１１ １１１１ １１１１",
+    "card,4111111111111111,ok",
+    "ports 8080 8081 8082 8083",
+    # Ordering / overlap and repeats.
+    f"two ghp_{A[:36]} ghp_{'B' * 36}",
+    f"order sk-ant-{A[:24]} then sk-{A[:24]}",
+    # Nothing to find.
+    "Alice joined Google in 2024 and moved to Berlin.",
+    "",
+]
+
+
+def run(text):
+    r = md.apply_redaction(text)
+    return {
+        "input": text,
+        "content": r.content,
+        "matched_types": r.matched_types,
+        "hits": r.hits,
+    }
+
+
+OUT.parent.mkdir(parents=True, exist_ok=True)
+OUT.write_text(
+    json.dumps(
+        {
+            "source": "hindsight-api 1.2.1 extensions/memory_defense.py apply_redaction",
+            "pattern_labels": [label for label, _ in md._REDACTION_PATTERNS],
+            "cases": [run(t) for t in CASES],
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    + "\n"
+)
+print(f"wrote {len(CASES)} cases to {OUT.relative_to(ROOT)}")

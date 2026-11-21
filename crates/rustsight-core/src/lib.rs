@@ -1,3 +1,4 @@
+pub mod defense;
 mod engine;
 mod entity;
 mod error;

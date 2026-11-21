@@ -637,13 +637,13 @@ fingerprinted per-hit previews (raw values never leave the screener).
   batch is a 422.
 
 DoD:
-- [ ] Pattern-table unit tests (one case per label, CJK boundary, Luhn
+- [x] Pattern-table unit tests (one case per label, CJK boundary, Luhn
       rejects timestamps/port lists, UUID guard, fingerprint lengths).
-- [ ] engine_flow: redact leaves no secret in memories, chunks or document
+- [x] engine_flow: redact leaves no secret in memories, chunks or document
       text; block stores nothing; disabled policy is a no-op.
-- [ ] compat: config accepts/validates `memory_defense`; partial-block batch
+- [x] compat: config accepts/validates `memory_defense`; partial-block batch
       retains the rest; all-blocked → 422.
-- [ ] docs/reference.md + NOTICE (1.2.1 source).
+- [x] docs/reference.md + NOTICE (1.2.1 source).
 
 ### RS-10b — Engine lifecycle events + webhooks · M
 

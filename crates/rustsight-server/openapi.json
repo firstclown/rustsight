@@ -116,7 +116,7 @@
             }
           },
           "400": { "$ref": "#/components/responses/BadRequest" },
-          "422": { "$ref": "#/components/responses/InvalidBody" },
+          "422": { "description": "Invalid body, or the content was refused by the bank's `memory_defense` policy (`block` action).", "content": { "text/plain": { "schema": { "type": "string" } } } },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "500": { "$ref": "#/components/responses/InternalError" }
         }
@@ -465,13 +465,38 @@
       },
       "RetainResponse": {
         "type": "object",
-        "required": ["memories_stored", "entities", "edges_created", "reasks", "document_id"],
+        "required": ["memories_stored", "entities", "edges_created", "reasks", "document_id", "defense"],
         "properties": {
           "memories_stored": { "type": "integer", "minimum": 0 },
           "entities": { "type": "array", "items": { "type": "string" }, "description": "Canonical names of the entities the new memories link to." },
           "edges_created": { "type": "integer", "minimum": 0 },
           "reasks": { "type": "integer", "minimum": 0, "description": "Chunk extractions re-asked at half size after a parse failure." },
-          "document_id": { "type": ["string", "null"], "description": "The document the memories were filed under (generated when not given)." }
+          "document_id": { "type": ["string", "null"], "description": "The document the memories were filed under (generated when not given)." },
+          "defense": {
+            "oneOf": [{ "$ref": "#/components/schemas/DefenseReport" }, { "type": "null" }],
+            "description": "What the bank's `memory_defense` policy did (null = nothing matched or no policy). `redact` means the stored text is scrubbed."
+          }
+        }
+      },
+      "DefenseReport": {
+        "type": "object",
+        "required": ["action", "detector", "message", "matched_types", "hits"],
+        "properties": {
+          "action": { "type": "string", "enum": ["allow", "redact", "block"] },
+          "detector": { "type": ["string", "null"] },
+          "message": { "type": "string" },
+          "matched_types": { "type": "array", "items": { "type": "string" }, "description": "Pattern labels that matched, e.g. `github_token`." },
+          "hits": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["detector", "preview"],
+              "properties": {
+                "detector": { "type": "string" },
+                "preview": { "type": "string", "description": "Fingerprinted value (`ghp_...AAAA`), never the raw secret." }
+              }
+            }
+          }
         }
       },
       "MemoryRef": {

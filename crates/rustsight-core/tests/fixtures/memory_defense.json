@@ -1,0 +1,773 @@
+{
+  "source": "hindsight-api 1.2.1 extensions/memory_defense.py apply_redaction",
+  "pattern_labels": [
+    "anthropic_key",
+    "openai_project_key",
+    "openai_admin_key",
+    "openai_key",
+    "google_api_key",
+    "google_oauth_token",
+    "xai_key",
+    "groq_key",
+    "hindsight_key",
+    "huggingface_token",
+    "replicate_token",
+    "perplexity_key",
+    "databricks_token",
+    "aws_access_key",
+    "aws_session_token",
+    "aws_secret_key",
+    "digitalocean_token",
+    "github_fg_pat",
+    "github_token",
+    "github_app_token",
+    "github_user_token",
+    "github_refresh",
+    "github_oauth",
+    "gitlab_pat",
+    "npm_token",
+    "pypi_token",
+    "stripe_secret",
+    "stripe_restricted",
+    "square_token",
+    "braintree_token",
+    "slack_token",
+    "slack_webhook",
+    "twilio_api_key",
+    "twilio_account_sid",
+    "sendgrid_key",
+    "mailgun_key",
+    "discord_bot",
+    "telegram_bot",
+    "shopify_token",
+    "db_url_postgres",
+    "db_url_mysql",
+    "db_url_mongodb",
+    "private_key_pem",
+    "jwt",
+    "credit_card",
+    "ssn_us"
+  ],
+  "cases": [
+    {
+      "input": "anthropic sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA end",
+      "content": "anthropic [REDACTED:anthropic_key] end",
+      "matched_types": [
+        "anthropic_key"
+      ],
+      "hits": [
+        {
+          "detector": "anthropic_key",
+          "preview": "sk-a...AAAA"
+        }
+      ]
+    },
+    {
+      "input": "project sk-proj-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "content": "project [REDACTED:openai_project_key]",
+      "matched_types": [
+        "openai_project_key"
+      ],
+      "hits": [
+        {
+          "detector": "openai_project_key",
+          "preview": "sk-p...AAAA"
+        }
+      ]
+    },
+    {
+      "input": "admin sk-admin-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "content": "admin [REDACTED:openai_admin_key]",
+      "matched_types": [
+        "openai_admin_key"
+      ],
+      "hits": [
+        {
+          "detector": "openai_admin_key",
+          "preview": "sk-a...AAAA"
+        }
+      ]
+    },
+    {
+      "input": "plain sk-AAAAAAAAAAAAAAAAAAAAAAAA",
+      "content": "plain [REDACTED:openai_key]",
+      "matched_types": [
+        "openai_key"
+      ],
+      "hits": [
+        {
+          "detector": "openai_key",
+          "preview": "sk-A...AAAA"
+        }
+      ]
+    },
+    {
+      "input": "google AIzaAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "content": "google [REDACTED:google_api_key]",
+      "matched_types": [
+        "google_api_key"
+      ],
+      "hits": [
+        {
+          "detector": "google_api_key",
+          "preview": "AIza...AAAA"
+        }
+      ]
+    },
+    {
+      "input": "oauth ya29.AAAAAAAAAAAAAAAAAAAAAAAAA",
+      "content": "oauth [REDACTED:google_oauth_token]",
+      "matched_types": [
+        "google_oauth_token"
+      ],
+      "hits": [
+        {
+          "detector": "google_oauth_token",
+          "preview": "ya29...AAAA"
+        }
+      ]
+    },
+    {
+      "input": "xai xai-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "content": "xai [REDACTED:xai_key]",
+      "matched_types": [
+        "xai_key"
+      ],
+      "hits": [
+        {
+          "detector": "xai_key",
+          "preview": "xai-...AAAA"
+        }
+      ]
+    },
+    {
+      "input": "groq gsk_AAAAAAAAAAAAAAAAAAAAAAAA",
+      "content": "groq [REDACTED:groq_key]",
+      "matched_types": [
+        "groq_key"
+      ],
+      "hits": [
+        {
+          "detector": "groq_key",
+          "preview": "gsk_...AAAA"
+        }
+      ]
+    },
+    {
+      "input": "hindsight hsk_a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4 and hsk_sys_a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4_deadbeef00",
+      "content": "hindsight [REDACTED:hindsight_key] and [REDACTED:hindsight_key]",
+      "matched_types": [
+        "hindsight_key"
+      ],
+      "hits": [
+        {
+          "detector": "hindsight_key",
+          "preview": "hsk_...c3d4"
+        },
+        {
+          "detector": "hindsight_key",
+          "preview": "hsk_...ef00"
+        }
+      ]
+    },
+    {
+      "input": "hf hf_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "content": "hf [REDACTED:huggingface_token]",
+      "matched_types": [
+        "huggingface_token"
+      ],
+      "hits": [
+        {
+          "detector": "huggingface_token",
+          "preview": "hf_A...AAAA"
+        }
+      ]
+    },
+    {
+      "input": "replicate r8_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "content": "replicate [REDACTED:replicate_token]",
+      "matched_types": [
+        "replicate_token"
+      ],
+      "hits": [
+        {
+          "detector": "replicate_token",
+          "preview": "r8_A...AAAA"
+        }
+      ]
+    },
+    {
+      "input": "pplx pplx-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "content": "pplx [REDACTED:perplexity_key]",
+      "matched_types": [
+        "perplexity_key"
+      ],
+      "hits": [
+        {
+          "detector": "perplexity_key",
+          "preview": "pplx...AAAA"
+        }
+      ]
+    },
+    {
+      "input": "databricks dapiAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "content": "databricks [REDACTED:databricks_token]",
+      "matched_types": [
+        "databricks_token"
+      ],
+      "hits": [
+        {
+          "detector": "databricks_token",
+          "preview": "dapi...AAAA"
+        }
+      ]
+    },
+    {
+      "input": "aws AKIAIOSFODNN7EXAMPLE and ASIAIOSFODNN7EXAMPLE",
+      "content": "aws [REDACTED:aws_access_key] and [REDACTED:aws_session_token]",
+      "matched_types": [
+        "aws_access_key",
+        "aws_session_token"
+      ],
+      "hits": [
+        {
+          "detector": "aws_access_key",
+          "preview": "AKIA...MPLE"
+        },
+        {
+          "detector": "aws_session_token",
+          "preview": "ASIA...MPLE"
+        }
+      ]
+    },
+    {
+      "input": "aws_secret_access_key = \"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\"",
+      "content": "[REDACTED:aws_secret_key]\"",
+      "matched_types": [
+        "aws_secret_key"
+      ],
+      "hits": [
+        {
+          "detector": "aws_secret_key",
+          "preview": "wJal...EKEY"
+        }
+      ]
+    },
+    {
+      "input": "do dop_v1_a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4",
+      "content": "do [REDACTED:digitalocean_token]",
+      "matched_types": [
+        "digitalocean_token"
+      ],
+      "hits": [
+        {
+          "detector": "digitalocean_token",
+          "preview": "dop_...c3d4"
+        }
+      ]
+    },
+    {
+      "input": "gh github_pat_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "content": "gh [REDACTED:github_fg_pat]",
+      "matched_types": [
+        "github_fg_pat"
+      ],
+      "hits": [
+        {
+          "detector": "github_fg_pat",
+          "preview": "gith...AAAA"
+        }
+      ]
+    },
+    {
+      "input": "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA ghs_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA ghu_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA ghr_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA gho_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "content": "[REDACTED:github_token] [REDACTED:github_app_token] [REDACTED:github_user_token] [REDACTED:github_refresh] [REDACTED:github_oauth]",
+      "matched_types": [
+        "github_token",
+        "github_app_token",
+        "github_user_token",
+        "github_refresh",
+        "github_oauth"
+      ],
+      "hits": [
+        {
+          "detector": "github_token",
+          "preview": "ghp_...AAAA"
+        },
+        {
+          "detector": "github_app_token",
+          "preview": "ghs_...AAAA"
+        },
+        {
+          "detector": "github_user_token",
+          "preview": "ghu_...AAAA"
+        },
+        {
+          "detector": "github_refresh",
+          "preview": "ghr_...AAAA"
+        },
+        {
+          "detector": "github_oauth",
+          "preview": "gho_...AAAA"
+        }
+      ]
+    },
+    {
+      "input": "gitlab glpat-AAAAAAAAAAAAAAAAAAAAAA",
+      "content": "gitlab [REDACTED:gitlab_pat]",
+      "matched_types": [
+        "gitlab_pat"
+      ],
+      "hits": [
+        {
+          "detector": "gitlab_pat",
+          "preview": "glpa...AAAA"
+        }
+      ]
+    },
+    {
+      "input": "npm npm_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "content": "npm [REDACTED:npm_token]",
+      "matched_types": [
+        "npm_token"
+      ],
+      "hits": [
+        {
+          "detector": "npm_token",
+          "preview": "npm_...AAAA"
+        }
+      ]
+    },
+    {
+      "input": "pypi pypi-AgEIcHlwaS5vcmcAAAAAAAAAAAAAAAAAAAAAAAA",
+      "content": "pypi [REDACTED:pypi_token]",
+      "matched_types": [
+        "pypi_token"
+      ],
+      "hits": [
+        {
+          "detector": "pypi_token",
+          "preview": "pypi...AAAA"
+        }
+      ]
+    },
+    {
+      "input": "stripe sk_live_AAAAAAAAAAAAAAAAAAAAAAAA rk_test_AAAAAAAAAAAAAAAAAAAAAAAA",
+      "content": "stripe [REDACTED:stripe_secret] [REDACTED:stripe_restricted]",
+      "matched_types": [
+        "stripe_secret",
+        "stripe_restricted"
+      ],
+      "hits": [
+        {
+          "detector": "stripe_secret",
+          "preview": "sk_l...AAAA"
+        },
+        {
+          "detector": "stripe_restricted",
+          "preview": "rk_t...AAAA"
+        }
+      ]
+    },
+    {
+      "input": "square sq0atp-AAAAAAAAAAAAAAAAAAAAAAAA",
+      "content": "square [REDACTED:square_token]",
+      "matched_types": [
+        "square_token"
+      ],
+      "hits": [
+        {
+          "detector": "square_token",
+          "preview": "sq0a...AAAA"
+        }
+      ]
+    },
+    {
+      "input": "braintree access_token$production$aaaaaaaaaaaaaaaa$a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4",
+      "content": "braintree [REDACTED:braintree_token]",
+      "matched_types": [
+        "braintree_token"
+      ],
+      "hits": [
+        {
+          "detector": "braintree_token",
+          "preview": "acce...c3d4"
+        }
+      ]
+    },
+    {
+      "input": "slack xoxb-1234567890-abcdefghij",
+      "content": "slack [REDACTED:slack_token]",
+      "matched_types": [
+        "slack_token"
+      ],
+      "hits": [
+        {
+          "detector": "slack_token",
+          "preview": "xoxb...ghij"
+        }
+      ]
+    },
+    {
+      "input": "hook https://hooks.slack.com/services/T01234567/B01234567/abcdefghijklmnopqrstuvwx",
+      "content": "hook [REDACTED:slack_webhook]",
+      "matched_types": [
+        "slack_webhook"
+      ],
+      "hits": [
+        {
+          "detector": "slack_webhook",
+          "preview": "http...uvwx"
+        }
+      ]
+    },
+    {
+      "input": "twilio SKa1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4 ACa1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4",
+      "content": "twilio [REDACTED:twilio_api_key] [REDACTED:twilio_account_sid]",
+      "matched_types": [
+        "twilio_api_key",
+        "twilio_account_sid"
+      ],
+      "hits": [
+        {
+          "detector": "twilio_api_key",
+          "preview": "SKa1...c3d4"
+        },
+        {
+          "detector": "twilio_account_sid",
+          "preview": "ACa1...c3d4"
+        }
+      ]
+    },
+    {
+      "input": "sendgrid SG.AAAAAAAAAAAAAAAAAAAAAA.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "content": "sendgrid [REDACTED:sendgrid_key]",
+      "matched_types": [
+        "sendgrid_key"
+      ],
+      "hits": [
+        {
+          "detector": "sendgrid_key",
+          "preview": "SG.A...AAAA"
+        }
+      ]
+    },
+    {
+      "input": "mailgun key-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "content": "mailgun [REDACTED:mailgun_key]",
+      "matched_types": [
+        "mailgun_key"
+      ],
+      "hits": [
+        {
+          "detector": "mailgun_key",
+          "preview": "key-...AAAA"
+        }
+      ]
+    },
+    {
+      "input": "discord MAAAAAAAAAAAAAAAAAAAAAAA.AAAAAA.AAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "content": "discord [REDACTED:discord_bot]",
+      "matched_types": [
+        "discord_bot"
+      ],
+      "hits": [
+        {
+          "detector": "discord_bot",
+          "preview": "MAAA...AAAA"
+        }
+      ]
+    },
+    {
+      "input": "telegram 123456789:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "content": "telegram [REDACTED:telegram_bot]",
+      "matched_types": [
+        "telegram_bot"
+      ],
+      "hits": [
+        {
+          "detector": "telegram_bot",
+          "preview": "1234...AAAA"
+        }
+      ]
+    },
+    {
+      "input": "shopify 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",
+      "content": "shopify [REDACTED:shopify_token]",
+      "matched_types": [
+        "shopify_token"
+      ],
+      "hits": [
+        {
+          "detector": "shopify_token",
+          "preview": "shpa...c3d4"
+        }
+      ]
+    },
+    {
+      "input": "pg postgres://user:pass@db.example.com:5432/app and postgresql://u:p@h/d",
+      "content": "pg [REDACTED:db_url_postgres] and [REDACTED:db_url_postgres]",
+      "matched_types": [
+        "db_url_postgres"
+      ],
+      "hits": [
+        {
+          "detector": "db_url_postgres",
+          "preview": "post.../app"
+        },
+        {
+          "detector": "db_url_postgres",
+          "preview": "post...@h/d"
+        }
+      ]
+    },
+    {
+      "input": "mysql://root:hunter2@localhost/db",
+      "content": "[REDACTED:db_url_mysql]",
+      "matched_types": [
+        "db_url_mysql"
+      ],
+      "hits": [
+        {
+          "detector": "db_url_mysql",
+          "preview": "mysq...t/db"
+        }
+      ]
+    },
+    {
+      "input": "mongodb+srv://admin:s3cret@cluster0.example.net/test",
+      "content": "[REDACTED:db_url_mongodb]",
+      "matched_types": [
+        "db_url_mongodb"
+      ],
+      "hits": [
+        {
+          "detector": "db_url_mongodb",
+          "preview": "mong...test"
+        }
+      ]
+    },
+    {
+      "input": "-----BEGIN RSA PRIVATE KEY----- and -----BEGIN PGP PRIVATE KEY BLOCK-----",
+      "content": "[REDACTED:private_key_pem] and [REDACTED:private_key_pem]",
+      "matched_types": [
+        "private_key_pem"
+      ],
+      "hits": [
+        {
+          "detector": "private_key_pem",
+          "preview": " B...CK"
+        }
+      ]
+    },
+    {
+      "input": "jwt eyJAAAAAAAAAAAA.eyJAAAAAAAAAAAA.AAAAAAAAAAAA",
+      "content": "jwt [REDACTED:jwt]",
+      "matched_types": [
+        "jwt"
+      ],
+      "hits": [
+        {
+          "detector": "jwt",
+          "preview": "eyJA...AAAA"
+        }
+      ]
+    },
+    {
+      "input": "card 4111 1111 1111 1111 and 5500-0000-0000-0004",
+      "content": "card [REDACTED:credit_card] and [REDACTED:credit_card]",
+      "matched_types": [
+        "credit_card"
+      ],
+      "hits": [
+        {
+          "detector": "credit_card",
+          "preview": "4111...1111"
+        },
+        {
+          "detector": "credit_card",
+          "preview": "5500...0004"
+        }
+      ]
+    },
+    {
+      "input": "ssn 123-45-6789",
+      "content": "ssn [REDACTED:ssn_us]",
+      "matched_types": [
+        "ssn_us"
+      ],
+      "hits": [
+        {
+          "detector": "ssn_us",
+          "preview": "12...89"
+        }
+      ]
+    },
+    {
+      "input": "凭证为sk_test_AAAAAAAAAAAAAAAAAAAAAAAA请保密",
+      "content": "凭证为[REDACTED:stripe_secret]请保密",
+      "matched_types": [
+        "stripe_secret"
+      ],
+      "hits": [
+        {
+          "detector": "stripe_secret",
+          "preview": "sk_t...AAAA"
+        }
+      ]
+    },
+    {
+      "input": "prefix_ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "content": "prefix_ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "matched_types": [],
+      "hits": []
+    },
+    {
+      "input": "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAsuffix",
+      "content": "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAsuffix",
+      "matched_types": [],
+      "hits": []
+    },
+    {
+      "input": "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-dash",
+      "content": "[REDACTED:github_token]-dash",
+      "matched_types": [
+        "github_token"
+      ],
+      "hits": [
+        {
+          "detector": "github_token",
+          "preview": "ghp_...AAAA"
+        }
+      ]
+    },
+    {
+      "input": "ts 2026 1121 0930 1234 not a card",
+      "content": "ts 2026 1121 0930 1234 not a card",
+      "matched_types": [],
+      "hits": []
+    },
+    {
+      "input": "0000 0000 0000 0000",
+      "content": "0000 0000 0000 0000",
+      "matched_types": [],
+      "hits": []
+    },
+    {
+      "input": "2026 4111 1111 1111 1111",
+      "content": "2026 [REDACTED:credit_card]",
+      "matched_types": [
+        "credit_card"
+      ],
+      "hits": [
+        {
+          "detector": "credit_card",
+          "preview": "4111...1111"
+        }
+      ]
+    },
+    {
+      "input": "price 4111111111111111.50",
+      "content": "price 4111111111111111.50",
+      "matched_types": [],
+      "hits": []
+    },
+    {
+      "input": "v1.4111111111111111",
+      "content": "v1.4111111111111111",
+      "matched_types": [],
+      "hits": []
+    },
+    {
+      "input": "id 4111a111-1111-1111-1111-111111111111 uuid",
+      "content": "id 4111a111-1111-1111-1111-111111111111 uuid",
+      "matched_types": [],
+      "hits": []
+    },
+    {
+      "input": "uuid 41111111-1111-1111-1111-111111111111",
+      "content": "uuid 41111111-1111-1111-1111-111111111111",
+      "matched_types": [],
+      "hits": []
+    },
+    {
+      "input": "４１１１ １１１１ １１１１ １１１１",
+      "content": "[REDACTED:credit_card]",
+      "matched_types": [
+        "credit_card"
+      ],
+      "hits": [
+        {
+          "detector": "credit_card",
+          "preview": "４１１１...１１１１"
+        }
+      ]
+    },
+    {
+      "input": "card,4111111111111111,ok",
+      "content": "card,[REDACTED:credit_card],ok",
+      "matched_types": [
+        "credit_card"
+      ],
+      "hits": [
+        {
+          "detector": "credit_card",
+          "preview": "4111...1111"
+        }
+      ]
+    },
+    {
+      "input": "ports 8080 8081 8082 8083",
+      "content": "ports 8080 8081 8082 8083",
+      "matched_types": [],
+      "hits": []
+    },
+    {
+      "input": "two ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA ghp_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+      "content": "two [REDACTED:github_token] [REDACTED:github_token]",
+      "matched_types": [
+        "github_token"
+      ],
+      "hits": [
+        {
+          "detector": "github_token",
+          "preview": "ghp_...AAAA"
+        },
+        {
+          "detector": "github_token",
+          "preview": "ghp_...BBBB"
+        }
+      ]
+    },
+    {
+      "input": "order sk-ant-AAAAAAAAAAAAAAAAAAAAAAAA then sk-AAAAAAAAAAAAAAAAAAAAAAAA",
+      "content": "order [REDACTED:anthropic_key] then [REDACTED:openai_key]",
+      "matched_types": [
+        "anthropic_key",
+        "openai_key"
+      ],
+      "hits": [
+        {
+          "detector": "anthropic_key",
+          "preview": "sk-a...AAAA"
+        },
+        {
+          "detector": "openai_key",
+          "preview": "sk-A...AAAA"
+        }
+      ]
+    },
+    {
+      "input": "Alice joined Google in 2024 and moved to Berlin.",
+      "content": "Alice joined Google in 2024 and moved to Berlin.",
+      "matched_types": [],
+      "hits": []
+    },
+    {
+      "input": "",
+      "content": "",
+      "matched_types": [],
+      "hits": []
+    }
+  ]
+}
