@@ -172,6 +172,9 @@ pub struct Engine {
     /// Lifecycle event receiver (RS-10b); unset drops events. Settable
     /// once, also after the engine is shared (`set_event_sink`).
     events: std::sync::OnceLock<Arc<dyn EventSink>>,
+    /// File-to-text converters for file retains (RS-10c); `text` and
+    /// `html` built in, more via `with_parsers`.
+    pub parsers: Arc<crate::files::ParserRegistry>,
 }
 
 impl Engine {
@@ -198,7 +201,14 @@ impl Engine {
             consolidate_lock: Mutex::new(()),
             bank_gates: Arc::default(),
             events: std::sync::OnceLock::new(),
+            parsers: Arc::new(crate::files::ParserRegistry::builtin()),
         }
+    }
+
+    /// Replace the file parser registry (to add PDF/DOCX/OCR converters).
+    pub fn with_parsers(mut self, parsers: crate::files::ParserRegistry) -> Self {
+        self.parsers = Arc::new(parsers);
+        self
     }
 
     /// Route lifecycle events (retain / consolidation / memory defense) to
@@ -301,7 +311,7 @@ impl Engine {
         bank.mission.clone()
     }
 
-    /// Delete a document and every memory extracted from it; entities whose
+    /// Delete a document, its attachments, and every memory extracted from it; entities whose
     /// facts or observations changed are re-queued for consolidation.
     /// Returns the number of memories deleted.
     pub fn forget_document(&self, bank_id: &str, document_id: &str) -> Result<usize> {

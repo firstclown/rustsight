@@ -54,8 +54,18 @@ enum Cmd {
     Retain {
         #[arg(long)]
         bank: String,
+        #[arg(long, required_unless_present = "file", conflicts_with = "file")]
+        content: Option<String>,
+        /// Retain a file instead: parsed like the files/retain API (text,
+        /// html), its bytes kept as an attachment of the document.
         #[arg(long)]
-        content: String,
+        file: Option<std::path::PathBuf>,
+        /// Parser chain for --file, comma-separated (default
+        /// RUSTSIGHT_FILE_PARSER, else text,html).
+        #[arg(long, requires = "file")]
+        parser: Option<String>,
+        #[arg(long)]
+        document_id: Option<String>,
         #[arg(long)]
         context: Option<String>,
         #[arg(long)]
@@ -282,18 +292,26 @@ async fn main() {
         Cmd::Retain {
             bank,
             content,
+            file,
+            parser,
+            document_id,
             context,
             timestamp_ms,
-        } => engine
-            .retain(RetainRequest {
+        } => {
+            let req = RetainRequest {
                 bank_id: bank,
-                content,
+                content: content.unwrap_or_default(),
                 context,
                 timestamp_ms,
+                document_id,
                 ..Default::default()
-            })
-            .await
-            .map(|r| print_json(&r)),
+            };
+            match file {
+                Some(path) => retain_file(&engine, req, &path, parser.as_deref()).await,
+                None => engine.retain(req).await,
+            }
+            .map(|r| print_json(&r))
+        }
         Cmd::Recall {
             bank,
             query,
@@ -400,6 +418,81 @@ async fn main() {
     }
 }
 
+/// Media type for an attachment, from the file extension.
+fn guess_content_type(path: &std::path::Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "txt" | "log" => "text/plain",
+        "md" | "markdown" => "text/markdown",
+        "csv" => "text/csv",
+        "tsv" => "text/tab-separated-values",
+        "json" => "application/json",
+        "yaml" | "yml" => "application/yaml",
+        "xml" => "application/xml",
+        "html" | "htm" => "text/html",
+        "pdf" => "application/pdf",
+        _ => return None,
+    })
+}
+
+/// `retain --file`: the files/retain flow, run in-process — store the
+/// bytes as an attachment, convert with the parser chain, retain the text
+/// with `attachment_id` / `filename` metadata.
+async fn retain_file(
+    engine: &Engine,
+    mut req: RetainRequest,
+    path: &std::path::Path,
+    parser: Option<&str>,
+) -> rustsight_core::Result<rustsight_core::RetainResponse> {
+    use rustsight_core::files::{Attachment, FileInput};
+    let bytes = std::fs::read(path)
+        .map_err(|e| rustsight_core::Error::BadInput(format!("reading {}: {e}", path.display())))?;
+    let filename = path
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".into());
+    let chain: Vec<String> = match parser {
+        Some(raw) => raw
+            .split(',')
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect(),
+        None => rustsight_server::files::FileSettings::from_env().default_chain,
+    };
+    let content_type = guess_content_type(path);
+    let converted = engine.parsers.convert_with_fallback(
+        &chain,
+        &FileInput {
+            bytes: &bytes,
+            filename: &filename,
+            content_type,
+        },
+    )?;
+    let document_id = req
+        .document_id
+        .clone()
+        .unwrap_or_else(|| format!("file_{}", uuid::Uuid::new_v4()));
+    let attachment = Attachment::new(
+        &req.bank_id,
+        &document_id,
+        &filename,
+        content_type,
+        bytes,
+        engine.clock.now_ms(),
+    );
+    engine.store.put_attachment(&attachment)?;
+    req.content = converted.text;
+    req.document_id = Some(document_id.clone());
+    let metadata = req.metadata.get_or_insert_with(Default::default);
+    metadata.insert("attachment_id".into(), attachment.id.clone());
+    metadata.insert("filename".into(), filename);
+    let resp = engine.retain(req).await?;
+    engine
+        .store
+        .prune_document_attachments(&attachment.bank_id, &document_id, &attachment.id)?;
+    Ok(resp)
+}
+
 #[cfg(test)]
 mod tests {
     use super::serve_addr;
@@ -423,5 +516,13 @@ mod tests {
             serve_addr("127.0.0.1:8888", Some("::1"), Some(1)),
             "[::1]:1"
         );
+    }
+
+    #[test]
+    fn file_content_types_follow_the_extension() {
+        let ct = |p: &str| super::guess_content_type(std::path::Path::new(p));
+        assert_eq!(ct("a/Notes.MD"), Some("text/markdown"));
+        assert_eq!(ct("page.htm"), Some("text/html"));
+        assert_eq!(ct("blob"), None);
     }
 }

@@ -96,6 +96,11 @@ trait (`search_semantic`).
     RUSTSIGHT_API_TOKEN       optional; bearer token required by every HTTP
                               endpoint except /healthz (see below)
     RUSTSIGHT_API_TOKEN_FILE  optional; read the token from a file instead
+    RUSTSIGHT_ENABLE_FILE_UPLOAD_API  true | false (default true); the
+                              files/retain endpoint (see "File ingest")
+    RUSTSIGHT_FILE_PARSER     default parser chain for uploads (default text,html)
+    RUSTSIGHT_FILE_CONVERSION_MAX_BATCH_SIZE  files per upload (default 10)
+    RUSTSIGHT_FILE_CONVERSION_MAX_BATCH_SIZE_MB  total upload size (default 100)
     RUSTSIGHT_WEBHOOK_URL     optional global webhook for every bank (see
                               "Webhooks"); _SECRET signs it, _EVENT_TYPES is a
                               comma list (default consolidation.completed)
@@ -135,6 +140,8 @@ untouched and served side by side.
     GET    /v1/default/banks/{bank_id}/operations          list, newest first
     GET    /v1/default/banks/{bank_id}/operations/{id}     async retain status
     POST   /v1/default/banks/{bank_id}/operations/{id}/retry
+    POST   /v1/default/banks/{bank_id}/files/retain        multipart upload, async
+    GET    /v1/default/banks/{bank_id}/attachments/{id}    a file's original bytes
     POST   /v1/default/banks/{bank_id}/webhooks            register (GET lists)
     PATCH  /v1/default/banks/{bank_id}/webhooks/{id}       (DELETE too)
     GET    /v1/default/banks/{bank_id}/webhooks/{id}/deliveries
@@ -207,7 +214,11 @@ Behavioral differences to know before swapping:
   Hindsight uses the ranked results from before that cut.
 - **Webhook event types are validated.** Registering an event type other
   than the three below is a 422; Hindsight accepts it and never fires it.
-- Not implemented: mental-model / page / directive / file-upload
+- **File parsers are `text` and `html`.** Hindsight's `markitdown` / `iris`
+  are not built in; naming them is the same 400 Hindsight gives for a
+  parser the server does not enable. PDF and Office files fail their
+  operation until a parser for them is registered.
+- Not implemented: mental-model / page / directive
   endpoints, cancelling or deleting operations, the HTTP MCP endpoint, opinions
   via this API (a rustsight-native kind, never returned here).
 
@@ -393,6 +404,40 @@ and `retry_base_delay_ms`; other errors (auth, bad requests) fail fast. If a
 chunk's extraction output fails to parse (e.g. JSON truncated by an output
 token limit), the chunk is re-asked once at half size before the error
 surfaces.
+
+## File ingest
+`POST /v1/default/banks/{id}/files/retain` takes Hindsight's multipart
+upload: one or more `files` parts plus a `request` JSON part with an
+optional `parser` (a name or an ordered fallback list) and
+`files_metadata` (one entry per file: `document_id`, `context`, `tags`,
+`metadata`, `timestamp`, `parser`). It is always asynchronous and answers
+`{"operation_ids": [...]}`, one `file_convert_retain` operation per file.
+
+Each file's bytes are stored with its document (generated as
+`file_<uuid>` when not given) before the response returns, so a restart
+resumes the work. The operation converts the bytes with the parser chain
+and retains the text like a JSON retain item — Memory Defense, tags and
+timestamps apply — and every resulting fact carries `attachment_id` and
+`filename` in its metadata. `GET /v1/default/banks/{id}/attachments/{attachment_id}`
+serves the original bytes with the uploaded Content-Type.
+
+- Parsers: `text` (UTF-8 text, markdown, CSV, JSON, YAML, XML, source code;
+  declines HTML and binaries) and `html` (visible text: scripts, styles and
+  comments dropped, entities decoded). A chain tries each in order until
+  one succeeds; the default chain is `RUSTSIGHT_FILE_PARSER` (`text,html`).
+  Embedders add converters with `Engine::with_parsers` and a
+  `rustsight_core::files::FileParser`.
+- Limits: `RUSTSIGHT_FILE_CONVERSION_MAX_BATCH_SIZE` files (10) and
+  `_MB` total megabytes (100) per request; more is a 400, as are an
+  unavailable parser, a `files_metadata` count that does not match the files,
+  and per-file fields placed at the top level of `request`.
+- Attachment ids are the first 12 hex characters of the file's sha256.
+  Re-uploading into a document replaces its attachment once the new retain
+  succeeds; deleting the document or the bank deletes its attachments.
+- Hindsight converts in one operation and retains in a second; here one
+  operation does both, so waiting on the returned id covers the retain.
+- Locally: `rustsight retain --bank B --file notes.md [--parser text]
+  [--document-id D]` runs the same conversion in-process.
 
 ## Webhooks
 Rustsight reports three lifecycle events, with Hindsight's names, statuses

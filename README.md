@@ -27,6 +27,8 @@ agents.
   embeddings endpoint (OpenAI, OpenRouter, Ollama, vLLM, …). It can also run
   a local cross-encoder reranker in-process, on CPU or CUDA.
 - **MCP built in.** `rustsight mcp` exposes memory as tools over stdio.
+- **Files in, facts out.** Upload text, markdown or HTML files; their facts
+  link back to the stored original.
 - **Secrets stay out.** Opt-in per-bank Memory Defense redacts or blocks
   API keys, tokens and PII before anything is stored.
 

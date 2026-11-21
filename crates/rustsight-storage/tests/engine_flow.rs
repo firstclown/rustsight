@@ -3583,3 +3583,32 @@ async fn blocked_retain_reports_defense_but_not_completion() {
     assert_eq!(blocked.len(), 1);
     assert_eq!(blocked[0].status, "block");
 }
+
+// ── RS-10c: attachments ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn attachments_die_with_their_document_and_bank() {
+    use rustsight_core::files::Attachment;
+    let e = engine();
+    retain(&e, "att", "Alice joined Google.").await;
+    let put = |doc: &str, bytes: &[u8]| {
+        let a = Attachment::new("att", doc, "f.txt", Some("text/plain"), bytes.to_vec(), 1);
+        e.store.put_attachment(&a).unwrap();
+        a.id
+    };
+    let a = put("doc-a", b"one");
+    let b = put("doc-b", b"two");
+    // The same bytes in two documents: one id, held by both.
+    let shared = put("doc-b", b"one");
+    assert_eq!(a, shared);
+
+    e.forget_document("att", "doc-a").unwrap();
+    let survivor = e.store.get_attachment("att", &a).unwrap().unwrap();
+    assert_eq!(survivor.document_id, "doc-b", "doc-b's copy outlives doc-a");
+    assert_eq!(survivor.bytes, b"one");
+    assert!(e.store.get_attachment("att", &b).unwrap().is_some());
+
+    e.delete_bank("att").await.unwrap();
+    assert!(e.store.get_attachment("att", &a).unwrap().is_none());
+    assert!(e.store.get_attachment("att", &b).unwrap().is_none());
+}

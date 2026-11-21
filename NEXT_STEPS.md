@@ -707,12 +707,12 @@ operation per file (`file_convert_retain`).
 - CLI: `rustsight retain --file <path>` runs the same parse locally.
 
 DoD:
-- [ ] Parser unit tests (text decode, HTML strip incl. script/style, chain
+- [x] Parser unit tests (text decode, HTML strip incl. script/style, chain
       fallback, unsupported type error).
-- [ ] compat: multipart upload → operation completes → memories carry
+- [x] compat: multipart upload → operation completes → memories carry
       `attachment_id`; attachment download returns the bytes; bad parser /
       too many files / metadata count mismatch → 400.
-- [ ] Storage: attachment rows die with their document and bank.
+- [x] Storage: attachment rows die with their document and bank.
 
 ### RS-10d — Bank templates · S/M
 

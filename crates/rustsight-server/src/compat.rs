@@ -101,6 +101,7 @@ pub fn public_routes() -> Router {
 pub fn routes() -> Router<Arc<Engine>> {
     Router::new()
         .merge(crate::webhooks::routes())
+        .merge(crate::files::routes())
         .route("/v1/default/banks", get(list_banks))
         .route(
             "/v1/default/banks/{bank_id}",
@@ -287,6 +288,8 @@ async fn openapi() -> Json<Value> {
             (format!("{bank}/operations")): { "get": {} },
             (format!("{bank}/operations/{{operation_id}}")): { "get": {} },
             (format!("{bank}/operations/{{operation_id}}/retry")): { "post": {} },
+            (format!("{bank}/files/retain")): { "post": {} },
+            (format!("{bank}/attachments/{{attachment_id}}")): { "get": {} },
             (format!("{bank}/webhooks")): { "get": {}, "post": {} },
             (format!("{bank}/webhooks/{{webhook_id}}")): { "patch": {}, "delete": {} },
             (format!("{bank}/webhooks/{{webhook_id}}/deliveries")): { "get": {} },
@@ -659,7 +662,7 @@ struct RetainBody {
 }
 
 /// One retain item, normalized from the wire shape.
-struct RetainItem {
+pub(crate) struct RetainItem {
     content: String,
     timestamp_ms: Option<i64>,
     timestamp_unset: bool,
@@ -727,7 +730,7 @@ fn item_content(v: &Value, index: usize) -> Result<String, ApiError> {
     }
 }
 
-fn parse_item(v: &Value, index: usize) -> Result<RetainItem, ApiError> {
+pub(crate) fn parse_item(v: &Value, index: usize) -> Result<RetainItem, ApiError> {
     let obj = v
         .as_object()
         .ok_or_else(|| ApiError::unprocessable(format!("items[{index}] must be an object")))?;
@@ -983,7 +986,7 @@ async fn finish_operation(engine: &Engine, mut op: Operation, outcome: Result<us
     }
 }
 
-fn spawn_operation(engine: Arc<Engine>, op: Operation) {
+pub(crate) fn spawn_operation(engine: Arc<Engine>, op: Operation) {
     tokio::spawn(async move {
         let _slot = async_retain_slots().acquire().await;
         // Held through the final status write, so a bank delete either
@@ -993,23 +996,36 @@ fn spawn_operation(engine: Arc<Engine>, op: Operation) {
             Ok(Some(current)) if current.status == "pending" => {}
             _ => return,
         }
-        let items: Vec<Value> = op
-            .payload
-            .get("items")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
+        let is_file = op.kind == "file_convert_retain";
+        let items: Result<Vec<Value>, ApiError> = if is_file {
+            crate::files::converted_item(&engine, &op).map(|item| vec![item])
+        } else {
+            Ok(op
+                .payload
+                .get("items")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default())
+        };
         let document_tags = string_list(
             op.payload.get("document_tags").unwrap_or(&Value::Null),
             "document_tags",
         )
         .unwrap_or_default();
-        let outcome =
-            run_retain(&engine, &guard, &op.bank_id, &items, &document_tags, &op.id).await;
+        let outcome = match items {
+            Ok(items) => {
+                run_retain(&engine, &guard, &op.bank_id, &items, &document_tags, &op.id).await
+            }
+            Err(e) => Err(e),
+        };
+        let outcome = match outcome {
+            Ok(n) if is_file => crate::files::prune_replaced(&engine, &op).map(|_| n),
+            other => other,
+        };
         if let Err(ApiError(_, detail, _)) = &outcome {
             eprintln!(
-                "rustsight: async retain {} (bank {}) failed: {detail}",
-                op.id, op.bank_id
+                "rustsight: async {} {} (bank {}) failed: {detail}",
+                op.kind, op.id, op.bank_id
             );
         }
         finish_operation(&engine, op, outcome).await;
@@ -1135,6 +1151,7 @@ fn operation_json(op: &Operation) -> Value {
         "task_type": op.kind,
         "items_count": items.map_or(0, Vec::len),
         "document_id": document_id,
+        "filename": op.payload.get("filename"),
         "created_at": iso(op.created_at_ms),
         "updated_at": iso(op.updated_at_ms),
         "completed_at": if op.status == "pending" { None } else { iso(op.updated_at_ms) },

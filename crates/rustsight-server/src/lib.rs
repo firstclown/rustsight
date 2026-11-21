@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod compat;
+pub mod files;
 pub mod http;
 pub mod mcp;
 pub mod webhooks;

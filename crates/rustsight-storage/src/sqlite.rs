@@ -218,6 +218,19 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries(
 );
 CREATE INDEX IF NOT EXISTS idx_deliveries_due ON webhook_deliveries(status, next_attempt_at_ms);
 CREATE INDEX IF NOT EXISTS idx_deliveries_webhook ON webhook_deliveries(bank_id, webhook_id, created_at_ms);
+CREATE TABLE IF NOT EXISTS attachments(
+  bank_id TEXT NOT NULL,
+  document_id TEXT NOT NULL,
+  id TEXT NOT NULL,
+  filename TEXT NOT NULL,
+  content_type TEXT,
+  size INTEGER NOT NULL,
+  sha256 TEXT NOT NULL,
+  bytes BLOB NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(bank_id, document_id, id)
+);
+CREATE INDEX IF NOT EXISTS idx_attachments_id ON attachments(bank_id, id);
 CREATE TABLE IF NOT EXISTS mental_models(
   id TEXT PRIMARY KEY,
   bank_id TEXT NOT NULL,
@@ -1966,13 +1979,79 @@ impl MemoryStore for SqliteStore {
     }
 
     fn delete_document(&self, bank_id: &str, id: &str) -> Result<()> {
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction().map_err(store_err)?;
+        for sql in [
+            "DELETE FROM documents WHERE bank_id = ?1 AND id = ?2",
+            "DELETE FROM attachments WHERE bank_id = ?1 AND document_id = ?2",
+        ] {
+            tx.execute(sql, params![bank_id, id]).map_err(store_err)?;
+        }
+        tx.commit().map_err(store_err)?;
+        Ok(())
+    }
+
+    fn put_attachment(&self, a: &rustsight_core::files::Attachment) -> Result<()> {
         let conn = self.lock_conn();
         conn.execute(
-            "DELETE FROM documents WHERE bank_id = ?1 AND id = ?2",
-            params![bank_id, id],
+            "INSERT OR REPLACE INTO attachments(bank_id, document_id, id, filename, content_type, size, sha256, bytes, created_at_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                a.bank_id,
+                a.document_id,
+                a.id,
+                a.filename,
+                a.content_type,
+                a.bytes.len() as i64,
+                a.sha256,
+                a.bytes,
+                a.created_at_ms
+            ],
         )
         .map_err(store_err)?;
         Ok(())
+    }
+
+    fn get_attachment(
+        &self,
+        bank_id: &str,
+        id: &str,
+    ) -> Result<Option<rustsight_core::files::Attachment>> {
+        let conn = self.lock_conn();
+        conn.query_row(
+            "SELECT bank_id, document_id, id, filename, content_type, sha256, bytes, created_at_ms
+             FROM attachments WHERE bank_id = ?1 AND id = ?2
+             ORDER BY created_at_ms DESC LIMIT 1",
+            params![bank_id, id],
+            |r| {
+                Ok(rustsight_core::files::Attachment {
+                    bank_id: r.get(0)?,
+                    document_id: r.get(1)?,
+                    id: r.get(2)?,
+                    filename: r.get(3)?,
+                    content_type: r.get(4)?,
+                    sha256: r.get(5)?,
+                    bytes: r.get(6)?,
+                    created_at_ms: r.get(7)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(store_err)
+    }
+
+    fn prune_document_attachments(
+        &self,
+        bank_id: &str,
+        document_id: &str,
+        keep: &str,
+    ) -> Result<usize> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "DELETE FROM attachments WHERE bank_id = ?1 AND document_id = ?2 AND id <> ?3",
+            params![bank_id, document_id, keep],
+        )
+        .map_err(store_err)
     }
 
     fn insert_chunks(&self, chunks: &[Chunk]) -> Result<()> {
@@ -2074,6 +2153,7 @@ impl MemoryStore for SqliteStore {
             "DELETE FROM operations WHERE bank_id = ?1",
             "DELETE FROM webhooks WHERE bank_id = ?1",
             "DELETE FROM webhook_deliveries WHERE bank_id = ?1",
+            "DELETE FROM attachments WHERE bank_id = ?1",
         ] {
             tx.execute(sql, params![bank_id]).map_err(store_err)?;
         }

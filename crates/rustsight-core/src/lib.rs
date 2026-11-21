@@ -3,6 +3,7 @@ mod engine;
 mod entity;
 mod error;
 pub mod events;
+pub mod files;
 mod fusion;
 pub mod labels;
 mod links;

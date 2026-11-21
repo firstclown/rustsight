@@ -35,7 +35,7 @@ sqlite-vec = "=0.1.9"
 # Benchmarks (RS-7/RS-12)
 criterion = { version = "0.5", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-axum = "0.8"
+axum = { version = "0.8", features = ["multipart"] }
 # Host classification for the webhook SSRF guard (RS-10b; reqwest already depends on it)
 url = "2"
 tower = { version = "0.5", features = ["util"] }

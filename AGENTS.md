@@ -80,7 +80,7 @@ Every change is complete only when **all** of the following pass locally:
      `crates/rustsight-core/src/fusion.rs`, `temporal.rs`, `prompts/*.rs`).
    - Engine-level/integration tests go in
      `crates/rustsight-storage/tests/engine_flow.rs` (in-memory SQLite +
-     scripted mocks; 59 tests there today).
+     scripted mocks; 67 tests there today).
 4. Docs touched where relevant: `docs/reference.md` (and the README overview) for user-facing behavior/env
    vars, `NEXT_STEPS.md` checkboxes if a ticket's scope changed.
 5. No secrets/API keys committed; `.gitignore` already covers `*.db*`.
@@ -143,6 +143,10 @@ Key source map:
   as the native API. Shapes were checked against the installed upstream
   `api/http.py` and exercised with the real `@vectorize-io/hindsight-client`;
   `docs/reference.md`'s compatibility matrix lists what is accepted-but-ignored.
+- `crates/rustsight-core/src/files.rs` — `FileParser` trait, `ParserRegistry`
+  (built-in `text`/`html`), content-addressed `Attachment` (RS-10c);
+  `crates/rustsight-server/src/files.rs` serves `files/retain` and
+  `attachments/{id}`.
 - `crates/rustsight-cli/src/main.rs` — `build_engine` is the three-line
   embedding recipe desktop apps copy.
 
@@ -291,6 +295,9 @@ Env vars, read in `crates/rustsight-providers/src/env.rs`:
 - `RUSTSIGHT_ASYNC_RETAIN_CONCURRENCY` (default 2, clamped 1–64; async
   retains running at once through the compat API, invalid values fall back
   to default with a warning)
+- `RUSTSIGHT_ENABLE_FILE_UPLOAD_API`, `RUSTSIGHT_FILE_PARSER` (default
+  `text,html`), `RUSTSIGHT_FILE_CONVERSION_MAX_BATCH_SIZE[_MB]` (RS-10c;
+  read in `crates/rustsight-server/src/files.rs`).
 - `RUSTSIGHT_WEBHOOK_URL` / `_SECRET` / `_EVENT_TYPES`,
   `RUSTSIGHT_WEBHOOK_ALLOWED_HOSTS`, `RUSTSIGHT_WEBHOOK_EXPOSE_RESPONSE_BODY`
   (RS-10b; read in `crates/rustsight-server/src/webhooks.rs`, each also

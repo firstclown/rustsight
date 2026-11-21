@@ -256,6 +256,20 @@ pub trait MemoryStore: Send + Sync {
         before: Option<(i64, String)>,
     ) -> Result<Vec<WebhookDelivery>>;
 
+    /// Store a file's original bytes under its document (RS-10c); a file
+    /// already stored for that document is replaced.
+    fn put_attachment(&self, a: &crate::files::Attachment) -> Result<()>;
+    /// An attachment by its short id, from any document of the bank.
+    fn get_attachment(&self, bank_id: &str, id: &str) -> Result<Option<crate::files::Attachment>>;
+    /// Drop a document's attachments other than `keep` (a file retain that
+    /// replaced the document's content).
+    fn prune_document_attachments(
+        &self,
+        bank_id: &str,
+        document_id: &str,
+        keep: &str,
+    ) -> Result<usize>;
+
     fn upsert_mental_model(&self, m: &MentalModel) -> Result<()>;
     fn list_mental_models(&self, bank_id: &str) -> Result<Vec<MentalModel>>;
     fn delete_mental_model(&self, id: &str) -> Result<()>;
