@@ -735,11 +735,11 @@ mental_models, directives}`.
   to every newly created bank.
 
 DoD:
-- [ ] Unit: manifest validation (version, duplicate ids/names, unsupported
+- [x] Unit: manifest validation (version, duplicate ids/names, unsupported
       fields).
-- [ ] compat: import → export round-trip; dry run changes nothing;
+- [x] compat: import → export round-trip; dry run changes nothing;
       re-import updates by id/name.
-- [ ] engine_flow: imported directives reach the reflect prompt; default
+- [x] engine_flow: imported directives reach the reflect prompt; default
       template lands on a bank created by retain.
 
 ### RS-10e — Multilingual preservation · S/M

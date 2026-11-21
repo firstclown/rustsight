@@ -224,14 +224,7 @@ async fn upsert_bank(
     State(engine): State<Arc<Engine>>,
     Json(body): Json<BankBody>,
 ) -> Result<Json<Bank>, (StatusCode, String)> {
-    let existing = engine.store.get_bank(&body.bank_id).map_err(http_err)?;
-    let mut bank = existing.unwrap_or(Bank {
-        id: body.bank_id.clone(),
-        mission: None,
-        directives: None,
-        background: None,
-        disposition: Disposition::default(),
-    });
+    let mut bank = engine.provision_bank(&body.bank_id).map_err(http_err)?;
     if body.mission.is_some() {
         bank.mission = body.mission;
     }
@@ -865,6 +858,10 @@ mod tests {
                 content: "c".into(),
                 last_refreshed_ms: None,
                 created_at_ms: 1,
+                name: None,
+                tags: vec![],
+                max_tokens: None,
+                trigger: None,
             },
         );
         assert_schema_matches("MemoryRef", &memory_ref);

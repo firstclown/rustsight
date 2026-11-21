@@ -113,6 +113,9 @@ pub fn routes() -> Router<Arc<Engine>> {
                 .patch(patch_bank_config)
                 .delete(reset_bank_config),
         )
+        .route("/v1/default/banks/{bank_id}/import", post(import_template))
+        .route("/v1/default/banks/{bank_id}/export", get(export_template))
+        .route("/v1/bank-template-schema", get(template_schema))
         .route("/v1/default/banks/{bank_id}/profile", get(bank_profile))
         .route("/v1/default/banks/{bank_id}/memories", post(retain))
         .route("/v1/default/banks/{bank_id}/memories/recall", post(recall))
@@ -288,6 +291,9 @@ async fn openapi() -> Json<Value> {
             (format!("{bank}/operations")): { "get": {} },
             (format!("{bank}/operations/{{operation_id}}")): { "get": {} },
             (format!("{bank}/operations/{{operation_id}}/retry")): { "post": {} },
+            (format!("{bank}/import")): { "post": {} },
+            (format!("{bank}/export")): { "get": {} },
+            "/v1/bank-template-schema": { "get": {} },
             (format!("{bank}/files/retain")): { "post": {} },
             (format!("{bank}/attachments/{{attachment_id}}")): { "get": {} },
             (format!("{bank}/webhooks")): { "get": {}, "post": {} },
@@ -379,7 +385,7 @@ async fn upsert_bank(
     if let Some(labels) = &body.entity_labels {
         BankLabels::parse(Some(labels), true)?;
     }
-    let mut bank = bank_or_default(&engine, &bank_id)?;
+    let mut bank = engine.provision_bank(&bank_id)?;
     // `reflect_mission` is the current name; `mission` and `background` are
     // upstream's deprecated aliases for it.
     if let Some(m) = body.reflect_mission.or(body.mission).or(body.background) {
@@ -444,33 +450,7 @@ async fn delete_bank(State(engine): State<Arc<Engine>>, Path(bank_id): Path<Stri
 
 // ── Bank config ──────────────────────────────────────────────────────────
 
-/// The per-bank settings this server acts on. Anything else is refused:
-/// accepting a setting that changes nothing would misreport what ran.
-const CONFIG_KEYS: [&str; 10] = [
-    "retain_mission",
-    "observations_mission",
-    "reflect_mission",
-    "enable_observations",
-    "entity_labels",
-    "entities_allow_free_form",
-    "disposition_skepticism",
-    "disposition_literalism",
-    "disposition_empathy",
-    "memory_defense",
-];
-
-fn is_config_key(key: &str) -> bool {
-    CONFIG_KEYS.contains(&key)
-}
-
-/// Upstream accepts both `retain_mission` and `HINDSIGHT_API_RETAIN_MISSION`.
-fn config_key(raw: &str) -> String {
-    let lower = raw.to_lowercase();
-    lower
-        .strip_prefix("hindsight_api_")
-        .unwrap_or(&lower)
-        .to_string()
-}
+use rustsight_core::bank_config::is_config_key;
 
 #[derive(Deserialize)]
 struct BankConfigUpdate {
@@ -510,69 +490,13 @@ fn bank_config_json(engine: &Engine, bank: &Bank) -> Result<Value, ApiError> {
     }))
 }
 
-/// Validate one update and apply it to the in-memory bank; nothing is
-/// stored until every update in the request has passed.
-fn apply_config_update(bank: &mut Bank, key: &str, value: &Value) -> Result<(), ApiError> {
-    let wrong_type = |expected: &str| ApiError::bad_request(format!("{key} must be {expected}"));
-    match key {
-        "retain_mission" | "observations_mission" | "reflect_mission" => {
-            if !(value.is_string() || value.is_null()) {
-                return Err(wrong_type("a string or null"));
-            }
-            if key == "reflect_mission" {
-                bank.mission = value
-                    .as_str()
-                    .filter(|m| !m.trim().is_empty())
-                    .map(str::to_string);
-            }
-        }
-        "enable_observations" | "entities_allow_free_form" => {
-            if !(value.is_boolean() || value.is_null()) {
-                return Err(wrong_type("a boolean or null"));
-            }
-        }
-        "entity_labels" => {
-            BankLabels::parse(Some(value), true)?;
-        }
-        "memory_defense" => {
-            // Validated on write so a bad policy never reaches retain, which
-            // refuses to run under one (screening must not fail open).
-            rustsight_core::defense::parse_policy(Some(value))?;
-        }
-        _ => {
-            let name = key.trim_start_matches("disposition_");
-            let defaults = Disposition::default();
-            let (slot, default) = match name {
-                "skepticism" => (&mut bank.disposition.skepticism, defaults.skepticism),
-                "literalism" => (&mut bank.disposition.literalism, defaults.literalism),
-                _ => (&mut bank.disposition.empathy, defaults.empathy),
-            };
-            *slot = match value {
-                Value::Null => default,
-                other => {
-                    let raw = other.as_i64().ok_or_else(|| wrong_type("an integer"))?;
-                    trait_value(name, raw).map_err(|ApiError(_, m, _)| ApiError::bad_request(m))?
-                }
-            };
-        }
+/// Core's validation errors without the `invalid input:` prefix, as this
+/// API has always worded them.
+fn plain_bad_input(e: Error) -> ApiError {
+    match e {
+        Error::BadInput(m) => ApiError::bad_request(m),
+        other => other.into(),
     }
-    Ok(())
-}
-
-fn store_bank_settings(
-    engine: &Engine,
-    bank: &Bank,
-    mut config: Map<String, Value>,
-) -> Result<(), ApiError> {
-    // A bank configured through this API follows Hindsight's mission split.
-    config.insert("mission_scope".into(), json!("reflect"));
-    engine.store.ensure_bank(bank)?;
-    engine.store.update_bank(bank)?;
-    engine
-        .store
-        .set_bank_config(&bank.id, &Value::Object(config))?;
-    engine.wake_worker();
-    Ok(())
 }
 
 async fn get_bank_config(
@@ -589,24 +513,9 @@ async fn patch_bank_config(
     body: Result<Json<BankConfigUpdate>, JsonRejection>,
 ) -> ApiResult {
     let Json(body) = body?;
-    let mut bank = bank_or_default(&engine, &bank_id)?;
-    let mut config = bank_config_map(&engine, &bank_id)?;
-    for (raw_key, value) in &body.updates {
-        let key = config_key(raw_key);
-        if !is_config_key(&key) {
-            return Err(ApiError::bad_request(format!(
-                "Unsupported bank config key {raw_key:?}; supported keys: {}",
-                CONFIG_KEYS.join(", ")
-            )));
-        }
-        apply_config_update(&mut bank, &key, value)?;
-        if value.is_null() {
-            config.remove(&key);
-        } else {
-            config.insert(key, value.clone());
-        }
-    }
-    store_bank_settings(&engine, &bank, config)?;
+    let bank = engine
+        .update_bank_config(&bank_id, &body.updates)
+        .map_err(plain_bad_input)?;
     Ok(Json(bank_config_json(&engine, &bank)?))
 }
 
@@ -614,25 +523,53 @@ async fn reset_bank_config(
     State(engine): State<Arc<Engine>>,
     Path(bank_id): Path<String>,
 ) -> ApiResult {
-    let mut bank = bank_or_default(&engine, &bank_id)?;
-    let mut config = bank_config_map(&engine, &bank_id)?;
-    let overridden: Vec<String> = config
-        .keys()
-        .filter(|key| is_config_key(key))
-        .cloned()
-        .collect();
-    for key in overridden {
-        apply_config_update(&mut bank, &key, &Value::Null)?;
-        config.remove(&key);
-    }
-    store_bank_settings(&engine, &bank, config)?;
+    let bank = engine
+        .reset_bank_config(&bank_id)
+        .map_err(plain_bad_input)?;
     Ok(Json(bank_config_json(&engine, &bank)?))
+}
+
+// ── Bank templates (RS-10d) ──────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ImportQuery {
+    #[serde(default)]
+    dry_run: bool,
+}
+
+async fn import_template(
+    State(engine): State<Arc<Engine>>,
+    Path(bank_id): Path<String>,
+    Query(query): Query<ImportQuery>,
+    body: axum::body::Bytes,
+) -> ApiResult {
+    let raw: Value = serde_json::from_slice(&body)
+        .map_err(|e| ApiError::bad_request(format!("Invalid JSON body: {e}")))?;
+    let manifest = rustsight_core::templates::parse_manifest(&raw).map_err(plain_bad_input)?;
+    let _guard = engine.bank_read(&bank_id).await;
+    let report = engine
+        .import_template(&bank_id, &manifest, query.dry_run)
+        .map_err(plain_bad_input)?;
+    Ok(Json(serde_json::to_value(report).unwrap_or_default()))
+}
+
+async fn export_template(
+    State(engine): State<Arc<Engine>>,
+    Path(bank_id): Path<String>,
+) -> ApiResult {
+    engine
+        .export_template(&bank_id)?
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found(format!("Bank '{bank_id}' not found")))
+}
+
+async fn template_schema() -> Json<Value> {
+    Json(rustsight_core::templates::manifest_schema())
 }
 
 async fn bank_profile(State(engine): State<Arc<Engine>>, Path(bank_id): Path<String>) -> ApiResult {
     // Upstream auto-creates a bank with defaults on first profile read.
-    let bank = bank_or_default(&engine, &bank_id)?;
-    engine.store.ensure_bank(&bank)?;
+    let bank = engine.provision_bank(&bank_id)?;
     Ok(Json(profile_json(&engine, &bank)?))
 }
 
@@ -2852,5 +2789,149 @@ mod tests {
             iso(1_705_314_600_000).as_deref(),
             Some("2024-01-15T10:30:00+00:00")
         );
+    }
+
+    #[tokio::test]
+    async fn bank_templates_round_trip_like_upstream() {
+        let engine = engine();
+        let app = app(&engine);
+        let manifest = json!({
+            "version": "1",
+            "bank": {"reflect_mission": "Help support agents.", "retain_mission": "Issues only.",
+                     "disposition_empathy": 5, "enable_observations": false},
+            "mental_models": [{"id": "sentiment", "name": "Sentiment", "source_query": "Trend?",
+                               "tags": ["cs"], "trigger": {"refresh_after_consolidation": true}}],
+            "directives": [{"name": "Empathy", "content": "Be kind.", "priority": 10}]
+        });
+
+        // A dry run validates and reports, but creates nothing.
+        let (status, dry) = call(
+            &app,
+            Method::POST,
+            "/v1/default/banks/tpl/import?dry_run=true",
+            Some(manifest.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{dry}");
+        assert_eq!(dry["dry_run"], true);
+        assert_eq!(dry["mental_models_created"], json!(["sentiment"]));
+        assert!(engine.store.get_bank("tpl").unwrap().is_none());
+
+        let (status, report) = call(
+            &app,
+            Method::POST,
+            "/v1/default/banks/tpl/import",
+            Some(manifest.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{report}");
+        assert_eq!(report["config_applied"], true);
+        assert_eq!(report["directives_created"], json!(["Empathy"]));
+        assert_eq!(report["mental_models_created"], json!(["sentiment"]));
+        let (_, config) = call(&app, Method::GET, "/v1/default/banks/tpl/config", None).await;
+        assert_eq!(config["config"]["reflect_mission"], "Help support agents.");
+        assert_eq!(config["config"]["disposition_empathy"], 5);
+        assert_eq!(config["config"]["enable_observations"], false);
+
+        let (status, exported) =
+            call(&app, Method::GET, "/v1/default/banks/tpl/export", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(exported["version"], "1");
+        assert_eq!(exported["bank"], manifest["bank"]);
+        assert_eq!(
+            exported["mental_models"],
+            json!([{"id": "sentiment", "name": "Sentiment", "source_query": "Trend?",
+                    "tags": ["cs"], "max_tokens": 2048,
+                    "trigger": {"refresh_after_consolidation": true}}])
+        );
+        assert_eq!(
+            exported["directives"],
+            json!([{"name": "Empathy", "content": "Be kind.", "priority": 10,
+                    "is_active": true, "tags": []}])
+        );
+
+        // The export imports cleanly into another bank, and re-importing it
+        // into the same bank is a no-op.
+        let (status, copy) = call(
+            &app,
+            Method::POST,
+            "/v1/default/banks/tpl2/import",
+            Some(exported.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{copy}");
+        let (_, again) = call(
+            &app,
+            Method::POST,
+            "/v1/default/banks/tpl/import",
+            Some(exported),
+        )
+        .await;
+        assert_eq!(again["mental_models_created"], json!([]));
+        assert_eq!(again["mental_models_updated"], json!([]));
+        assert_eq!(again["directives_updated"], json!([]));
+        assert_eq!(engine.store.list_mental_models("tpl").unwrap().len(), 1);
+
+        // Changes update by id / name instead of duplicating.
+        let (_, upd) = call(
+            &app,
+            Method::POST,
+            "/v1/default/banks/tpl/import",
+            Some(json!({"version": "1",
+                "mental_models": [{"id": "sentiment", "name": "Mood", "source_query": "Trend?"}],
+                "directives": [{"name": "Empathy", "content": "Be very kind."}]})),
+        )
+        .await;
+        assert_eq!(upd["mental_models_updated"], json!(["sentiment"]));
+        assert_eq!(upd["directives_updated"], json!(["Empathy"]));
+        assert_eq!(upd["config_applied"], false);
+        let directives = engine.store.list_directives("tpl").unwrap();
+        assert_eq!(directives.len(), 1);
+        assert_eq!(directives[0].content, "Be very kind.");
+        let models = engine.store.list_mental_models("tpl").unwrap();
+        assert_eq!(models[0].name.as_deref(), Some("Mood"));
+        assert_eq!(
+            models[0].tags,
+            vec!["cs".to_string()],
+            "empty tags keep stored ones"
+        );
+    }
+
+    #[tokio::test]
+    async fn bank_template_errors_and_schema() {
+        let engine = engine();
+        let app = app(&engine);
+        for (body, needle) in [
+            (
+                json!({"version": "2"}),
+                "Template schema validation failed: version",
+            ),
+            (
+                json!({"version": "1", "bank": {"retain_extraction_mode": "verbose"}}),
+                "bank.retain_extraction_mode: not supported by this server",
+            ),
+            (
+                json!({"version": "1", "directives": [{"name": "a", "content": " "}]}),
+                "Template validation failed: directives[0].content: must not be empty",
+            ),
+        ] {
+            let (status, resp) = call(
+                &app,
+                Method::POST,
+                "/v1/default/banks/bad/import",
+                Some(body),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+            let detail = resp["detail"].as_str().unwrap();
+            assert!(detail.contains(needle), "{detail}");
+        }
+        assert!(engine.store.get_bank("bad").unwrap().is_none());
+        let (status, _) = call(&app, Method::GET, "/v1/default/banks/nope/export", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, schema) = call(&app, Method::GET, "/v1/bank-template-schema", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(schema["title"], "BankTemplateManifest");
+        assert_eq!(schema["required"], json!(["version"]));
     }
 }

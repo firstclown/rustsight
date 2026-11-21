@@ -231,6 +231,18 @@ CREATE TABLE IF NOT EXISTS attachments(
   PRIMARY KEY(bank_id, document_id, id)
 );
 CREATE INDEX IF NOT EXISTS idx_attachments_id ON attachments(bank_id, id);
+CREATE TABLE IF NOT EXISTS directives(
+  id TEXT PRIMARY KEY,
+  bank_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  content TEXT NOT NULL,
+  priority INTEGER NOT NULL DEFAULT 0,
+  is_active INTEGER NOT NULL DEFAULT 1,
+  tags_json TEXT NOT NULL DEFAULT '[]',
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  UNIQUE(bank_id, name)
+);
 CREATE TABLE IF NOT EXISTS mental_models(
   id TEXT PRIMARY KEY,
   bank_id TEXT NOT NULL,
@@ -380,6 +392,11 @@ impl SqliteStore {
             ("memories", "metadata_json", "TEXT"),
             ("memories", "chunk_id", "TEXT"),
             ("banks", "config_json", "TEXT"),
+            // RS-10d: bank-template fields on mental models.
+            ("mental_models", "name", "TEXT"),
+            ("mental_models", "tags_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("mental_models", "max_tokens", "INTEGER"),
+            ("mental_models", "trigger_json", "TEXT"),
         ];
         for (table, column, decl) in COLUMNS {
             let exists = conn
@@ -2154,6 +2171,7 @@ impl MemoryStore for SqliteStore {
             "DELETE FROM webhooks WHERE bank_id = ?1",
             "DELETE FROM webhook_deliveries WHERE bank_id = ?1",
             "DELETE FROM attachments WHERE bank_id = ?1",
+            "DELETE FROM directives WHERE bank_id = ?1",
         ] {
             tx.execute(sql, params![bank_id]).map_err(store_err)?;
         }
@@ -2517,10 +2535,27 @@ impl MemoryStore for SqliteStore {
     fn upsert_mental_model(&self, m: &MentalModel) -> Result<()> {
         let conn = self.lock_conn();
         conn.execute(
-            "INSERT INTO mental_models(id, bank_id, question, path, content, last_refreshed_ms, created_at_ms)
-             VALUES (?1,?2,?3,?4,?5,?6,?7)
-             ON CONFLICT(id) DO UPDATE SET question=excluded.question, path=excluded.path, content=excluded.content, last_refreshed_ms=excluded.last_refreshed_ms",
-            params![m.id, m.bank_id, m.question, m.path, m.content, m.last_refreshed_ms, m.created_at_ms],
+            "INSERT INTO mental_models(id, bank_id, question, path, content, last_refreshed_ms, created_at_ms, name, tags_json, max_tokens, trigger_json)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+             ON CONFLICT(id) DO UPDATE SET question=excluded.question, path=excluded.path, content=excluded.content, last_refreshed_ms=excluded.last_refreshed_ms,
+               name=excluded.name, tags_json=excluded.tags_json, max_tokens=excluded.max_tokens, trigger_json=excluded.trigger_json",
+            params![
+                m.id,
+                m.bank_id,
+                m.question,
+                m.path,
+                m.content,
+                m.last_refreshed_ms,
+                m.created_at_ms,
+                m.name,
+                serde_json::to_string(&m.tags).map_err(json_err)?,
+                m.max_tokens,
+                m.trigger
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(json_err)?
+            ],
         )
         .map_err(store_err)?;
         Ok(())
@@ -2529,7 +2564,7 @@ impl MemoryStore for SqliteStore {
     fn list_mental_models(&self, bank_id: &str) -> Result<Vec<MentalModel>> {
         let conn = self.lock_conn();
         let mut stmt = conn
-            .prepare("SELECT id, bank_id, question, path, content, last_refreshed_ms, created_at_ms FROM mental_models WHERE bank_id = ?1 ORDER BY created_at_ms")
+            .prepare("SELECT id, bank_id, question, path, content, last_refreshed_ms, created_at_ms, name, tags_json, max_tokens, trigger_json FROM mental_models WHERE bank_id = ?1 ORDER BY created_at_ms")
             .map_err(store_err)?;
         let rows = stmt
             .query_map(params![bank_id], |r| {
@@ -2541,6 +2576,63 @@ impl MemoryStore for SqliteStore {
                     content: r.get(4)?,
                     last_refreshed_ms: r.get(5)?,
                     created_at_ms: r.get(6)?,
+                    name: r.get(7)?,
+                    tags: json_col(r, 8)?,
+                    max_tokens: r.get(9)?,
+                    trigger: r
+                        .get::<_, Option<String>>(10)?
+                        .and_then(|raw| serde_json::from_str(&raw).ok()),
+                })
+            })
+            .map_err(store_err)?;
+        let mut out = vec![];
+        for r in rows {
+            out.push(r.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
+    fn upsert_directive(&self, d: &BankDirective) -> Result<()> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "INSERT OR REPLACE INTO directives(id, bank_id, name, content, priority, is_active, tags_json, created_at_ms, updated_at_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                d.id,
+                d.bank_id,
+                d.name,
+                d.content,
+                d.priority,
+                d.is_active,
+                serde_json::to_string(&d.tags).map_err(json_err)?,
+                d.created_at_ms,
+                d.updated_at_ms
+            ],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    fn list_directives(&self, bank_id: &str) -> Result<Vec<BankDirective>> {
+        let conn = self.lock_conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, bank_id, name, content, priority, is_active, tags_json, created_at_ms, updated_at_ms
+                 FROM directives WHERE bank_id = ?1 ORDER BY priority DESC, created_at_ms, name",
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![bank_id], |r| {
+                Ok(BankDirective {
+                    id: r.get(0)?,
+                    bank_id: r.get(1)?,
+                    name: r.get(2)?,
+                    content: r.get(3)?,
+                    priority: r.get(4)?,
+                    is_active: r.get(5)?,
+                    tags: json_col(r, 6)?,
+                    created_at_ms: r.get(7)?,
+                    updated_at_ms: r.get(8)?,
                 })
             })
             .map_err(store_err)?;
@@ -3215,7 +3307,12 @@ mod tests {
                    created_at_ms INTEGER NOT NULL);
                  INSERT INTO banks(id, created_at_ms, updated_at_ms) VALUES ('b', 1, 1);
                  INSERT INTO memories(id, bank_id, kind, text, mentioned_at_ms, created_at_ms)
-                   VALUES ('m1', 'b', 'world', 'an old fact', 5, 5);",
+                   VALUES ('m1', 'b', 'world', 'an old fact', 5, 5);
+                 CREATE TABLE mental_models(id TEXT PRIMARY KEY, bank_id TEXT NOT NULL,
+                   question TEXT NOT NULL, path TEXT, content TEXT NOT NULL DEFAULT '',
+                   last_refreshed_ms INTEGER, created_at_ms INTEGER NOT NULL);
+                 INSERT INTO mental_models(id, bank_id, question, content, created_at_ms)
+                   VALUES ('mm', 'b', 'What matters?', 'old content', 1);",
             )
             .unwrap();
         }
@@ -3227,6 +3324,10 @@ mod tests {
             assert!(old.tags.is_empty() && old.document_id.is_none() && old.metadata.is_none());
             assert_eq!(s.bank_config("b").unwrap(), serde_json::json!({}));
             assert!(s.memory_chunk_ids("b", &["m1".into()]).unwrap().is_empty());
+            let models = s.list_mental_models("b").unwrap();
+            assert_eq!(models[0].content, "old content");
+            assert!(models[0].name.is_none() && models[0].tags.is_empty());
+            assert!(models[0].max_tokens.is_none() && models[0].trigger.is_none());
         }
         let s = SqliteStore::open(&path).unwrap();
         let mut rec = new_mem("a new fact", 9);

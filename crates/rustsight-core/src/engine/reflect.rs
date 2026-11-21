@@ -58,7 +58,8 @@ pub(super) async fn reflect(
         background: None,
         disposition: Disposition::default(),
     });
-    let system = build_reflect_system(&bank);
+    let directives = e.reflect_directives(&bank, opts.tags.as_ref())?;
+    let system = build_reflect_system(&bank, &directives);
     let mut messages: Vec<ChatMessage> = vec![ChatMessage::user(query.to_string())];
     let mut retrieved: HashSet<String> = HashSet::new();
     // Everything the tools returned, in upstream's synthesis-prompt shape —
@@ -415,8 +416,15 @@ pub(super) async fn reflect(
         Some((a, c, path)) => (a, c, path, None),
         None => {
             let synthesis_started = std::time::Instant::now();
-            let synthesis =
-                synthesize_answer(e, &bank, query, &context_history, answer_max_tokens).await;
+            let synthesis = synthesize_answer(
+                e,
+                &bank,
+                &directives,
+                query,
+                &context_history,
+                answer_max_tokens,
+            )
+            .await;
             let ms = synthesis_started.elapsed().as_millis() as u64;
             match synthesis {
                 Ok(text) if !text.trim().is_empty() => {
@@ -769,6 +777,7 @@ fn collect(retrieved: &mut HashSet<String>, entry: &ContextHistoryEntry, key: &s
 async fn synthesize_answer(
     e: &Engine,
     bank: &Bank,
+    directives: &[Directive],
     query: &str,
     history: &[ContextHistoryEntry],
     answer_max_tokens: Option<usize>,
@@ -784,17 +793,11 @@ async fn synthesize_answer(
             empathy: Some(bank.disposition.empathy as i32),
         }),
     };
-    let directives: Vec<Directive> = bank
-        .directives
-        .as_deref()
-        .filter(|d| !d.trim().is_empty())
-        .map(|d| vec![Directive::new("", d)])
-        .unwrap_or_default();
     let now_str = iso_datetime_utc(e.clock.now_ms());
     let system = build_final_system_prompt(
         bank.mission.as_deref().filter(|m| !m.trim().is_empty()),
         None,
-        &directives,
+        directives,
         &now_str,
     );
     let llm = e.llm_for_reflect();

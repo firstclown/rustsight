@@ -96,6 +96,12 @@ enum Cmd {
         bank: String,
     },
     Banks,
+    /// Bank templates: export a bank's settings, mental models and
+    /// directives, or import a manifest into a bank.
+    Template {
+        #[command(subcommand)]
+        action: TemplateCmd,
+    },
     BankSet {
         #[arg(long)]
         bank: String,
@@ -129,6 +135,25 @@ enum Cmd {
         question: String,
         #[arg(long)]
         path: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum TemplateCmd {
+    /// Print the bank's template manifest.
+    Export {
+        #[arg(long)]
+        bank: String,
+    },
+    /// Apply a manifest file to the bank (created if missing).
+    Import {
+        #[arg(long)]
+        bank: String,
+        #[arg(long)]
+        file: PathBuf,
+        /// Validate and report without changing anything.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -214,6 +239,14 @@ async fn build_engine(db: &PathBuf, mock: bool) -> Arc<Engine> {
     engine.reflect_llm = operation_llms.reflect;
     engine.consolidate_llm = operation_llms.consolidate;
     engine.config.retain_max_completion_tokens = Some(retain_max_completion_tokens());
+    match rustsight_server::default_bank_template_from_env() {
+        Ok(Some(template)) => engine = engine.with_default_template(template),
+        Ok(None) => {}
+        Err(msg) => {
+            eprintln!("configuration error: {msg}");
+            std::process::exit(1);
+        }
+    }
     Arc::new(engine)
 }
 
@@ -347,6 +380,31 @@ async fn main() {
             Ok(())
         })(),
         Cmd::Banks => engine.store.list_banks().map(|banks| print_json(&banks)),
+        Cmd::Template { action } => match action {
+            TemplateCmd::Export { bank } => match engine.export_template(&bank) {
+                Ok(Some(manifest)) => {
+                    print_json(&manifest);
+                    Ok(())
+                }
+                Ok(None) => Err(rustsight_core::Error::NotFound(format!("bank {bank}"))),
+                Err(e) => Err(e),
+            },
+            TemplateCmd::Import {
+                bank,
+                file,
+                dry_run,
+            } => std::fs::read_to_string(&file)
+                .map_err(|e| {
+                    rustsight_core::Error::BadInput(format!("reading {}: {e}", file.display()))
+                })
+                .and_then(|text| {
+                    serde_json::from_str(&text)
+                        .map_err(|e| rustsight_core::Error::BadInput(format!("invalid JSON: {e}")))
+                })
+                .and_then(|raw| rustsight_core::templates::parse_manifest(&raw))
+                .and_then(|manifest| engine.import_template(&bank, &manifest, dry_run))
+                .map(|report| print_json(&report)),
+        },
         Cmd::Reindex { .. } => unreachable!("handled before the engine is built"),
         Cmd::BankSet {
             bank,

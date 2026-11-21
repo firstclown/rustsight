@@ -270,6 +270,12 @@ pub trait MemoryStore: Send + Sync {
         keep: &str,
     ) -> Result<usize>;
 
+    /// Insert or replace a directive by id (RS-10d).
+    fn upsert_directive(&self, d: &BankDirective) -> Result<()>;
+    /// Every directive of a bank, active or not: highest priority first,
+    /// then oldest.
+    fn list_directives(&self, bank_id: &str) -> Result<Vec<BankDirective>>;
+
     fn upsert_mental_model(&self, m: &MentalModel) -> Result<()>;
     fn list_mental_models(&self, bank_id: &str) -> Result<Vec<MentalModel>>;
     fn delete_mental_model(&self, id: &str) -> Result<()>;

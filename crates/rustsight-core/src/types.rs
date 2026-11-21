@@ -244,6 +244,36 @@ pub struct MentalModel {
     pub content: String,
     pub last_refreshed_ms: Option<i64>,
     pub created_at_ms: i64,
+    /// Display name (bank templates, RS-10d); `None` for models created by
+    /// a plain refresh.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Template settings kept for export round-trips: visibility tags, the
+    /// content token cap, and upstream's trigger object.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub trigger: Option<serde_json::Value>,
+}
+
+/// A named hard rule for reflect (upstream directive, RS-10d). Active
+/// directives are rendered into the reflect prompts, highest priority
+/// first; untagged ones always apply, tagged ones only to reflects whose
+/// tag filter matches them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BankDirective {
+    pub id: String,
+    pub bank_id: String,
+    /// Unique per bank; the match key on template re-import.
+    pub name: String,
+    pub content: String,
+    pub priority: i32,
+    pub is_active: bool,
+    pub tags: Vec<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

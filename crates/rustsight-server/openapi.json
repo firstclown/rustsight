@@ -657,7 +657,8 @@
       "MentalModel": {
         "type": "object",
         "required": [
-          "id", "bank_id", "question", "path", "content", "last_refreshed_ms", "created_at_ms"
+          "id", "bank_id", "question", "path", "content", "last_refreshed_ms", "created_at_ms",
+          "name", "tags", "max_tokens", "trigger"
         ],
         "properties": {
           "id": { "type": "string" },
@@ -666,7 +667,11 @@
           "path": { "type": ["string", "null"] },
           "content": { "type": "string" },
           "last_refreshed_ms": { "type": ["integer", "null"], "format": "int64" },
-          "created_at_ms": { "type": "integer", "format": "int64" }
+          "created_at_ms": { "type": "integer", "format": "int64" },
+          "name": { "type": ["string", "null"], "description": "Display name (bank templates)" },
+          "tags": { "type": "array", "items": { "type": "string" } },
+          "max_tokens": { "type": ["integer", "null"] },
+          "trigger": { "type": ["object", "null"], "description": "Hindsight trigger settings, kept for template export" }
         }
       }
     }

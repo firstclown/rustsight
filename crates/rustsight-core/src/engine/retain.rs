@@ -133,20 +133,7 @@ async fn retain_screened(e: &Engine, req: RetainRequest) -> Result<RetainRespons
     if req.content.trim().is_empty() {
         return Err(Error::BadInput("content is empty".into()));
     }
-    let bank = match e.store.get_bank(&req.bank_id)? {
-        Some(b) => b,
-        None => {
-            let b = Bank {
-                id: req.bank_id.clone(),
-                mission: None,
-                directives: None,
-                background: None,
-                disposition: Disposition::default(),
-            };
-            e.store.ensure_bank(&b)?;
-            b
-        }
-    };
+    let bank = e.provision_bank(&req.bank_id)?;
     let now = req.timestamp_ms.unwrap_or_else(|| e.clock.now_ms());
 
     let chunks = split_chunks(

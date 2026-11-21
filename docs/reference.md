@@ -96,6 +96,9 @@ trait (`search_semantic`).
     RUSTSIGHT_API_TOKEN       optional; bearer token required by every HTTP
                               endpoint except /healthz (see below)
     RUSTSIGHT_API_TOKEN_FILE  optional; read the token from a file instead
+    RUSTSIGHT_DEFAULT_BANK_TEMPLATE  a bank template (inline JSON, or a path to a
+                              JSON file) applied to every new bank; an invalid
+                              one stops startup (see "Bank templates")
     RUSTSIGHT_ENABLE_FILE_UPLOAD_API  true | false (default true); the
                               files/retain endpoint (see "File ingest")
     RUSTSIGHT_FILE_PARSER     default parser chain for uploads (default text,html)
@@ -140,6 +143,9 @@ untouched and served side by side.
     GET    /v1/default/banks/{bank_id}/operations          list, newest first
     GET    /v1/default/banks/{bank_id}/operations/{id}     async retain status
     POST   /v1/default/banks/{bank_id}/operations/{id}/retry
+    POST   /v1/default/banks/{bank_id}/import              bank template (?dry_run=true)
+    GET    /v1/default/banks/{bank_id}/export              bank template
+    GET    /v1/bank-template-schema                        manifest JSON Schema
     POST   /v1/default/banks/{bank_id}/files/retain        multipart upload, async
     GET    /v1/default/banks/{bank_id}/attachments/{id}    a file's original bytes
     POST   /v1/default/banks/{bank_id}/webhooks            register (GET lists)
@@ -404,6 +410,37 @@ and `retry_base_delay_ms`; other errors (auth, bad requests) fail fast. If a
 chunk's extraction output fails to parse (e.g. JSON truncated by an output
 token limit), the chunk is re-asked once at half size before the error
 surfaces.
+
+## Bank templates
+A template is Hindsight's manifest of a bank's setup:
+`{"version": "1", "bank": {...}, "mental_models": [...], "directives": [...]}`.
+`GET /v1/default/banks/{id}/export` produces one and
+`POST /v1/default/banks/{id}/import` applies one (creating the bank if
+needed; `?dry_run=true` validates and changes nothing). `rustsight template
+export --bank B` and `rustsight template import --bank B --file t.json
+[--dry-run]` do the same locally.
+
+- `bank` takes the settings `PATCH /config` takes (missions, observation
+  toggle, entity labels, dispositions, Memory Defense). Any other Hindsight
+  setting with a non-null value is refused by name with a 400, rather than
+  accepted and ignored. Export lists only the settings explicitly set.
+- `mental_models` match by `id`, `directives` by `name`: new ones are
+  created, changed ones updated, unchanged ones left alone (empty `tags`
+  keep the stored tags). An imported mental model starts empty and fills
+  on its next refresh; no refresh operation is queued, so
+  `operation_ids` is always empty.
+- Directives are named hard rules for reflect (`content`, `priority`,
+  `is_active`, `tags`). Active ones go into the reflect prompts, highest
+  priority first. Untagged directives always apply; tagged ones only to
+  reflects whose tag filter matches them, as in Hindsight. The free-text
+  `directives` of the native bank API still works and is placed first.
+- `RUSTSIGHT_DEFAULT_BANK_TEMPLATE` is applied once, when a bank is created
+  by any path (retain, config, webhooks, import). Later changes to the bank
+  are never overwritten by it.
+- Validation follows Hindsight's two 400 messages: `Template schema
+  validation failed: ...` (types, versions above 1, duplicate ids or
+  names, mental model ids with `/`) and `Template validation failed: ...`
+  (empty names, queries or contents).
 
 ## File ingest
 `POST /v1/default/banks/{id}/files/retain` takes Hindsight's multipart

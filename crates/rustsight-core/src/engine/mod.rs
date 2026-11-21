@@ -175,6 +175,9 @@ pub struct Engine {
     /// File-to-text converters for file retains (RS-10c); `text` and
     /// `html` built in, more via `with_parsers`.
     pub parsers: Arc<crate::files::ParserRegistry>,
+    /// Applied to every bank this engine creates (RS-10d,
+    /// `RUSTSIGHT_DEFAULT_BANK_TEMPLATE`).
+    pub(crate) default_template: Option<Arc<crate::templates::Manifest>>,
 }
 
 impl Engine {
@@ -202,7 +205,15 @@ impl Engine {
             bank_gates: Arc::default(),
             events: std::sync::OnceLock::new(),
             parsers: Arc::new(crate::files::ParserRegistry::builtin()),
+            default_template: None,
         }
+    }
+
+    /// Apply `template` to every bank created from now on (see
+    /// `provision_bank`).
+    pub fn with_default_template(mut self, template: crate::templates::Manifest) -> Self {
+        self.default_template = Some(Arc::new(template));
+        self
     }
 
     /// Replace the file parser registry (to add PDF/DOCX/OCR converters).

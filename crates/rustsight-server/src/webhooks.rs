@@ -714,15 +714,7 @@ async fn create_webhook(
     };
     // Upstream creates the bank row lazily with the webhook.
     let _guard = engine.bank_read(&bank_id).await;
-    if engine.store.get_bank(&bank_id)?.is_none() {
-        engine.store.ensure_bank(&Bank {
-            id: bank_id.clone(),
-            mission: None,
-            directives: None,
-            background: None,
-            disposition: Disposition::default(),
-        })?;
-    }
+    engine.provision_bank(&bank_id)?;
     let now = engine.clock.now_ms();
     let hook = Webhook {
         id: uuid::Uuid::new_v4().to_string(),

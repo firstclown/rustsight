@@ -3612,3 +3612,122 @@ async fn attachments_die_with_their_document_and_bank() {
     assert!(e.store.get_attachment("att", &a).unwrap().is_none());
     assert!(e.store.get_attachment("att", &b).unwrap().is_none());
 }
+
+// ── RS-10d: bank templates ───────────────────────────────────────────────
+
+/// Records every system prompt and answers in plain prose (the loop's
+/// volunteered answer; the closing ask then yields to it).
+#[derive(Default)]
+struct SystemCapture(std::sync::Mutex<Vec<String>>);
+
+#[async_trait]
+impl LlmProvider for SystemCapture {
+    async fn complete(&self, req: &LlmRequest) -> Result<LlmResponse> {
+        self.0
+            .lock()
+            .unwrap()
+            .push(req.system.clone().unwrap_or_default());
+        Ok(LlmResponse {
+            content: Some("Here is the answer.".into()),
+            tool_calls: vec![],
+        })
+    }
+}
+
+fn manifest(v: serde_json::Value) -> templates::Manifest {
+    templates::parse_manifest(&v).unwrap()
+}
+
+#[tokio::test]
+async fn imported_directives_reach_the_reflect_prompt() {
+    let llm = Arc::new(SystemCapture::default());
+    let e = Engine::new(
+        Arc::new(SqliteStore::open_in_memory().unwrap()),
+        llm.clone(),
+        Arc::new(MockEmbed::default()),
+        Arc::new(MockRerank),
+        Arc::new(SimpleTokenEstimator),
+        Arc::new(FixedClock::new(1_800_000_000_000)),
+    );
+    e.import_template(
+        "dir",
+        &manifest(json!({"version": "1", "directives": [
+            {"name": "Formal", "content": "Answer formally.", "priority": 1},
+            {"name": "Urgent", "content": "Lead with the deadline.", "priority": 5},
+            {"name": "Paused", "content": "Speak in rhyme.", "is_active": false},
+            {"name": "Sales", "content": "Mention the discount.", "tags": ["sales"]}
+        ]})),
+        false,
+    )
+    .unwrap();
+
+    e.reflect("dir", "What should I do?").await.unwrap();
+    let first = llm.0.lock().unwrap()[0].clone();
+    let urgent = first
+        .find("**Urgent**: Lead with the deadline.")
+        .expect("urgent");
+    let formal = first.find("**Formal**: Answer formally.").expect("formal");
+    assert!(urgent < formal, "higher priority first");
+    assert!(!first.contains("rhyme"), "inactive directives never apply");
+    assert!(
+        !first.contains("discount"),
+        "tagged directives need a matching scope"
+    );
+
+    llm.0.lock().unwrap().clear();
+    let scoped = ReflectOptions {
+        tags: Some(TagFilter {
+            tags: vec!["sales".into()],
+            mode: TagsMatch::Any,
+            groups: vec![],
+        }),
+        ..Default::default()
+    };
+    e.reflect_with("dir", "What should I do?", &scoped)
+        .await
+        .unwrap();
+    let first = llm.0.lock().unwrap()[0].clone();
+    assert!(
+        first.contains("**Sales**: Mention the discount."),
+        "{first}"
+    );
+    assert!(first.contains("**Formal**"), "untagged ones still apply");
+}
+
+#[tokio::test]
+async fn default_template_lands_on_a_bank_created_by_retain() {
+    let base = engine();
+    let e = Engine::new(
+        Arc::clone(&base.store),
+        Arc::new(MockLlm::demo()),
+        Arc::new(MockEmbed::default()),
+        Arc::new(MockRerank),
+        Arc::new(SimpleTokenEstimator),
+        Arc::new(FixedClock::new(1_800_000_000_000)),
+    )
+    .with_default_template(manifest(json!({
+        "version": "1",
+        "bank": {"reflect_mission": "Support desk memory.", "disposition_empathy": 5},
+        "mental_models": [{"id": "overview", "name": "Overview", "source_query": "What matters?"}],
+        "directives": [{"name": "Kind", "content": "Be kind."}]
+    })));
+    retain(&e, "fresh", "Alice joined Google.").await;
+    let bank = e.store.get_bank("fresh").unwrap().unwrap();
+    assert_eq!(bank.mission.as_deref(), Some("Support desk memory."));
+    assert_eq!(bank.disposition.empathy, 5);
+    assert_eq!(e.store.list_directives("fresh").unwrap()[0].name, "Kind");
+    let models = e.store.list_mental_models("fresh").unwrap();
+    assert_eq!(models[0].id, "fresh/overview");
+    assert_eq!(models[0].name.as_deref(), Some("Overview"));
+
+    // Only new banks get it: a later change survives the next retain.
+    e.update_bank_config(
+        "fresh",
+        &serde_json::from_value(json!({"reflect_mission": "Changed."})).unwrap(),
+    )
+    .unwrap();
+    retain(&e, "fresh", "Bob joined Google.").await;
+    let bank = e.store.get_bank("fresh").unwrap().unwrap();
+    assert_eq!(bank.mission.as_deref(), Some("Changed."));
+    assert_eq!(e.store.list_directives("fresh").unwrap().len(), 1);
+}

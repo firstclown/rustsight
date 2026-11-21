@@ -1,3 +1,4 @@
+use crate::prompts::upstream::reflect::Directive;
 use crate::traits::ToolDef;
 use crate::types::{Bank, Disposition, EntityType, ExtractedEntity};
 use crate::{Error, Result};
@@ -24,7 +25,7 @@ pub fn verbalize_disposition(d: &Disposition) -> String {
     )
 }
 
-pub fn build_reflect_system(bank: &Bank) -> String {
+pub fn build_reflect_system(bank: &Bank, directives: &[Directive]) -> String {
     let mut s = String::from(
         "You are the REFLECTIVE REASONING LOOP of a long-lived agent with persistent memory. \
          You answer questions on behalf of the agent by gathering evidence from its memory bank, \
@@ -36,10 +37,29 @@ pub fn build_reflect_system(bank: &Bank) -> String {
     if let Some(b) = &bank.background {
         s.push_str(&format!("BACKGROUND: {b}\n"));
     }
-    if let Some(d) = &bank.directives {
-        s.push_str(&format!(
-            "DIRECTIVES (hard rules you must never break): {d}\n"
-        ));
+    let rules: Vec<String> = directives
+        .iter()
+        .filter(|d| !d.content.trim().is_empty())
+        .map(|d| {
+            if d.name.is_empty() {
+                d.content.clone()
+            } else {
+                format!("**{}**: {}", d.name, d.content)
+            }
+        })
+        .collect();
+    match rules.as_slice() {
+        [] => {}
+        // One rule keeps the single-line form banks have always had.
+        [only] => s.push_str(&format!(
+            "DIRECTIVES (hard rules you must never break): {only}\n"
+        )),
+        many => {
+            s.push_str("DIRECTIVES (hard rules you must never break):\n");
+            for rule in many {
+                s.push_str(&format!("- {rule}\n"));
+            }
+        }
     }
     s.push('\n');
     s.push_str(&verbalize_disposition(&bank.disposition));
@@ -296,6 +316,38 @@ pub fn build_mental_model_prompt(question: &str, memories_block: &str) -> (Strin
 mod tests {
     use super::*;
 
+    fn bank_directives(bank: &Bank) -> Vec<Directive> {
+        bank.directives
+            .iter()
+            .map(|d| Directive::new("", d))
+            .collect()
+    }
+
+    #[test]
+    fn several_directives_render_as_a_named_list() {
+        let bank = Bank {
+            id: "b".into(),
+            mission: None,
+            directives: None,
+            background: None,
+            disposition: Disposition::default(),
+        };
+        let one = build_reflect_system(&bank, &[Directive::new("", "Never recommend stocks.")]);
+        assert!(
+            one.contains("DIRECTIVES (hard rules you must never break): Never recommend stocks.\n")
+        );
+        let many = build_reflect_system(
+            &bank,
+            &[
+                Directive::new("Formal", "Answer formally."),
+                Directive::new("", "Cite sources."),
+            ],
+        );
+        assert!(many.contains(
+            "DIRECTIVES (hard rules you must never break):\n- **Formal**: Answer formally.\n- Cite sources.\n"
+        ));
+    }
+
     #[test]
     fn disposition_text() {
         let d = Disposition {
@@ -319,7 +371,7 @@ mod tests {
             background: Some("ML focus".into()),
             disposition: Disposition::default(),
         };
-        let s = build_reflect_system(&bank);
+        let s = build_reflect_system(&bank, &bank_directives(&bank));
         assert!(s.contains("MISSION: Research assistant"));
         assert!(s.contains("DIRECTIVES"));
         assert!(s.contains("finish"));
@@ -354,13 +406,16 @@ mod tests {
     /// behaviors).
     #[test]
     fn reflect_system_carries_ladder_and_temporal_note() {
-        let s = build_reflect_system(&Bank {
-            id: "b".into(),
-            mission: None,
-            directives: None,
-            background: None,
-            disposition: Disposition::default(),
-        });
+        let s = build_reflect_system(
+            &Bank {
+                id: "b".into(),
+                mission: None,
+                directives: None,
+                background: None,
+                disposition: Disposition::default(),
+            },
+            &[],
+        );
         assert!(s.contains("search_observations"));
         assert!(s.contains("ordered by semantic relevance, NOT by time"));
         assert!(s.contains("mentioned_at"));
@@ -371,13 +426,16 @@ mod tests {
         // Upstream parity-run finding (2026-11-11): without the answer-not-a-
         // summary wording, models answer the literal question in one line and
         // the judge scores adjacent retrieved facts as omitted information.
-        let s = build_reflect_system(&Bank {
-            id: "b".into(),
-            mission: None,
-            directives: None,
-            background: None,
-            disposition: Disposition::default(),
-        });
+        let s = build_reflect_system(
+            &Bank {
+                id: "b".into(),
+                mission: None,
+                directives: None,
+                background: None,
+                disposition: Disposition::default(),
+            },
+            &[],
+        );
         assert!(s.contains("not a summary of it"));
         assert!(s.contains("carry over every relevant fact, date and number"));
         assert!(s.contains("NEVER cite memory ids or UUIDs in the answer text"));
@@ -399,13 +457,16 @@ mod tests {
     /// pin their presence.
     #[test]
     fn reflect_system_carries_query_strategy_and_depth() {
-        let s = build_reflect_system(&Bank {
-            id: "b".into(),
-            mission: None,
-            directives: None,
-            background: None,
-            disposition: Disposition::default(),
-        });
+        let s = build_reflect_system(
+            &Bank {
+                id: "b".into(),
+                mission: None,
+                directives: None,
+                background: None,
+                disposition: Disposition::default(),
+            },
+            &[],
+        );
         assert!(s.contains("## Query Strategy"));
         assert!(s.contains("NEVER just echo the user's question"));
         assert!(s.contains("Search for each separately"));
@@ -420,13 +481,16 @@ mod tests {
     /// preference.
     #[test]
     fn reflect_system_carries_evidence_discipline() {
-        let s = build_reflect_system(&Bank {
-            id: "b".into(),
-            mission: None,
-            directives: None,
-            background: None,
-            disposition: Disposition::default(),
-        });
+        let s = build_reflect_system(
+            &Bank {
+                id: "b".into(),
+                mission: None,
+                directives: None,
+                background: None,
+                disposition: Disposition::default(),
+            },
+            &[],
+        );
         assert!(s.contains("## Evidence Discipline"));
         assert!(s.contains("DO count as meeting them"));
         assert!(s.contains("not a food"));

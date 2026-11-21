@@ -80,7 +80,7 @@ Every change is complete only when **all** of the following pass locally:
      `crates/rustsight-core/src/fusion.rs`, `temporal.rs`, `prompts/*.rs`).
    - Engine-level/integration tests go in
      `crates/rustsight-storage/tests/engine_flow.rs` (in-memory SQLite +
-     scripted mocks; 67 tests there today).
+     scripted mocks; 69 tests there today).
 4. Docs touched where relevant: `docs/reference.md` (and the README overview) for user-facing behavior/env
    vars, `NEXT_STEPS.md` checkboxes if a ticket's scope changed.
 5. No secrets/API keys committed; `.gitignore` already covers `*.db*`.
@@ -143,6 +143,10 @@ Key source map:
   as the native API. Shapes were checked against the installed upstream
   `api/http.py` and exercised with the real `@vectorize-io/hindsight-client`;
   `docs/reference.md`'s compatibility matrix lists what is accepted-but-ignored.
+- `crates/rustsight-core/src/bank_config.rs` — the Hindsight-named bank
+  settings (`CONFIG_KEYS`, validation, `Engine::update_bank_config`) and
+  `Engine::provision_bank`; `templates.rs` — bank template manifests
+  (parse/import/export) and `Engine::reflect_directives` (RS-10d).
 - `crates/rustsight-core/src/files.rs` — `FileParser` trait, `ParserRegistry`
   (built-in `text`/`html`), content-addressed `Attachment` (RS-10c);
   `crates/rustsight-server/src/files.rs` serves `files/retain` and
@@ -230,6 +234,9 @@ Key source map:
   work, `memory_defense.triggered` for every redact/block. Sinks run
   synchronously, so they must only queue (the webhook sink writes delivery
   rows) — never make network calls inside `EventSink::emit`.
+- **Banks are created through `Engine::provision_bank`** (RS-10d): it is
+  what applies the default bank template, exactly once, before any caller
+  settings. Don't create banks with `store.ensure_bank` in new code paths.
 - **`enable_observations: false` gates consolidation, not retain.** Dirty
   entities keep queueing so re-enabling catches up.
 - **Embeddings are mirrored write-through into the vec0 index** (RS-7,
@@ -295,6 +302,9 @@ Env vars, read in `crates/rustsight-providers/src/env.rs`:
 - `RUSTSIGHT_ASYNC_RETAIN_CONCURRENCY` (default 2, clamped 1–64; async
   retains running at once through the compat API, invalid values fall back
   to default with a warning)
+- `RUSTSIGHT_DEFAULT_BANK_TEMPLATE` (inline JSON or a file path; RS-10d,
+  read by `rustsight_server::default_bank_template_from_env`, installed with
+  `Engine::with_default_template`).
 - `RUSTSIGHT_ENABLE_FILE_UPLOAD_API`, `RUSTSIGHT_FILE_PARSER` (default
   `text,html`), `RUSTSIGHT_FILE_CONVERSION_MAX_BATCH_SIZE[_MB]` (RS-10c;
   read in `crates/rustsight-server/src/files.rs`).

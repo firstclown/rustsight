@@ -1,3 +1,4 @@
+pub mod bank_config;
 pub mod defense;
 mod engine;
 mod entity;
@@ -10,6 +11,7 @@ mod links;
 pub mod prompts;
 mod store;
 pub mod tag_resolution;
+pub mod templates;
 mod temporal;
 pub mod traits;
 pub mod trigram;

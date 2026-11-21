@@ -66,6 +66,10 @@ pub(super) async fn refresh(
                 content,
                 last_refreshed_ms: Some(now),
                 created_at_ms: now,
+                name: None,
+                tags: vec![],
+                max_tokens: None,
+                trigger: None,
             };
             e.store.upsert_mental_model(&m)?;
             m
