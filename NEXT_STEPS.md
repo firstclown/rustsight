@@ -601,40 +601,198 @@ client). Facts for later tickets:
 
 ---
 
-## RS-10 — Upstream feature catch-up (individually ticketed) · P2 · varies
+## RS-10 — Upstream feature catch-up (triaged into RS-10a…f) · P2 · varies
 
 ### Description
-Features present upstream that rustsight deliberately lacks. Each should be
-pulled out into its own ticket when scheduled; listed here with enough context
-to size them.
-
-### Need-to-know facts / sub-items
-- **Memory defense (S/M):** opt-in per-bank policy scanning every retain for
-  secrets/PII (upstream ships 45 patterns) with `redact` or `block` actions
-  (e.g. `[REDACTED:github_token]`). Implement as a retain pre-parse hook;
-  pattern set is a plain data file upstream — port it.
-- **Documents & attachments (M):** retain accepts documents with attachments
-  (files stored via `attachment_store`, parsed by pluggable parsers —
-  markitdown/llama_parse/iris upstream). v1: file ingest with plain-text
-  extraction + attachment ids on facts.
-- **Async operations + webhooks (M):** long retains return an operation id;
-  status polling + webhook delivery on retain/consolidation/refresh
-  lifecycle events. Needs an `operations` table and a small event emitter.
-- **Bank templates (S):** declarative bank presets (mission/directives/
-  disposition/extraction labels) — upstream `engine/bank_templates.py`;
-  mostly config plumbing on our `Bank`.
-- **Multilingual preservation (S/M):** input-language detection and
-  preservation end-to-end (entities keep native script, facts untranslated);
-  FTS5 tokenizer choice matters for CJK (upstream ships
-  `chinese_temporal_periods.py` and trigram indexes — note our FTS uses
-  `porter unicode61`, which tokenizes CJK poorly; trigram or per-language
-  tokenizer needed).
-- **Per-tenant/hierarchical config (M):** global env → per-tenant → per-bank
-  override chain upstream; ours is env-only today.
+Features present upstream that rustsight lacked. Triaged Nov 2026 into the
+six tickets below, each with its own tests and DoD, landing as one commit
+each. Upstream sources (MIT) were read from the installed hindsight-api
+**1.2.1** (`api/http.py`, `extensions/memory_defense.py`, `webhooks/`,
+`engine/bank_templates.py`, `config_resolver.py`, `engine/parsers/`) —
+memory defense, bank templates and the webhook manager do not exist at the
+1.1.0 prompt pin.
 
 ### Definition of done
-- [ ] Each sub-item broken into its own ticket with tests before work starts;
+- [x] Each sub-item broken into its own ticket with tests before work starts;
       this umbrella closes when triaged.
+
+### RS-10a — Memory defense (secret/PII screening on retain) · S/M
+
+Port upstream's regex Memory Defense: the `_REDACTION_PATTERNS` catalog
+verbatim (provider keys, cloud/CI/payment/chat tokens, DB URLs, PEM, JWT,
+Luhn-checked cards, US SSN) with ASCII token boundaries (so secrets inside
+CJK prose still match), credit-card Luhn + UUID-overlap rejection, and
+fingerprinted per-hit previews (raw values never leave the screener).
+`fancy-regex` because the catalog needs look-around.
+
+- Policy is the bank config key `memory_defense`
+  (`{"enabled", "rules": [{"on": "sensitive_data", "action": "allow|redact|block"}]}`,
+  upstream `parse_policy`; unknown `on` names are accepted no-ops, a bad
+  action is a 4xx).
+- Screening runs inside `Engine::retain` before chunking, so native, compat
+  and MCP retains are all covered: `redact` rewrites the content (document
+  `original_text`, chunks and facts never see the secret); `block` refuses
+  the item with `Error::Blocked` (422) and stores nothing.
+- Compat batches follow upstream: blocked items are dropped, an all-blocked
+  batch is a 422.
+
+DoD:
+- [ ] Pattern-table unit tests (one case per label, CJK boundary, Luhn
+      rejects timestamps/port lists, UUID guard, fingerprint lengths).
+- [ ] engine_flow: redact leaves no secret in memories, chunks or document
+      text; block stores nothing; disabled policy is a no-op.
+- [ ] compat: config accepts/validates `memory_defense`; partial-block batch
+      retains the rest; all-blocked → 422.
+- [ ] docs/reference.md + NOTICE (1.2.1 source).
+
+### RS-10b — Engine lifecycle events + webhooks · M
+
+Async operations already exist (RS-9: persisted `operations`, polling,
+retry). What is missing is the event side.
+
+- `EventSink` seam on `Engine` (`with_event_sink`): `retain.completed`
+  (per document), `consolidation.completed` (per bank pass with
+  created/updated/deleted counts or the error), `memory_defense.triggered`
+  (action, matched types, fingerprinted hits). Called synchronously at the
+  emit point; embedders (Tauri) can plug their own sink.
+- Webhooks (upstream `webhooks/`): `webhooks` + `webhook_deliveries`
+  tables; the server's sink writes one delivery row per matching enabled
+  webhook (bank-scoped rows + the global `RUSTSIGHT_WEBHOOK_URL/_SECRET/
+  _EVENT_TYPES` one) — a transactional-outbox shape, so a restart resumes
+  pending deliveries. Deliveries do NOT go through the operations table
+  (a client waiting for "no pending operations" must not wait on a
+  5-hour webhook retry).
+- Delivery: upstream headers (`X-Hindsight-Event`, `-Event-Id`,
+  `-Delivery-Id`, `X-Hindsight-Signature` = `X-Hub-Signature-256` =
+  `sha256=<hmac body>`, `X-Hindsight-Signature-V2` = `t=..,v1=..`),
+  custom headers spread first, GET/POST, params, per-webhook timeout, retry
+  schedule 5s/5m/30m/2h/5h (6 attempts).
+- SSRF guard: deny loopback/private/link-local/CGNAT/reserved unless
+  `RUSTSIGHT_WEBHOOK_ALLOWED_HOSTS` permits the host or IP/CIDR; checked
+  at registration and at delivery (resolved addresses pinned for connect).
+  Response bodies withheld from the deliveries API unless
+  `RUSTSIGHT_WEBHOOK_EXPOSE_RESPONSE_BODY`.
+- Compat routes: `POST/GET /v1/default/banks/{id}/webhooks`,
+  `PATCH/DELETE …/webhooks/{webhook_id}`, `GET …/{webhook_id}/deliveries`.
+
+DoD:
+- [ ] engine_flow: a capturing sink sees retain, consolidation and defense
+      events with the upstream payload fields.
+- [ ] server tests: CRUD + validation (SSRF, unknown event type), signed
+      delivery to a local receiver (allowlisted), retry scheduling after a
+      500, deliveries listing.
+- [ ] docs/reference.md env vars + compat matrix.
+
+### RS-10c — File ingest + attachments · M
+
+Upstream `POST /v1/default/banks/{id}/files/retain` (multipart `files` +
+`request` JSON with `parser` / `files_metadata`), always async — one
+operation per file (`file_convert_retain`).
+
+- `attachments` table (id, bank, document, filename, content type, size,
+  sha256, bytes); `GET /v1/default/banks/{id}/attachments/{attachment_id}`
+  serves the original bytes. Deleting the document or bank deletes them.
+- `FileParser` trait + registry in core; built-ins: `text` (UTF-8 text,
+  markdown, CSV/JSON/YAML/XML, source code) and `html` (tag-stripped
+  text). Parser chains fall back in order; requesting an unregistered
+  parser is a 400 (upstream allowlist semantics). Heavier converters (PDF,
+  DOCX, OCR) slot in behind the trait later.
+- The extracted text retains under the file's document with the file's
+  tags/context/timestamp; every fact carries `attachment_id` (and
+  `filename`) in its metadata.
+- Limits (upstream defaults): 10 files, 100 MB per request
+  (`RUSTSIGHT_FILE_CONVERSION_MAX_BATCH_SIZE[_MB]`), endpoint toggle
+  `RUSTSIGHT_ENABLE_FILE_UPLOAD_API` (default on), default chain
+  `RUSTSIGHT_FILE_PARSER` (default `text,html`).
+- CLI: `rustsight retain --file <path>` runs the same parse locally.
+
+DoD:
+- [ ] Parser unit tests (text decode, HTML strip incl. script/style, chain
+      fallback, unsupported type error).
+- [ ] compat: multipart upload → operation completes → memories carry
+      `attachment_id`; attachment download returns the bytes; bad parser /
+      too many files / metadata count mismatch → 400.
+- [ ] Storage: attachment rows die with their document and bank.
+
+### RS-10d — Bank templates · S/M
+
+Upstream `engine/bank_templates.py`: manifest `{version: "1", bank,
+mental_models, directives}`.
+
+- `POST /v1/default/banks/{id}/import[?dry_run=true]`,
+  `GET /v1/default/banks/{id}/export`, `GET /v1/bank-template-schema`;
+  CLI `rustsight template import|export`.
+- `bank` applies the config keys this server acts on (same set as
+  `PATCH /config`); any other non-null upstream field is refused by name
+  rather than silently dropped.
+- Directives become first-class (name, content, priority, is_active,
+  tags) — stored per bank, matched by name on re-import, active ones
+  rendered into the reflect prompts by priority. The legacy single
+  `Bank.directives` string keeps working.
+- Mental models are matched by id (`source_query` → question, `name`
+  stored); content fills on the next refresh.
+- `RUSTSIGHT_DEFAULT_BANK_TEMPLATE` (inline JSON or a file path) is applied
+  to every newly created bank.
+
+DoD:
+- [ ] Unit: manifest validation (version, duplicate ids/names, unsupported
+      fields).
+- [ ] compat: import → export round-trip; dry run changes nothing;
+      re-import updates by id/name.
+- [ ] engine_flow: imported directives reach the reflect prompt; default
+      template lands on a bank created by retain.
+
+### RS-10e — Multilingual preservation · S/M
+
+Extraction already carries upstream's preserve-the-source-language rule
+(`default_language_section`) and the output-language directive builder;
+neither the setting nor CJK search was wired.
+
+- `RUSTSIGHT_LLM_OUTPUT_LANGUAGE` (+ `HINDSIGHT_API_LLM_OUTPUT_LANGUAGE`)
+  feeds extraction, consolidation and reflect prompts; unset keeps the
+  source-language rule (facts untranslated, entities in native script).
+- FTS: CJK runs (Han, Kana, Hangul) are indexed and queried as
+  overlapping bigrams next to the unicode61 tokens (Lucene CJKAnalyzer
+  shape) — `porter unicode61` alone makes a whole CJK sentence one token.
+  A one-time migration re-indexes existing rows.
+- Script detection (`lang.rs`) routes queries: Han-bearing queries also
+  run a Chinese relative-period parser (今天/昨天/前天, 本周/上周/下周,
+  本月/上个月, 今年/去年/前年, 最近/过去 N 天/周/个月/年, N 天前,
+  YYYY年M月[D日], M月D日) — the common subset of upstream's
+  `chinese_temporal_periods.py`; the full rule set is a recorded
+  divergence.
+
+DoD:
+- [ ] Unit: bigram tokenization, script detection, Chinese period table.
+- [ ] engine_flow: Chinese content retained with native-script entities;
+      a Chinese keyword query finds it through BM25; `上周` narrows the
+      temporal arm; output language reaches the extraction prompt.
+- [ ] Storage: migration test opening a pre-bigram FTS file.
+
+### RS-10f — Hierarchical config (global → tenant → bank) · M
+
+Upstream `config_resolver.py`: global env → tenant (extension) → bank
+overrides, resolved per request.
+
+- A tenant here is a named config layer (`tenants` table, id + JSON); a
+  bank joins one via its `tenant` setting (or `RUSTSIGHT_DEFAULT_TENANT`).
+  No auth-scoped isolation — that stays the single-token model.
+- One registry of configurable keys: engine knobs (chunk size/overlap,
+  reflect rounds/answer length, recall budget levels, rerank cap,
+  consolidation window/dupe threshold, output language) and bank settings
+  (missions, observations toggle, labels, memory defense). Values are
+  type-checked on write at either layer.
+- `Engine::resolved_config(bank)` merges the layers; retain, recall,
+  reflect and consolidation read their knobs and settings through it
+  instead of the global `EngineConfig`.
+- Native API: `GET/PATCH /tenants/{id}/config`, `GET /banks/{id}/config`
+  (resolved values + which layer each came from); CLI `rustsight tenant`.
+
+DoD:
+- [ ] Unit: layer precedence, type validation, unknown keys refused.
+- [ ] engine_flow: a tenant chunk-size override changes retain chunking for
+      its banks only; a bank override beats the tenant.
+- [ ] HTTP: tenant config round-trip; resolved view reports provenance.
 
 ---
 
