@@ -8,7 +8,7 @@
 pub mod consolidation;
 pub mod extraction;
 pub mod reflect;
-mod texts;
+pub(crate) mod texts;
 
 /// Python `str.format`-faithful template rendering for known keys: `{{` and
 /// `}}` collapse to literal braces, `{known}` substitutes verbatim (values

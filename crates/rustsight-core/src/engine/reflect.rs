@@ -3,7 +3,7 @@ use crate::engine::{with_retry, with_retry_config, Engine};
 use crate::entity::{
     collapse_ws, normalize_name, score_candidate, string_similarity, ResolverConfig,
 };
-use crate::prompts::prompt_utils::{iso_date_utc, iso_datetime_utc};
+use crate::prompts::prompt_utils::{iso_date_utc, iso_datetime_utc, output_language_directive};
 use crate::prompts::reflect::{
     build_opinion_extraction_prompt, build_reflect_system, parse_opinions, reflect_tools,
 };
@@ -59,8 +59,14 @@ pub(super) async fn reflect(
         disposition: Disposition::default(),
     });
     let directives = e.reflect_directives(&bank, opts.tags.as_ref())?;
-    let system = build_reflect_system(&bank, &directives);
-    let mut messages: Vec<ChatMessage> = vec![ChatMessage::user(query.to_string())];
+    let language = e.config.output_language.as_deref();
+    let system = build_reflect_system(&bank, &directives, language);
+    // A configured language goes on the user turn, as upstream's
+    // `build_agent_user_prompt` places it (the freshest position).
+    let mut messages: Vec<ChatMessage> = vec![ChatMessage::user(format!(
+        "{query}{}",
+        output_language_directive(language)
+    ))];
     let mut retrieved: HashSet<String> = HashSet::new();
     // Everything the tools returned, in upstream's synthesis-prompt shape —
     // the input to the final-synthesis call.
@@ -334,7 +340,7 @@ pub(super) async fn reflect(
         messages.push(ChatMessage::user(build_done_request_prompt(
             query,
             answer_max_tokens,
-            None,
+            language,
         )));
         let request = LlmRequest {
             system: Some(system.clone()),
@@ -794,9 +800,10 @@ async fn synthesize_answer(
         }),
     };
     let now_str = iso_datetime_utc(e.clock.now_ms());
+    let language = e.config.output_language.as_deref();
     let system = build_final_system_prompt(
         bank.mission.as_deref().filter(|m| !m.trim().is_empty()),
-        None,
+        language,
         directives,
         &now_str,
     );
@@ -814,7 +821,7 @@ async fn synthesize_answer(
             bank.background.as_deref(),
             e.config.reflect_max_context_tokens,
             answer_max_tokens,
-            None,
+            language,
             &count,
         );
         let request = LlmRequest {
@@ -848,7 +855,7 @@ async fn synthesize_answer(
         &profile,
         bank.background.as_deref(),
         answer_max_tokens,
-        None,
+        language,
     );
     let request = LlmRequest {
         system: Some(system),

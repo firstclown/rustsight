@@ -186,6 +186,9 @@ async fn retain_screened(e: &Engine, req: RetainRequest) -> Result<RetainRespons
         .unwrap_or(true);
     let labels = BankLabels::parse(bank_config.get("entity_labels"), free_form)?;
     let mut extract_config = e.config.extract.clone();
+    if let Some(language) = &e.config.output_language {
+        extract_config.output_language = Some(language.clone());
+    }
     if let Some(labels) = &labels {
         extract_config.entity_labels = Some(labels.groups.clone()).filter(|g| !g.is_empty());
         extract_config.entities_allow_free_form = labels.free_form;

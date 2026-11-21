@@ -7,6 +7,7 @@ pub mod events;
 pub mod files;
 mod fusion;
 pub mod labels;
+pub mod lang;
 mod links;
 pub mod prompts;
 mod store;

@@ -303,6 +303,7 @@ fn consolidate_entity<'a>(
                 window,
                 &existing,
                 mission.as_deref(),
+                e.config.output_language.as_deref(),
             );
             let request = LlmRequest {
                 system: Some(system),

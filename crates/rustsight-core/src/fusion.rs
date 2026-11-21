@@ -1,6 +1,6 @@
 use crate::traits::TokenEstimator;
 use crate::types::MemoryRef;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 pub fn rrf_fuse(lists: &[Vec<String>], k: f32) -> Vec<(String, f32)> {
     let mut scores: HashMap<&str, f32> = HashMap::new();
@@ -21,16 +21,12 @@ pub fn rrf_fuse(lists: &[Vec<String>], k: f32) -> Vec<(String, f32)> {
     v
 }
 
+/// BM25 query terms: lowercased words, plus character bigrams for CJK runs
+/// (indexed the same way, `lang::cjk_segment`). Capped at 12 terms, 24 when
+/// the query has CJK text — a CJK sentence yields a bigram per character.
 pub fn bm25_terms(query: &str) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut out = vec![];
-    for w in query.split(|c: char| !c.is_alphanumeric()) {
-        let w = w.to_lowercase();
-        if w.len() >= 2 && seen.insert(w.clone()) {
-            out.push(w);
-        }
-    }
-    out.truncate(12);
+    let mut out = crate::lang::search_terms(query);
+    out.truncate(if crate::lang::has_cjk(query) { 24 } else { 12 });
     out
 }
 

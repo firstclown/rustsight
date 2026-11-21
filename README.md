@@ -27,6 +27,9 @@ agents.
   embeddings endpoint (OpenAI, OpenRouter, Ollama, vLLM, …). It can also run
   a local cross-encoder reranker in-process, on CPU or CUDA.
 - **MCP built in.** `rustsight mcp` exposes memory as tools over stdio.
+- **Any language.** Facts keep the language and script they were written
+  in, Chinese/Japanese/Korean text is keyword-searchable, and Chinese date
+  phrases like 上周 narrow recall. Or force one output language.
 - **Templates.** Export a bank's settings, mental models and directives and
   import them elsewhere, or give every new bank a default template.
 - **Files in, facts out.** Upload text, markdown or HTML files; their facts

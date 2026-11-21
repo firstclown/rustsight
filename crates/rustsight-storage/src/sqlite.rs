@@ -1,5 +1,6 @@
 use crate::vector;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
+use rustsight_core::lang::cjk_segment;
 use rustsight_core::types::*;
 use rustsight_core::{
     brute_force_semantic, sort_hits, Admit, Clock, Error, MemoryStore, Result, SemanticHit,
@@ -243,6 +244,10 @@ CREATE TABLE IF NOT EXISTS directives(
   updated_at_ms INTEGER NOT NULL,
   UNIQUE(bank_id, name)
 );
+CREATE TABLE IF NOT EXISTS store_flags(
+  name TEXT PRIMARY KEY,
+  set_at_ms INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS mental_models(
   id TEXT PRIMARY KEY,
   bank_id TEXT NOT NULL,
@@ -418,6 +423,53 @@ impl SqliteStore {
             [],
         )
         .map_err(store_err)?;
+        Self::reindex_cjk_once(conn)?;
+        Ok(())
+    }
+
+    /// RS-10e: FTS rows written before CJK bigram indexing hold whole CJK
+    /// runs as single tokens. Rewrite those rows once (non-CJK rows are
+    /// unchanged by the segmenter and left alone), then record the flag.
+    fn reindex_cjk_once(conn: &Connection) -> Result<()> {
+        const FLAG: &str = "fts_cjk_bigrams";
+        let done = conn
+            .prepare("SELECT 1 FROM store_flags WHERE name = ?1")
+            .and_then(|mut st| st.exists(params![FLAG]))
+            .map_err(store_err)?;
+        if done {
+            return Ok(());
+        }
+        let rows: Vec<(i64, String)> = {
+            let mut stmt = conn
+                .prepare("SELECT rowid, text FROM texts_fts")
+                .map_err(store_err)?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(store_err)?;
+            rows.collect::<rusqlite::Result<_>>().map_err(store_err)?
+        };
+        let tx = conn.unchecked_transaction().map_err(store_err)?;
+        for (rowid, text) in rows {
+            let segmented = cjk_segment(&text);
+            if segmented != text {
+                tx.execute(
+                    "UPDATE texts_fts SET text = ?1 WHERE rowid = ?2",
+                    params![segmented, rowid],
+                )
+                .map_err(store_err)?;
+            }
+        }
+        tx.execute(
+            "INSERT INTO store_flags(name, set_at_ms) VALUES (?1, ?2)",
+            params![
+                FLAG,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as i64)
+            ],
+        )
+        .map_err(store_err)?;
+        tx.commit().map_err(store_err)?;
         Ok(())
     }
 
@@ -689,7 +741,7 @@ impl SqliteStore {
         .map_err(store_err)?;
         conn.execute(
             "INSERT INTO texts_fts(text, bank_id, kind, ref_id) VALUES (?1, ?2, ?3, ?4)",
-            params![text, bank_id, kind, ref_id],
+            params![cjk_segment(text), bank_id, kind, ref_id],
         )
         .map_err(store_err)?;
         Ok(())
@@ -828,7 +880,7 @@ impl MemoryStore for SqliteStore {
             .map_err(store_err)?;
             tx.execute(
                 "INSERT INTO texts_fts(text, bank_id, kind, ref_id) VALUES (?1, ?2, ?3, ?4)",
-                params![item.text, bank_id, item.kind.as_str(), id],
+                params![cjk_segment(&item.text), bank_id, item.kind.as_str(), id],
             )
             .map_err(store_err)?;
             self.vec_put(&tx, bank_id, item.kind, &id, Some(&item.embedding))?;
@@ -3337,6 +3389,53 @@ mod tests {
         let back = s.get_memory(&stored[0].id).unwrap().unwrap();
         assert_eq!(back.document_id.as_deref(), Some("d"));
         assert_eq!(back.tags, vec!["t".to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reindexes_cjk_rows_written_before_bigram_indexing() {
+        let dir = std::env::temp_dir().join(format!("rustsight-cjk-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.db");
+        {
+            // An FTS table as it was: whole CJK runs indexed as one token.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE VIRTUAL TABLE texts_fts USING fts5(
+                   text, bank_id UNINDEXED, kind UNINDEXED, ref_id UNINDEXED,
+                   tokenize='porter unicode61');
+                 INSERT INTO texts_fts VALUES ('爱丽丝加入了谷歌', 'b', 'world', 'm1');
+                 INSERT INTO texts_fts VALUES ('Bob moved to Berlin', 'b', 'world', 'm2');",
+            )
+            .unwrap();
+            let before: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM texts_fts WHERE texts_fts MATCH '谷歌'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(before, 0, "the old index cannot find a CJK word");
+        }
+        for _ in 0..2 {
+            let s = SqliteStore::open(&path).unwrap();
+            let hits = s
+                .search_bm25("b", &rustsight_core::bm25_terms("谷歌"), 10)
+                .unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].0, "m1");
+            let hits = s
+                .search_bm25("b", &rustsight_core::bm25_terms("berlin"), 10)
+                .unwrap();
+            assert_eq!(hits.len(), 1, "non-CJK rows untouched");
+            let conn = s.lock_conn();
+            let text: String = conn
+                .query_row("SELECT text FROM texts_fts WHERE ref_id = 'm1'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(text, "爱丽 丽丝 丝加 加入 入了 了谷 谷歌", "rewritten once");
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

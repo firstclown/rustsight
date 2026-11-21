@@ -247,6 +247,27 @@ the *engine* intentionally deviates from upstream, and what was not ported.
    - Not produced: `usage`, reflect `trace`, `scores.reranker` /
      `semantic` / `keyword` (only `scores.final`).
 
+### Multilingual handling (RS-10e)
+
+- **Tool-loop language rule.** rustsight's own tool-loop system prompt
+  (`build_reflect_system`) now carries upstream's
+  `REFLECT_TOOLS_LANGUAGE_RULE` when no output language is configured, and
+  with one the `output_language_directive` goes on the first user turn —
+  upstream's placement in `build_system_prompt_for_tools` /
+  `build_agent_user_prompt`. The rest of that prompt stays rustsight's.
+- **Chinese periods are a subset.** `lang::parse_chinese_window` covers the
+  common relative expressions (今天/昨天/前天/大前天, 本周/上周/下周,
+  本月/上个月/下个月, 今年/去年/前年, 最近/过去/近 N 天|周|个月|年 and 几,
+  N 天前, YYYY年[M月[D日]], M月D日) with upstream's semantics (Monday-start
+  calendar weeks, whole-day ranges, rolling windows ending today, `N天前`
+  as one day). Upstream's `chinese_temporal_periods.py` also handles
+  weekdays, weekends, quarters, halves, fuzzy offsets (前两天, 两三个月前),
+  "since"/"until" forms, future-open sentinels and hours; those fall
+  through to no window here.
+- **CJK keyword search** is ours: upstream relies on Postgres text search;
+  rustsight indexes CJK runs as character bigrams in FTS5
+  (`lang::cjk_segment`).
+
 ## Not ported (no parity claim)
 
 - `reflect/prompts.py`: `build_final_prompt`, `build_done_request_prompt`,

@@ -239,6 +239,7 @@ async fn build_engine(db: &PathBuf, mock: bool) -> Arc<Engine> {
     engine.reflect_llm = operation_llms.reflect;
     engine.consolidate_llm = operation_llms.consolidate;
     engine.config.retain_max_completion_tokens = Some(retain_max_completion_tokens());
+    engine.config.output_language = rustsight_server::llm_output_language_from_env();
     match rustsight_server::default_bank_template_from_env() {
         Ok(Some(template)) => engine = engine.with_default_template(template),
         Ok(None) => {}

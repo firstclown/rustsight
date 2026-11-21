@@ -15,7 +15,9 @@ const SCOPED_FETCH: usize = 100_000;
 
 pub(super) async fn recall(e: &Engine, req: RecallRequest) -> Result<RecallResponse> {
     let now = req.now_ms.unwrap_or_else(|| e.clock.now_ms());
-    let window = parse_window(&req.query, now);
+    // Han-bearing queries try the Chinese period rules first (RS-10e).
+    let window = crate::lang::parse_chinese_window(&req.query, now)
+        .or_else(|| parse_window(&req.query, now));
     let embed = Arc::clone(&e.embed);
     let qemb = with_retry(e, || embed.embed(vec![req.query.clone()]))
         .await?

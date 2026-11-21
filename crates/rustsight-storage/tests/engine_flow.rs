@@ -3731,3 +3731,141 @@ async fn default_template_lands_on_a_bank_created_by_retain() {
     assert_eq!(bank.mission.as_deref(), Some("Changed."));
     assert_eq!(e.store.list_directives("fresh").unwrap().len(), 1);
 }
+
+// ── RS-10e: multilingual ─────────────────────────────────────────────────
+
+/// Answers from a script and records each request's full prompt text.
+struct PromptCapture {
+    script: std::sync::Mutex<VecDeque<LlmResponse>>,
+    prompts: std::sync::Mutex<Vec<String>>,
+}
+
+impl PromptCapture {
+    fn new(script: Vec<LlmResponse>) -> Self {
+        Self {
+            script: std::sync::Mutex::new(script.into()),
+            prompts: std::sync::Mutex::default(),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for PromptCapture {
+    async fn complete(&self, req: &LlmRequest) -> Result<LlmResponse> {
+        let mut text = req.system.clone().unwrap_or_default();
+        for m in &req.messages {
+            text.push('\n');
+            text.push_str(&m.content);
+        }
+        self.prompts.lock().unwrap().push(text);
+        Ok(self
+            .script
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(synthesis_resp("{}")))
+    }
+}
+
+const ZH_NOW: i64 = 1_795_000_000_000; // 2026-11-18 (a Wednesday)
+
+#[tokio::test]
+async fn chinese_content_keeps_its_script_and_is_searchable() {
+    let llm = Arc::new(PromptCapture::new(vec![facts_resp(&[
+        ("爱丽丝上周加入了谷歌，担任搜索工程师。", "爱丽丝"),
+        ("Bob moved to Berlin.", "Bob"),
+    ])]));
+    let e = Engine::new(
+        Arc::new(SqliteStore::open_in_memory().unwrap()),
+        llm.clone(),
+        Arc::new(MockEmbed::default()),
+        Arc::new(MockRerank),
+        Arc::new(SimpleTokenEstimator),
+        Arc::new(FixedClock::new(ZH_NOW)),
+    );
+    retain(
+        &e,
+        "zh",
+        "爱丽丝上周加入了谷歌，担任搜索工程师。Bob moved to Berlin.",
+    )
+    .await;
+
+    // No output language: the source-language rule is in the prompt and
+    // the stored fact and entity stay in native script.
+    assert!(llm.prompts.lock().unwrap()[0].contains("Never translate."));
+    let names: Vec<String> = e
+        .store
+        .entities_for_bank("zh")
+        .unwrap()
+        .into_iter()
+        .map(|en| en.name)
+        .collect();
+    assert!(names.contains(&"爱丽丝".to_string()), "{names:?}");
+
+    // A Chinese keyword reaches the fact through BM25 bigrams, and a
+    // Latin word still finds the English fact.
+    let hits = e
+        .store
+        .search_bm25("zh", &bm25_terms("谷歌工程师"), 10)
+        .unwrap();
+    let texts: Vec<String> = hits
+        .iter()
+        .map(|(id, _, _)| e.store.get_memory(id).unwrap().unwrap().text)
+        .collect();
+    assert_eq!(
+        texts,
+        vec!["爱丽丝上周加入了谷歌，担任搜索工程师。".to_string()]
+    );
+    let hits = e
+        .store
+        .search_bm25("zh", &bm25_terms("berlin"), 10)
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+
+    // 上周 narrows the temporal arm to last calendar week (Mon 9 – Sun 15).
+    let r = e
+        .recall(RecallRequest {
+            bank_id: "zh".into(),
+            query: "爱丽丝上周做了什么？".into(),
+            token_budget: 1000,
+            top_k_per_arm: 20,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    // 2026-11-09T00:00Z .. 2026-11-16T00:00Z
+    assert_eq!(r.window, Some((1_794_182_400_000, 1_794_787_200_000)));
+}
+
+#[tokio::test]
+async fn output_language_reaches_extraction_and_reflect() {
+    let llm = Arc::new(PromptCapture::new(vec![facts_resp(&[(
+        "Alice rejoint Google.",
+        "Alice",
+    )])]));
+    let mut e = Engine::new(
+        Arc::new(SqliteStore::open_in_memory().unwrap()),
+        llm.clone(),
+        Arc::new(MockEmbed::default()),
+        Arc::new(MockRerank),
+        Arc::new(SimpleTokenEstimator),
+        Arc::new(FixedClock::new(ZH_NOW)),
+    );
+    e.config.output_language = Some("French".into());
+    retain(&e, "fr", "Alice joined Google.").await;
+    let extraction = llm.prompts.lock().unwrap()[0].clone();
+    assert!(
+        extraction.contains("Respond exclusively in French"),
+        "{extraction}"
+    );
+    assert!(
+        !extraction.contains("Never translate."),
+        "the source-language rule is dropped"
+    );
+
+    llm.prompts.lock().unwrap().clear();
+    e.reflect("fr", "Where does Alice work?").await.unwrap();
+    let first = llm.prompts.lock().unwrap()[0].clone();
+    assert!(first.contains("Respond exclusively in French"), "{first}");
+    assert!(!first.contains("## LANGUAGE RULE"));
+}

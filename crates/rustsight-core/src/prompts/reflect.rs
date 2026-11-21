@@ -25,7 +25,14 @@ pub fn verbalize_disposition(d: &Disposition) -> String {
     )
 }
 
-pub fn build_reflect_system(bank: &Bank, directives: &[Directive]) -> String {
+/// `language`: the configured output language (`None` adds upstream's
+/// answer-in-the-question's-language rule; a language drops it, and the
+/// engine puts the language directive on the user turn).
+pub fn build_reflect_system(
+    bank: &Bank,
+    directives: &[Directive],
+    language: Option<&str>,
+) -> String {
     let mut s = String::from(
         "You are the REFLECTIVE REASONING LOOP of a long-lived agent with persistent memory. \
          You answer questions on behalf of the agent by gathering evidence from its memory bank, \
@@ -133,6 +140,12 @@ pub fn build_reflect_system(bank: &Bank, directives: &[Directive]) -> String {
          - For before/after-a-date questions, weigh every recorded milestone of the subject — \
          an earlier partial ship, visit, or change counts — not only the final one.\n\n",
     );
+    // Upstream's tool-loop language rule (RS-10e); a configured language
+    // replaces it with the directive on the user turn.
+    s.push_str(&crate::prompts::prompt_utils::default_language_section(
+        crate::prompts::upstream::texts::REFLECT_TOOLS_LANGUAGE_RULE,
+        language,
+    ));
     s
 }
 
@@ -324,6 +337,22 @@ mod tests {
     }
 
     #[test]
+    fn language_rule_follows_the_output_language() {
+        let bank = Bank {
+            id: "b".into(),
+            mission: None,
+            directives: None,
+            background: None,
+            disposition: Disposition::default(),
+        };
+        let default = build_reflect_system(&bank, &[], None);
+        assert!(default.contains("## LANGUAGE RULE"));
+        assert!(default.contains("If the question is in Chinese, respond in Chinese."));
+        let fixed = build_reflect_system(&bank, &[], Some("German"));
+        assert!(!fixed.contains("## LANGUAGE RULE"));
+    }
+
+    #[test]
     fn several_directives_render_as_a_named_list() {
         let bank = Bank {
             id: "b".into(),
@@ -332,7 +361,11 @@ mod tests {
             background: None,
             disposition: Disposition::default(),
         };
-        let one = build_reflect_system(&bank, &[Directive::new("", "Never recommend stocks.")]);
+        let one = build_reflect_system(
+            &bank,
+            &[Directive::new("", "Never recommend stocks.")],
+            None,
+        );
         assert!(
             one.contains("DIRECTIVES (hard rules you must never break): Never recommend stocks.\n")
         );
@@ -342,6 +375,7 @@ mod tests {
                 Directive::new("Formal", "Answer formally."),
                 Directive::new("", "Cite sources."),
             ],
+            None,
         );
         assert!(many.contains(
             "DIRECTIVES (hard rules you must never break):\n- **Formal**: Answer formally.\n- Cite sources.\n"
@@ -371,7 +405,7 @@ mod tests {
             background: Some("ML focus".into()),
             disposition: Disposition::default(),
         };
-        let s = build_reflect_system(&bank, &bank_directives(&bank));
+        let s = build_reflect_system(&bank, &bank_directives(&bank), None);
         assert!(s.contains("MISSION: Research assistant"));
         assert!(s.contains("DIRECTIVES"));
         assert!(s.contains("finish"));
@@ -415,6 +449,7 @@ mod tests {
                 disposition: Disposition::default(),
             },
             &[],
+            None,
         );
         assert!(s.contains("search_observations"));
         assert!(s.contains("ordered by semantic relevance, NOT by time"));
@@ -435,6 +470,7 @@ mod tests {
                 disposition: Disposition::default(),
             },
             &[],
+            None,
         );
         assert!(s.contains("not a summary of it"));
         assert!(s.contains("carry over every relevant fact, date and number"));
@@ -466,6 +502,7 @@ mod tests {
                 disposition: Disposition::default(),
             },
             &[],
+            None,
         );
         assert!(s.contains("## Query Strategy"));
         assert!(s.contains("NEVER just echo the user's question"));
@@ -490,6 +527,7 @@ mod tests {
                 disposition: Disposition::default(),
             },
             &[],
+            None,
         );
         assert!(s.contains("## Evidence Discipline"));
         assert!(s.contains("DO count as meeting them"));

@@ -30,6 +30,11 @@ pub struct EngineConfig {
     pub entity_backfill: usize,
     pub semantic_edge_cap: usize,
     pub extract: ExtractionConfig,
+    /// Language every LLM-written artifact is forced into — facts,
+    /// observations, reflect answers (`RUSTSIGHT_LLM_OUTPUT_LANGUAGE`,
+    /// RS-10e). `None` keeps each prompt's preserve-the-source-language
+    /// rule: facts stay untranslated, entities in their native script.
+    pub output_language: Option<String>,
     pub reflect_max_rounds: usize,
     /// Base iteration count the Hindsight-compatible API scales by the
     /// request's `budget` (upstream `reflect_max_iterations` = 10, with
@@ -122,6 +127,7 @@ impl Default for EngineConfig {
             temporal_sigma_ms: 7.0 * 86_400_000.0,
             temporal_edge_min_weight: 0.25,
             entity: ResolverConfig::default(),
+            output_language: None,
             entity_backfill: 20,
             semantic_edge_cap: 10,
             extract: ExtractionConfig::default(),

@@ -96,6 +96,9 @@ trait (`search_semantic`).
     RUSTSIGHT_API_TOKEN       optional; bearer token required by every HTTP
                               endpoint except /healthz (see below)
     RUSTSIGHT_API_TOKEN_FILE  optional; read the token from a file instead
+    RUSTSIGHT_LLM_OUTPUT_LANGUAGE  write facts, observations and reflect answers
+                              in this language (e.g. English); unset keeps
+                              each source's own language (see "Multilingual")
     RUSTSIGHT_DEFAULT_BANK_TEMPLATE  a bank template (inline JSON, or a path to a
                               JSON file) applied to every new bank; an invalid
                               one stops startup (see "Bank templates")
@@ -410,6 +413,29 @@ and `retry_base_delay_ms`; other errors (auth, bad requests) fail fast. If a
 chunk's extraction output fails to parse (e.g. JSON truncated by an output
 token limit), the chunk is re-asked once at half size before the error
 surfaces.
+
+## Multilingual
+Content is remembered in the language it was written in. With
+`RUSTSIGHT_LLM_OUTPUT_LANGUAGE` unset, extraction, consolidation and
+reflect each keep Hindsight's preserve-the-source-language rule: facts are
+not translated, entity names stay in their native script, and reflect
+answers in the language of the question. Setting it (e.g. `English`)
+drops those rules and forces every generated fact, observation and answer
+into that language; the setting also answers to
+`HINDSIGHT_API_LLM_OUTPUT_LANGUAGE`.
+
+- **Keyword search in CJK.** Chinese, Japanese and Korean are written
+  without spaces, so the keyword arm indexes and queries their text as
+  overlapping two-character pieces next to ordinary words. A Chinese
+  query such as `谷歌工程师` finds facts containing `谷歌` or `工程师`.
+  Databases from before this change are re-indexed once, automatically,
+  when first opened (only rows containing CJK text are rewritten).
+- **Chinese dates in questions.** Queries with Chinese characters also
+  understand common relative periods for the temporal arm: 今天, 昨天,
+  前天, 上周 / 本周 / 下周 (Monday-start weeks), 上个月 / 本月,
+  去年 / 今年 / 前年, 最近三天 / 过去两周 / 近几个月, 十天前,
+  `2024年3月5日`, `2024年3月`, `6月1日`. Rarer forms (weekdays, quarters,
+  fuzzy ranges) are not recognized yet.
 
 ## Bank templates
 A template is Hindsight's manifest of a bank's setup:

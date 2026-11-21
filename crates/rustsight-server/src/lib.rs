@@ -27,6 +27,20 @@ pub fn consolidate_interval_from_env() -> Duration {
     }
 }
 
+/// `RUSTSIGHT_LLM_OUTPUT_LANGUAGE` (or `HINDSIGHT_API_LLM_OUTPUT_LANGUAGE`):
+/// the language facts, observations and reflect answers are written in.
+/// Unset keeps the source language.
+pub fn llm_output_language_from_env() -> Option<String> {
+    [
+        "RUSTSIGHT_LLM_OUTPUT_LANGUAGE",
+        "HINDSIGHT_API_LLM_OUTPUT_LANGUAGE",
+    ]
+    .into_iter()
+    .find_map(|name| std::env::var(name).ok())
+    .map(|v| v.trim().to_string())
+    .filter(|v| !v.is_empty())
+}
+
 /// The bank template applied to every new bank, from
 /// `RUSTSIGHT_DEFAULT_BANK_TEMPLATE` (or `HINDSIGHT_API_DEFAULT_BANK_TEMPLATE`):
 /// inline JSON when the value starts with `{`, else a path to a JSON file.

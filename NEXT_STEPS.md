@@ -763,11 +763,11 @@ neither the setting nor CJK search was wired.
   divergence.
 
 DoD:
-- [ ] Unit: bigram tokenization, script detection, Chinese period table.
-- [ ] engine_flow: Chinese content retained with native-script entities;
+- [x] Unit: bigram tokenization, script detection, Chinese period table.
+- [x] engine_flow: Chinese content retained with native-script entities;
       a Chinese keyword query finds it through BM25; `上周` narrows the
       temporal arm; output language reaches the extraction prompt.
-- [ ] Storage: migration test opening a pre-bigram FTS file.
+- [x] Storage: migration test opening a pre-bigram FTS file.
 
 ### RS-10f — Hierarchical config (global → tenant → bank) · M
 

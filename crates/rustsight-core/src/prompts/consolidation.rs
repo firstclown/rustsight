@@ -121,8 +121,9 @@ pub fn build_entity_consolidation_prompt(
     facts: &[Memory],
     existing: &[Observation],
     observations_mission: Option<&str>,
+    output_language: Option<&str>,
 ) -> (String, String) {
-    let system = build_consolidation_system_prompt(None);
+    let system = build_consolidation_system_prompt(output_language);
     let user = format!(
         "ENTITY: {entity_name}\n\n{}",
         build_consolidation_input(
@@ -538,7 +539,7 @@ mod tests {
 
     #[test]
     fn entity_prompt_carries_upstream_system_and_entity_scope() {
-        let (system, user) = build_entity_consolidation_prompt("Alice", &[], &[], None);
+        let (system, user) = build_entity_consolidation_prompt("Alice", &[], &[], None, None);
         assert!(
             system.contains("You are a memory consolidation system"),
             "upstream system prompt: {system}"
