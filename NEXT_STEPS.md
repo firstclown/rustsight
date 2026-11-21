@@ -437,13 +437,45 @@ memories, sluggish beyond. Add a `sqlite-vec` backed index behind the same
   table); keep brute-force as the fallback when the extension fails to load.
 
 ### Definition of done
-- [ ] Feature `sqlite-vec` in `rustsight-storage`; vec0 table + triggers or
-      write-through inserts; `search_semantic` uses KNN when enabled.
-- [ ] Migration/reindex command (`rustsight reindex --bank`).
-- [ ] Criterion bench: recall semantic arm at 10k / 100k vectors, brute force
-      vs ANN, recall@10 quality delta reported.
-- [ ] Graceful fallback when extension unavailable (log + brute force).
-- [ ] README scale guidance updated.
+- [x] Feature `sqlite-vec` in `rustsight-storage` (default on); vec0 tables
+      with write-through inserts; `search_semantic` uses KNN when enabled.
+- [x] Migration/reindex command (`rustsight reindex [--bank]`).
+- [x] Criterion bench: recall semantic arm at 10k / 100k vectors, brute force
+      vs index, recall@10 quality delta reported
+      (`cargo bench -p rustsight-storage --bench semantic`).
+- [x] Graceful fallback when extension unavailable (log + brute force).
+- [x] README scale guidance updated (`docs/reference.md` "Vector index and
+      scale").
+
+Done Nov 2026. Facts for later tickets:
+
+- sqlite-vec **0.1.9** (pinned `=0.1.9`) is an *exact* SIMD-less flat
+  scan in C, not an ANN: recall@10 = 1.000, single-query speedup ~2x
+  (100k x 384-d: 132 → 76 ms; 50k x 1536-d: 247 → 116 ms). The cosine
+  metric has no SIMD path even with `SQLITE_VEC_ENABLE_AVX` (only L2
+  does), and the crate's build.rs defines neither. Retain's 20-fact
+  neighbour batch is break-even (1.85 s scan vs 2.03 s KNN at 50k x
+  1536-d); the index's win there is memory, not time. A real ANN (HNSW
+  via usearch, or a later sqlite-vec with ANN) is the next lever and slots
+  in behind `MemoryStore::search_semantic`.
+- Layout (`crates/rustsight-storage/src/vector.rs`): one
+  `vec_f32_<dim>` vec0 table per width, `bank_id` partition key, `kind`
+  metadata column (KNN filters with `kind IN (...)`), `+ref_id` auxiliary;
+  `vec_rows` maps item id → vec0 rowid for point updates/deletes.
+  Extension registered per connection by calling `sqlite3_vec_init` on
+  the rusqlite handle (no process-global auto-extension).
+- Trust model: a bank answers from the index only while
+  `vec_indexed_banks` lists it. New banks under a live index are marked
+  at `ensure_bank`; any store opened without the index (`StoreOptions {
+  vector_index: false }`, `RUSTSIGHT_VECTOR_INDEX=off`, feature off, load
+  failure) clears all markers, so a mirror its writes skipped is never
+  trusted. `reindex_vectors` clears by partition key (catches orphans
+  `vec_rows` doesn't know about), re-inserts, re-marks.
+- Tag scopes keep filtering before the top-k cut: KNN fetch widens x4 from
+  max(4k, 64) up to vec0's k limit 4096, then falls back to the scan.
+- Retain's semantic edges now come from `search_semantic` (top
+  `semantic_edge_cap` per new fact, new ids excluded) instead of
+  `all_embeddings`; the brute-force default still scans once per batch.
 
 ---
 
@@ -1056,5 +1088,5 @@ opinions.
   reference scores 83.6 / 89.0 / 91.4 (OSS-20B / OSS-120B / Gemini-3 head).
 - Current test baseline: 39 tests green, clippy clean (as of initial commit
   `9070afb`).
-- Deviations already accepted: brute-force vectors (RS-7), informed-rewrite
+- Deviations already accepted: exact (non-ANN) vector KNN (RS-7), informed-rewrite
   prompts (RS-5), sync-only consolidation (RS-2), custom HTTP shapes (RS-9).

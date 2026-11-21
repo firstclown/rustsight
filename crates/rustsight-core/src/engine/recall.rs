@@ -3,9 +3,7 @@ use crate::engine::scoring::{
 };
 use crate::engine::{with_retry, Engine};
 use crate::types::*;
-use crate::{
-    apply_token_budget, bm25_terms, cosine, parse_window, rrf_fuse, Error, MemoryStore, Result,
-};
+use crate::{apply_token_budget, bm25_terms, parse_window, rrf_fuse, Error, MemoryStore, Result};
 use std::sync::Arc;
 
 /// How many of the fused arms' top hits seed the graph arm's link expansion
@@ -279,19 +277,15 @@ async fn arm_semantic(
     let qemb = qemb.to_vec();
     let kinds = kinds.to_vec();
     blocking_store(&e.store, move |store| {
-        let all = store.all_embeddings(&bank_id)?;
-        let mut scored: Vec<(f32, String)> = all
+        let admit = scope.as_ref().map(|s| move |id: &str| s.admits(id));
+        let admit_ref = admit.as_ref().map(|f| f as &dyn Fn(&str) -> bool);
+        let mut hits = store.search_semantic(&bank_id, &[&qemb], &kinds, k, admit_ref)?;
+        Ok(hits
+            .pop()
+            .unwrap_or_default()
             .into_iter()
-            .filter(|(id, kind, _)| kinds.contains(kind) && admits(&scope, id))
-            .map(|(id, _, v)| (cosine(&qemb, &v), id))
-            .collect();
-        scored.sort_by(|a, b| {
-            b.0.partial_cmp(&a.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.1.cmp(&b.1))
-        });
-        scored.truncate(k);
-        Ok(scored.into_iter().map(|(_, id)| id).collect())
+            .map(|(id, _, _)| id)
+            .collect())
     })
     .await
 }

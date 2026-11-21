@@ -195,8 +195,9 @@ example, in an MCP client config:
 ### CLI
 
 `rustsight` also has `retain`, `recall`, `reflect`, `consolidate`,
-`inspect`, `banks`, `bank-set` (mission, directives, and disposition), and
-`mental-model` subcommands. Run `rustsight --help` for details. The database
+`inspect`, `banks`, `bank-set` (mission, directives, and disposition),
+`mental-model`, and `reindex` (rebuild the vector index for a database
+written before it existed) subcommands. Run `rustsight --help` for details. The database
 lives at `~/.rustsight/rustsight.db` unless you set `--db` or `RUSTSIGHT_DB`.
 
 ## Use it as a library
@@ -316,7 +317,7 @@ Some useful extension points:
 | Crate | Role |
 |---|---|
 | `rustsight-core` | Types, traits, prompts, and the retain/recall/reflect/consolidate pipelines |
-| `rustsight-storage` | `SqliteStore`: WAL, FTS5 BM25, cosine over BLOB embeddings, typed edge graph |
+| `rustsight-storage` | `SqliteStore`: WAL, FTS5 BM25, sqlite-vec KNN over embeddings, typed edge graph |
 | `rustsight-providers` | OpenAI-compatible LLM/embeddings, API and ONNX rerankers, mocks |
 | `rustsight-server` | axum HTTP API (native and Hindsight-compatible) and stdio MCP server |
 | `rustsight-cli` | The `rustsight` binary |

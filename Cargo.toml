@@ -28,6 +28,12 @@ uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+# vec0 KNN index for the semantic recall arm (RS-7, rustsight-storage
+# feature `sqlite-vec`). One C file compiled against rusqlite's bundled
+# SQLite; pinned exactly because the on-disk vec0 format is versioned.
+sqlite-vec = "=0.1.9"
+# Benchmarks (RS-7/RS-12)
+criterion = { version = "0.5", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 axum = "0.8"
 tower = { version = "0.5", features = ["util"] }

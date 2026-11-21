@@ -1,6 +1,10 @@
+use crate::vector;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 use rustsight_core::types::*;
-use rustsight_core::{Clock, Error, MemoryStore, Result, SystemClock};
+use rustsight_core::{
+    brute_force_semantic, sort_hits, Admit, Clock, Error, MemoryStore, Result, SemanticHit,
+    SystemClock,
+};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -12,6 +16,39 @@ fn store_err(e: rusqlite::Error) -> Error {
 pub struct SqliteStore {
     conn: Arc<Mutex<Connection>>,
     clock: Arc<dyn Clock>,
+    /// sqlite-vec version when the KNN index is live on this connection
+    /// (RS-7); `None` means every semantic query is a brute-force scan.
+    vec_version: Option<String>,
+    /// Banks already warned about answering by brute force while the index
+    /// is live (pre-index banks awaiting `rustsight reindex`).
+    warned_unindexed: Mutex<HashSet<String>>,
+}
+
+/// How a [`SqliteStore`] opens its database.
+#[derive(Debug, Clone)]
+pub struct StoreOptions {
+    /// Maintain and query the sqlite-vec KNN index (default true). Off, or
+    /// when the extension cannot initialize, semantic search scans every
+    /// embedding and the index markers are cleared so a later indexed open
+    /// does not trust a mirror this store's writes skipped.
+    pub vector_index: bool,
+}
+
+impl Default for StoreOptions {
+    fn default() -> Self {
+        Self { vector_index: true }
+    }
+}
+
+/// Outcome of [`SqliteStore::reindex_vectors`] for one bank.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ReindexReport {
+    pub bank_id: String,
+    /// Embedded items written to the index.
+    pub indexed: usize,
+    /// Items whose embedding is too wide for vec0; when non-zero the bank
+    /// stays on brute force.
+    pub skipped: usize,
 }
 
 const SCHEMA: &str = r#"
@@ -194,7 +231,7 @@ fn placeholders(n: usize) -> String {
 }
 
 impl SqliteStore {
-    fn init(conn: Connection, clock: Arc<dyn Clock>) -> Result<Self> {
+    fn init(conn: Connection, clock: Arc<dyn Clock>, opts: &StoreOptions) -> Result<Self> {
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(store_err)?;
         conn.pragma_update(None, "synchronous", "NORMAL")
@@ -202,10 +239,29 @@ impl SqliteStore {
         conn.pragma_update(None, "busy_timeout", 5000)
             .map_err(store_err)?;
         conn.execute_batch(SCHEMA).map_err(store_err)?;
+        conn.execute_batch(vector::SCHEMA).map_err(store_err)?;
         Self::migrate(&conn)?;
+        let vec_version = if opts.vector_index {
+            match vector::load(&conn) {
+                Ok(version) => Some(version),
+                Err(reason) => {
+                    eprintln!(
+                        "rustsight: sqlite-vec unavailable ({reason}); semantic search falls back to brute force"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if vec_version.is_none() {
+            vector::invalidate_all(&conn).map_err(store_err)?;
+        }
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             clock,
+            vec_version,
+            warned_unindexed: Mutex::new(HashSet::new()),
         })
     }
 
@@ -249,6 +305,14 @@ impl SqliteStore {
     }
 
     pub fn open_with_clock(path: impl AsRef<Path>, clock: Arc<dyn Clock>) -> Result<Self> {
+        Self::open_with_options(path, clock, &StoreOptions::default())
+    }
+
+    pub fn open_with_options(
+        path: impl AsRef<Path>,
+        clock: Arc<dyn Clock>,
+        opts: &StoreOptions,
+    ) -> Result<Self> {
         if let Some(parent) = path.as_ref().parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)
@@ -256,7 +320,7 @@ impl SqliteStore {
             }
         }
         let conn = Connection::open(path).map_err(store_err)?;
-        Self::init(conn, clock)
+        Self::init(conn, clock, opts)
     }
 
     pub fn open_in_memory() -> Result<Self> {
@@ -264,8 +328,138 @@ impl SqliteStore {
     }
 
     pub fn open_in_memory_with_clock(clock: Arc<dyn Clock>) -> Result<Self> {
+        Self::open_in_memory_with_options(clock, &StoreOptions::default())
+    }
+
+    pub fn open_in_memory_with_options(clock: Arc<dyn Clock>, opts: &StoreOptions) -> Result<Self> {
         let conn = Connection::open_in_memory().map_err(store_err)?;
-        Self::init(conn, clock)
+        Self::init(conn, clock, opts)
+    }
+
+    /// The sqlite-vec version when the KNN index is live, `None` when
+    /// semantic search is brute force (feature off, disabled, or the
+    /// extension failed to initialize).
+    pub fn vector_index_version(&self) -> Option<&str> {
+        self.vec_version.as_deref()
+    }
+
+    /// Whether a bank's semantic queries are answered from the KNN index.
+    pub fn bank_vector_indexed(&self, bank_id: &str) -> Result<bool> {
+        if self.vec_version.is_none() {
+            return Ok(false);
+        }
+        vector::is_indexed(&self.lock_conn(), bank_id).map_err(store_err)
+    }
+
+    /// Rebuild the KNN index for one bank (or every bank) from the stored
+    /// embeddings, then mark it indexed. The migration path for databases
+    /// written before the index existed or by a store that did not maintain
+    /// it. Runs in one transaction per bank, holding the connection lock
+    /// for the duration.
+    pub fn reindex_vectors(&self, bank_id: Option<&str>) -> Result<Vec<ReindexReport>> {
+        if self.vec_version.is_none() {
+            return Err(Error::Store(
+                "vector index unavailable: sqlite-vec is disabled or failed to load".into(),
+            ));
+        }
+        let banks: Vec<String> = match bank_id {
+            Some(b) => vec![b.to_string()],
+            None => self.list_banks()?.into_iter().map(|b| b.id).collect(),
+        };
+        let mut reports = vec![];
+        let mut conn = self.lock_conn();
+        for bank in banks {
+            let tx = conn.transaction().map_err(store_err)?;
+            vector::remove_bank(&tx, &bank).map_err(store_err)?;
+            let all = Self::all_embeddings_on(&tx, &bank)?;
+            let mut report = ReindexReport {
+                bank_id: bank.clone(),
+                indexed: 0,
+                skipped: 0,
+            };
+            for (id, kind, v) in &all {
+                if v.is_empty() {
+                    continue;
+                }
+                if v.len() > vector::MAX_DIM {
+                    report.skipped += 1;
+                    continue;
+                }
+                vector::put(&tx, &bank, *kind, id, Some(v)).map_err(store_err)?;
+                report.indexed += 1;
+            }
+            if report.skipped == 0 {
+                vector::mark(&tx, &bank).map_err(store_err)?;
+            }
+            tx.commit().map_err(store_err)?;
+            reports.push(report);
+        }
+        Ok(reports)
+    }
+
+    /// Mirror an item's embedding into the KNN index when it is live.
+    fn vec_put(
+        &self,
+        conn: &Connection,
+        bank_id: &str,
+        kind: MemoryKind,
+        ref_id: &str,
+        embedding: Option<&[f32]>,
+    ) -> Result<()> {
+        if self.vec_version.is_some() {
+            vector::put(conn, bank_id, kind, ref_id, embedding).map_err(store_err)?;
+        }
+        Ok(())
+    }
+
+    /// Drop items from the KNN index when it is live.
+    fn vec_remove<'a>(
+        &self,
+        conn: &Connection,
+        ref_ids: impl IntoIterator<Item = &'a String>,
+    ) -> Result<()> {
+        if self.vec_version.is_some() {
+            vector::remove_many(conn, ref_ids).map_err(store_err)?;
+        }
+        Ok(())
+    }
+
+    /// One query's top-k from the index, widening the KNN fetch while an
+    /// `admit` predicate keeps rejecting rows. `None` when even the widest
+    /// fetch vec0 allows cannot fill `k` — the caller scans instead.
+    fn knn_top_k(
+        conn: &Connection,
+        bank_id: &str,
+        query: &[f32],
+        kinds: &[MemoryKind],
+        k: usize,
+        admit: Admit<'_>,
+    ) -> Result<Option<Vec<SemanticHit>>> {
+        if k == 0 {
+            return Ok(Some(vec![]));
+        }
+        let mut fetch = match admit {
+            Some(_) => (k * 4).max(64),
+            None => k,
+        }
+        .min(vector::MAX_K);
+        loop {
+            let rows = vector::knn(conn, bank_id, query, kinds, fetch).map_err(store_err)?;
+            let exhausted = rows.len() < fetch;
+            let mut hits: Vec<SemanticHit> = rows
+                .into_iter()
+                .filter(|(id, _, _)| admit.is_none_or(|f| f(id)))
+                .collect();
+            if hits.len() >= k || exhausted {
+                sort_hits(&mut hits);
+                hits.truncate(k);
+                return Ok(Some(hits));
+            }
+            if fetch >= vector::MAX_K {
+                return Ok(None);
+            }
+            fetch = (fetch * 4).min(vector::MAX_K);
+        }
     }
 
     /// Deliberate poisoning-recovery policy: SQLite's real state lives in the
@@ -274,6 +468,62 @@ impl SqliteStore {
     /// every subsequent store call.
     fn lock_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn all_embeddings_on(
+        conn: &Connection,
+        bank_id: &str,
+    ) -> Result<Vec<(MemoryId, MemoryKind, Vec<f32>)>> {
+        let mut out = vec![];
+        let mut stmt = conn
+            .prepare("SELECT id, kind, embedding FROM memories WHERE bank_id=?1 AND embedding IS NOT NULL")
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![bank_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .map_err(store_err)?;
+        for r in rows {
+            let (id, kind, blob) = r.map_err(store_err)?;
+            out.push((
+                id,
+                MemoryKind::parse(&kind).unwrap_or(MemoryKind::World),
+                blob_to_emb(&blob),
+            ));
+        }
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, embedding FROM observations WHERE bank_id=?1 AND embedding IS NOT NULL",
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![bank_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(store_err)?;
+        for r in rows {
+            let (id, blob) = r.map_err(store_err)?;
+            out.push((id, MemoryKind::Observation, blob_to_emb(&blob)));
+        }
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, embedding FROM opinions WHERE bank_id=?1 AND embedding IS NOT NULL",
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![bank_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(store_err)?;
+        for r in rows {
+            let (id, blob) = r.map_err(store_err)?;
+            out.push((id, MemoryKind::Opinion, blob_to_emb(&blob)));
+        }
+        Ok(out)
     }
 
     fn row_memory(r: &Row) -> rusqlite::Result<Memory> {
@@ -329,7 +579,7 @@ impl MemoryStore for SqliteStore {
     fn ensure_bank(&self, bank: &Bank) -> Result<()> {
         let conn = self.lock_conn();
         let now = self.clock.now_ms();
-        conn.execute(
+        let created = conn.execute(
             "INSERT OR IGNORE INTO banks(id, mission, directives, background, skepticism, literalism, empathy, bias_strength, created_at_ms, updated_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
             params![
@@ -345,6 +595,11 @@ impl MemoryStore for SqliteStore {
             ],
         )
         .map_err(store_err)?;
+        // A bank born under a live index has every embedding mirrored from
+        // its first write; older banks wait for `reindex_vectors`.
+        if created > 0 && self.vec_version.is_some() {
+            vector::mark(&conn, &bank.id).map_err(store_err)?;
+        }
         Ok(())
     }
 
@@ -455,6 +710,7 @@ impl MemoryStore for SqliteStore {
                 params![item.text, bank_id, item.kind.as_str(), id],
             )
             .map_err(store_err)?;
+            self.vec_put(&tx, bank_id, item.kind, &id, Some(&item.embedding))?;
             out.push(Memory {
                 id,
                 bank_id: bank_id.to_string(),
@@ -521,55 +777,48 @@ impl MemoryStore for SqliteStore {
     }
 
     fn all_embeddings(&self, bank_id: &str) -> Result<Vec<(MemoryId, MemoryKind, Vec<f32>)>> {
+        Self::all_embeddings_on(&self.lock_conn(), bank_id)
+    }
+
+    fn search_semantic(
+        &self,
+        bank_id: &str,
+        queries: &[&[f32]],
+        kinds: &[MemoryKind],
+        k: usize,
+        admit: Admit<'_>,
+    ) -> Result<Vec<Vec<SemanticHit>>> {
         let conn = self.lock_conn();
-        let mut out = vec![];
-        let mut stmt = conn
-            .prepare("SELECT id, kind, embedding FROM memories WHERE bank_id=?1 AND embedding IS NOT NULL")
-            .map_err(store_err)?;
-        let rows = stmt
-            .query_map(params![bank_id], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, Vec<u8>>(2)?,
-                ))
-            })
-            .map_err(store_err)?;
-        for r in rows {
-            let (id, kind, blob) = r.map_err(store_err)?;
-            out.push((
-                id,
-                MemoryKind::parse(&kind).unwrap_or(MemoryKind::World),
-                blob_to_emb(&blob),
-            ));
+        let indexed =
+            self.vec_version.is_some() && vector::is_indexed(&conn, bank_id).map_err(store_err)?;
+        if !indexed {
+            if self.vec_version.is_some() {
+                let mut warned = self
+                    .warned_unindexed
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                if warned.insert(bank_id.to_string()) {
+                    eprintln!(
+                        "rustsight: bank {bank_id} has no vector index yet; semantic search scans every embedding until `rustsight reindex --bank {bank_id}`"
+                    );
+                }
+            }
+            let all = Self::all_embeddings_on(&conn, bank_id)?;
+            return Ok(brute_force_semantic(&all, queries, kinds, k, admit));
         }
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, embedding FROM observations WHERE bank_id=?1 AND embedding IS NOT NULL",
-            )
-            .map_err(store_err)?;
-        let rows = stmt
-            .query_map(params![bank_id], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
-            })
-            .map_err(store_err)?;
-        for r in rows {
-            let (id, blob) = r.map_err(store_err)?;
-            out.push((id, MemoryKind::Observation, blob_to_emb(&blob)));
-        }
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, embedding FROM opinions WHERE bank_id=?1 AND embedding IS NOT NULL",
-            )
-            .map_err(store_err)?;
-        let rows = stmt
-            .query_map(params![bank_id], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
-            })
-            .map_err(store_err)?;
-        for r in rows {
-            let (id, blob) = r.map_err(store_err)?;
-            out.push((id, MemoryKind::Opinion, blob_to_emb(&blob)));
+        let mut scan: Option<Vec<(MemoryId, MemoryKind, Vec<f32>)>> = None;
+        let mut out = Vec::with_capacity(queries.len());
+        for q in queries {
+            match Self::knn_top_k(&conn, bank_id, q, kinds, k, admit)? {
+                Some(hits) => out.push(hits),
+                None => {
+                    if scan.is_none() {
+                        scan = Some(Self::all_embeddings_on(&conn, bank_id)?);
+                    }
+                    let all = scan.as_deref().unwrap_or_default();
+                    out.extend(brute_force_semantic(all, &[q], kinds, k, admit));
+                }
+            }
         }
         Ok(out)
     }
@@ -1247,6 +1496,13 @@ impl MemoryStore for SqliteStore {
         )
         .map_err(store_err)?;
         Self::fts_upsert(&tx, &o.bank_id, "observation", &o.id, &o.text)?;
+        self.vec_put(
+            &tx,
+            &o.bank_id,
+            MemoryKind::Observation,
+            &o.id,
+            o.embedding.as_deref(),
+        )?;
         tx.commit().map_err(store_err)
     }
 
@@ -1281,13 +1537,26 @@ impl MemoryStore for SqliteStore {
     }
 
     fn set_observation_embedding(&self, id: &str, embedding: Option<Vec<f32>>) -> Result<()> {
-        let conn = self.lock_conn();
-        conn.execute(
-            "UPDATE observations SET embedding = ?2 WHERE id = ?1",
-            params![id, embedding.as_deref().map(emb_to_blob)],
-        )
-        .map_err(store_err)?;
-        Ok(())
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction().map_err(store_err)?;
+        let bank_id: Option<String> = tx
+            .query_row(
+                "UPDATE observations SET embedding = ?2 WHERE id = ?1 RETURNING bank_id",
+                params![id, embedding.as_deref().map(emb_to_blob)],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(store_err)?;
+        if let Some(bank_id) = bank_id {
+            self.vec_put(
+                &tx,
+                &bank_id,
+                MemoryKind::Observation,
+                id,
+                embedding.as_deref(),
+            )?;
+        }
+        tx.commit().map_err(store_err)
     }
 
     fn delete_observation(&self, bank_id: &str, id: &str) -> Result<()> {
@@ -1303,6 +1572,7 @@ impl MemoryStore for SqliteStore {
             params![bank_id, id],
         )
         .map_err(store_err)?;
+        self.vec_remove(&tx, [&id.to_string()])?;
         tx.commit().map_err(store_err)
     }
 
@@ -1334,6 +1604,13 @@ impl MemoryStore for SqliteStore {
             .map_err(store_err)?;
         }
         Self::fts_upsert(&tx, &o.bank_id, "opinion", &o.id, &o.text)?;
+        self.vec_put(
+            &tx,
+            &o.bank_id,
+            MemoryKind::Opinion,
+            &o.id,
+            o.embedding.as_deref(),
+        )?;
         tx.commit().map_err(store_err)
     }
 
@@ -1546,6 +1823,7 @@ impl MemoryStore for SqliteStore {
                     .map_err(store_err)?;
             }
         }
+        self.vec_remove(&tx, &ids)?;
         // Observations must not keep citing facts that no longer exist.
         let observations: Vec<(String, String, String)> = {
             let mut stmt = tx
@@ -1572,6 +1850,7 @@ impl MemoryStore for SqliteStore {
             if kept.is_empty() {
                 tx.execute("DELETE FROM observations WHERE id = ?1", params![oid])
                     .map_err(store_err)?;
+                self.vec_remove(&tx, [&oid])?;
                 tx.execute(
                     "DELETE FROM texts_fts WHERE bank_id = ?1 AND ref_id = ?2",
                     params![bank_id, oid],
@@ -1746,6 +2025,11 @@ impl MemoryStore for SqliteStore {
             "DELETE FROM banks WHERE id = ?1",
         ] {
             tx.execute(sql, params![bank_id]).map_err(store_err)?;
+        }
+        // Without the extension the vec0 rows cannot be touched (and the
+        // marker is already gone); a later reindex clears them by partition.
+        if self.vec_version.is_some() {
+            vector::remove_bank(&tx, bank_id).map_err(store_err)?;
         }
         tx.commit().map_err(store_err)?;
         Ok(deleted)
@@ -2874,5 +3158,336 @@ mod tests {
         assert_eq!(chunks[0].document_tags, vec!["t".to_string()]);
         s.delete_document_memories("b", "d").unwrap();
         assert!(s.get_chunks("b", &["b_d_0".into()]).unwrap().is_empty());
+    }
+
+    // ---- RS-7: sqlite-vec KNN index -------------------------------------
+
+    fn vbank(s: &SqliteStore, id: &str) {
+        s.ensure_bank(&Bank {
+            id: id.into(),
+            mission: None,
+            directives: None,
+            background: None,
+            disposition: Disposition::default(),
+        })
+        .unwrap();
+    }
+
+    /// Deterministic, tie-free 4-d vectors.
+    fn vvec(i: usize) -> Vec<f32> {
+        let x = i as f32;
+        vec![
+            (x * 0.37).sin(),
+            (x * 0.91).cos(),
+            (x * 1.3 + 0.2).sin(),
+            0.5 + x * 0.01,
+        ]
+    }
+
+    fn vmem(i: usize, kind: MemoryKind, doc: Option<&str>) -> NewMemoryRecord {
+        NewMemoryRecord {
+            kind,
+            embedding: vvec(i),
+            document_id: doc.map(str::to_string),
+            ..new_mem(&format!("m{i}"), i as i64)
+        }
+    }
+
+    #[cfg(feature = "sqlite-vec")]
+    fn vobs(id: &str, bank: &str, emb: Option<Vec<f32>>) -> Observation {
+        Observation {
+            id: id.into(),
+            bank_id: bank.into(),
+            entity_id: "e".into(),
+            text: format!("obs {id}"),
+            evidence: vec![],
+            proof_count: 0,
+            history: vec![],
+            updated_at_ms: 1,
+            created_at_ms: 1,
+            embedding: emb,
+        }
+    }
+
+    const ALL: [MemoryKind; 4] = [
+        MemoryKind::World,
+        MemoryKind::Experience,
+        MemoryKind::Observation,
+        MemoryKind::Opinion,
+    ];
+
+    fn ids(hits: &[SemanticHit]) -> Vec<String> {
+        hits.iter().map(|(id, _, _)| id.clone()).collect()
+    }
+
+    /// The index answer must equal the reference scan for every query,
+    /// kind set, and admit predicate tried.
+    fn assert_matches_scan(s: &SqliteStore, bank: &str) {
+        let all = s.all_embeddings(bank).unwrap();
+        let queries: Vec<Vec<f32>> = (100..106).map(vvec).collect();
+        let qrefs: Vec<&[f32]> = queries.iter().map(Vec::as_slice).collect();
+        let even = |id: &str| id.bytes().map(u32::from).sum::<u32>() % 2 == 0;
+        let kind_sets: [&[MemoryKind]; 3] = [
+            &ALL,
+            &[MemoryKind::World, MemoryKind::Experience],
+            &[MemoryKind::Observation],
+        ];
+        for kinds in kind_sets {
+            for k in [1, 3, 50] {
+                for admit in [None, Some(&even as &dyn Fn(&str) -> bool)] {
+                    let got = s.search_semantic(bank, &qrefs, kinds, k, admit).unwrap();
+                    let want = brute_force_semantic(&all, &qrefs, kinds, k, admit);
+                    assert_eq!(got.len(), want.len());
+                    for (g, w) in got.iter().zip(&want) {
+                        assert_eq!(ids(g), ids(w), "kinds {kinds:?} k {k}");
+                        for (a, b) in g.iter().zip(w) {
+                            assert!((a.2 - b.2).abs() < 1e-4, "{a:?} vs {b:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "sqlite-vec")]
+    #[test]
+    fn vector_index_mirrors_every_embedding_write_and_delete() {
+        let s = store();
+        assert!(s.vector_index_version().unwrap().starts_with('v'));
+        vbank(&s, "b");
+        vbank(&s, "other");
+        assert!(s.bank_vector_indexed("b").unwrap());
+        let mut recs = vec![];
+        for i in 0..30 {
+            let kind = if i % 3 == 0 {
+                MemoryKind::Experience
+            } else {
+                MemoryKind::World
+            };
+            recs.push(vmem(i, kind, Some(if i < 10 { "d1" } else { "d2" })));
+        }
+        let stored = s.insert_memories("b", &recs).unwrap();
+        s.insert_memories("other", &[vmem(101, MemoryKind::World, None)])
+            .unwrap();
+        s.upsert_observation(&vobs("o1", "b", Some(vvec(40))))
+            .unwrap();
+        s.upsert_observation(&vobs("o2", "b", Some(vvec(41))))
+            .unwrap();
+        s.upsert_observation(&vobs("o3", "b", None)).unwrap();
+        s.upsert_opinion(&Opinion {
+            id: "p1".into(),
+            bank_id: "b".into(),
+            text: "op".into(),
+            confidence: 0.5,
+            evidence: vec![],
+            history: vec![],
+            entity_ids: vec![],
+            updated_at_ms: 1,
+            created_at_ms: 1,
+            embedding: Some(vvec(42)),
+        })
+        .unwrap();
+        assert_matches_scan(&s, "b");
+
+        // Updates replace the mirrored vector; clearing one unindexes it.
+        s.upsert_observation(&vobs("o1", "b", Some(vvec(102))))
+            .unwrap();
+        s.set_observation_embedding("o3", Some(vvec(43))).unwrap();
+        s.set_observation_embedding("o2", None).unwrap();
+        assert_matches_scan(&s, "b");
+
+        // Deletes: one observation, a whole document's memories (with an
+        // observation that loses all its evidence), then the other bank.
+        s.delete_observation("b", "o3").unwrap();
+        let mut citing = vobs("o4", "b", Some(vvec(44)));
+        citing.evidence = vec![Evidence {
+            memory_id: stored[0].id.clone(),
+            quote: String::new(),
+        }];
+        s.upsert_observation(&citing).unwrap();
+        s.delete_document_memories("b", "d1").unwrap();
+        assert!(s
+            .all_embeddings("b")
+            .unwrap()
+            .iter()
+            .all(|(id, _, _)| id != "o4"));
+        assert_matches_scan(&s, "b");
+
+        s.delete_bank("other").unwrap();
+        let conn = s.lock_conn();
+        let left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM vec_rows WHERE bank_id = 'other'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let in_vec0: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM vec_f32_4 WHERE bank_id = 'other'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let total_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM vec_rows", [], |r| r.get(0))
+            .unwrap();
+        let total_vec0: i64 = conn
+            .query_row("SELECT COUNT(*) FROM vec_f32_4", [], |r| r.get(0))
+            .unwrap();
+        drop(conn);
+        assert_eq!((left, in_vec0), (0, 0));
+        assert_eq!(total_rows as usize, s.all_embeddings("b").unwrap().len());
+        assert_eq!(total_rows, total_vec0);
+        assert!(!s.bank_vector_indexed("other").unwrap());
+    }
+
+    #[cfg(feature = "sqlite-vec")]
+    #[test]
+    fn vector_index_widens_fetch_until_a_strict_admit_is_filled() {
+        let s = store();
+        vbank(&s, "b");
+        let recs: Vec<_> = (0..400).map(|i| vmem(i, MemoryKind::World, None)).collect();
+        let stored = s.insert_memories("b", &recs).unwrap();
+        // Admit only the 5 items farthest from the query: the first KNN
+        // fetches (64, 256) cannot contain them.
+        let q = vvec(7);
+        let mut far: Vec<(f32, String)> = stored
+            .iter()
+            .zip(&recs)
+            .map(|(m, r)| (rustsight_core::cosine(&q, &r.embedding), m.id.clone()))
+            .collect();
+        far.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        let allowed: HashSet<String> = far.iter().take(5).map(|(_, id)| id.clone()).collect();
+        let admit = |id: &str| allowed.contains(id);
+        let got = s
+            .search_semantic("b", &[&q], &ALL, 5, Some(&admit))
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(ids(&got).into_iter().collect::<HashSet<_>>(), allowed);
+        assert_matches_scan(&s, "b");
+    }
+
+    #[cfg(feature = "sqlite-vec")]
+    #[test]
+    fn reindex_adopts_banks_written_without_the_index() {
+        let dir = std::env::temp_dir().join(format!("rustsight-rs7-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("db.sqlite");
+        let off = StoreOptions {
+            vector_index: false,
+        };
+        {
+            // An indexed store creates and marks the bank ...
+            let s = SqliteStore::open(&path).unwrap();
+            vbank(&s, "b");
+            s.insert_memories("b", &[vmem(1, MemoryKind::World, None)])
+                .unwrap();
+            assert!(s.bank_vector_indexed("b").unwrap());
+        }
+        {
+            // ... then a store without it writes and deletes unmirrored.
+            let s = SqliteStore::open_with_options(&path, Arc::new(SystemClock), &off).unwrap();
+            assert_eq!(s.vector_index_version(), None);
+            assert!(!s.bank_vector_indexed("b").unwrap());
+            let recs: Vec<_> = (2..20)
+                .map(|i| vmem(i, MemoryKind::World, Some("d")))
+                .collect();
+            s.insert_memories("b", &recs).unwrap();
+            s.insert_memories("b", &[vmem(30, MemoryKind::World, Some("gone"))])
+                .unwrap();
+            s.delete_document_memories("b", "gone").unwrap();
+            assert_matches_scan(&s, "b");
+            assert!(s.reindex_vectors(Some("b")).is_err());
+        }
+        let s = SqliteStore::open(&path).unwrap();
+        // The stale mirror is not trusted: brute force until reindex.
+        assert!(!s.bank_vector_indexed("b").unwrap());
+        assert_matches_scan(&s, "b");
+        let report = s.reindex_vectors(None).unwrap();
+        assert_eq!(
+            report,
+            vec![ReindexReport {
+                bank_id: "b".into(),
+                indexed: 19,
+                skipped: 0
+            }]
+        );
+        assert!(s.bank_vector_indexed("b").unwrap());
+        assert_matches_scan(&s, "b");
+        let vec0: i64 = s
+            .lock_conn()
+            .query_row("SELECT COUNT(*) FROM vec_f32_4", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vec0, 19, "orphaned rows cleared by the reindex");
+        drop(s);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(feature = "sqlite-vec")]
+    #[test]
+    fn vectors_too_wide_for_vec0_fall_back_to_the_scan() {
+        let s = store();
+        vbank(&s, "b");
+        let wide = vec![0.5; vector::MAX_DIM + 1];
+        let rec = NewMemoryRecord {
+            embedding: wide.clone(),
+            ..new_mem("wide", 1)
+        };
+        s.insert_memories("b", &[rec]).unwrap();
+        assert!(!s.bank_vector_indexed("b").unwrap());
+        let hits = s.search_semantic("b", &[&wide], &ALL, 5, None).unwrap();
+        assert_eq!(hits[0].len(), 1);
+        let report = s.reindex_vectors(Some("b")).unwrap();
+        assert_eq!(report[0].skipped, 1);
+        assert!(!s.bank_vector_indexed("b").unwrap());
+    }
+
+    #[cfg(feature = "sqlite-vec")]
+    #[test]
+    fn indexed_bank_answers_from_vec0_not_the_scan() {
+        let s = store();
+        vbank(&s, "b");
+        s.insert_memories("b", &[vmem(1, MemoryKind::World, None)])
+            .unwrap();
+        // A row only the index knows about proves the KNN path served it.
+        vector::put(
+            &s.lock_conn(),
+            "b",
+            MemoryKind::World,
+            "ghost",
+            Some(&vvec(2)),
+        )
+        .unwrap();
+        let hits = s
+            .search_semantic("b", &[&vvec(2)], &ALL, 5, None)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(hits[0].0, "ghost");
+        assert!((hits[0].2 - 1.0).abs() < 1e-5);
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn semantic_search_without_the_index_is_the_scan() {
+        let s = SqliteStore::open_in_memory_with_options(
+            Arc::new(SystemClock),
+            &StoreOptions {
+                vector_index: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(s.vector_index_version(), None);
+        vbank(&s, "b");
+        assert!(!s.bank_vector_indexed("b").unwrap());
+        let recs: Vec<_> = (0..12).map(|i| vmem(i, MemoryKind::World, None)).collect();
+        s.insert_memories("b", &recs).unwrap();
+        assert_matches_scan(&s, "b");
+        let rows: i64 = s
+            .lock_conn()
+            .query_row("SELECT COUNT(*) FROM vec_rows", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "nothing mirrored without the extension");
     }
 }

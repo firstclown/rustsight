@@ -3,11 +3,19 @@ name = "rustsight-storage"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "SQLite-backed storage for rustsight (FTS5 BM25, brute-force vectors, typed edge graph)"
+description = "SQLite-backed storage for rustsight (FTS5 BM25, sqlite-vec KNN or brute-force vectors, typed edge graph)"
+
+[features]
+default = ["sqlite-vec"]
+# vec0 KNN index for semantic search (RS-7). Without it (or when the
+# extension fails to initialize) every semantic query is a brute-force scan.
+sqlite-vec = ["dep:sqlite-vec"]
 
 [dependencies]
+sqlite-vec = { workspace = true, optional = true }
 rustsight-core = { workspace = true }
 rusqlite = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
@@ -17,3 +25,8 @@ tokio = { workspace = true, features = ["test-util"] }
 rustsight-providers = { workspace = true }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "semantic"
+harness = false

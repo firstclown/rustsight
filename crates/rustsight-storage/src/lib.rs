@@ -1,3 +1,4 @@
 mod sqlite;
+mod vector;
 
-pub use sqlite::SqliteStore;
+pub use sqlite::{ReindexReport, SqliteStore, StoreOptions};

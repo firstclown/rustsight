@@ -7,7 +7,7 @@ use crate::prompts::extraction::{
 };
 use crate::traits::{ChatMessage, LlmRequest};
 use crate::types::*;
-use crate::{cosine, temporal_weight, Error, Result};
+use crate::{temporal_weight, Error, Result, SemanticHit};
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
@@ -434,7 +434,20 @@ pub(super) async fn retain(e: &Engine, req: RetainRequest) -> Result<RetainRespo
 
     let new_ids: HashSet<String> = stored.iter().map(|m| m.id.clone()).collect();
     let recent = e.store.recent_memories(&bank.id, 60)?;
-    let existing_emb = e.store.all_embeddings(&bank.id)?;
+    // Nearest pre-existing neighbours per new fact, through the store's
+    // semantic search (KNN when the bank is vector-indexed, RS-7; one
+    // brute-force scan for the whole batch otherwise).
+    let semantic_candidates = {
+        let queries: Vec<&[f32]> = embeddings.iter().map(Vec::as_slice).collect();
+        let not_new = |id: &str| !new_ids.contains(id);
+        e.store.search_semantic(
+            &bank.id,
+            &queries,
+            &ALL_KINDS,
+            e.config.semantic_edge_cap,
+            Some(&not_new),
+        )?
+    };
     // One batched facts fetch for every entity the new facts mention
     // (CR-14): the entity-edge builder used to call `facts_for_entity`
     // once per (memory x entity) pair.
@@ -463,9 +476,7 @@ pub(super) async fn retain(e: &Engine, req: RetainRequest) -> Result<RetainRespo
         &e.config,
         &bank.id,
         &stored,
-        &embeddings,
-        &existing_emb,
-        &new_ids,
+        &semantic_candidates,
     ));
     edges.extend(build_causal_edges(&bank.id, &stored, &facts));
 
@@ -611,45 +622,39 @@ fn build_temporal_edges(
     edges
 }
 
+/// Every memory kind — semantic edges may land on any embedded item.
+const ALL_KINDS: [MemoryKind; 4] = [
+    MemoryKind::World,
+    MemoryKind::Experience,
+    MemoryKind::Observation,
+    MemoryKind::Opinion,
+];
+
 /// Semantic edges: connect each new fact to its most similar existing
 /// memories (cosine >= `semantic_edge_threshold`), keeping the top
-/// `semantic_edge_cap` per fact. `existing` is the bank's pre-existing
-/// embeddings; anything in `new_ids` is filtered out as a self-match.
+/// `semantic_edge_cap` per fact. `candidates[i]` is stored fact `i`'s
+/// nearest pre-existing items, best first, with this batch's new ids
+/// already excluded (no self-matches).
 fn build_semantic_edges(
     cfg: &EngineConfig,
     bank_id: &str,
     stored: &[Memory],
-    embeddings: &[Vec<f32>],
-    existing: &[(MemoryId, MemoryKind, Vec<f32>)],
-    new_ids: &HashSet<String>,
+    candidates: &[Vec<SemanticHit>],
 ) -> Vec<Edge> {
     let mut edges = vec![];
-    for (i, a) in stored.iter().enumerate() {
-        let mut best: Vec<(f32, String)> = existing
+    for (a, hits) in stored.iter().zip(candidates) {
+        for (id, _, w) in hits
             .iter()
-            .filter_map(|(id, _, v)| {
-                if new_ids.contains(id) {
-                    None
-                } else {
-                    let c = cosine(&embeddings[i], v);
-                    (c >= cfg.semantic_edge_threshold).then(|| (c, id.clone()))
-                }
-            })
-            .collect();
-        best.sort_by(|x, y| {
-            y.0.partial_cmp(&x.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| x.1.cmp(&y.1))
-        });
-        best.truncate(cfg.semantic_edge_cap);
-        for (w, id) in best {
+            .filter(|(_, _, c)| *c >= cfg.semantic_edge_threshold)
+            .take(cfg.semantic_edge_cap)
+        {
             edges.push(Edge {
                 bank_id: bank_id.to_string(),
                 a_id: a.id.clone(),
-                b_id: id,
+                b_id: id.clone(),
                 kind: EdgeKind::Semantic,
                 label: None,
-                weight: w,
+                weight: *w,
             });
         }
     }
@@ -980,7 +985,7 @@ mod tests {
             ..Default::default()
         };
         let stored = vec![mem("a", 0, None)];
-        let embeddings = vec![vec![1.0, 0.0]];
+        let embeddings = [vec![1.0, 0.0]];
         let existing = vec![
             ("x1".to_string(), MemoryKind::World, vec![1.0, 0.0]), // cos 1.0
             ("x2".to_string(), MemoryKind::World, vec![0.0, 1.0]), // cos 0.0
@@ -988,7 +993,17 @@ mod tests {
             ("a".to_string(), MemoryKind::World, vec![1.0, 0.0]),  // new id -> excluded
         ];
         let new_ids: HashSet<String> = stored.iter().map(|m| m.id.clone()).collect();
-        let edges = build_semantic_edges(&cfg, "b", &stored, &embeddings, &existing, &new_ids);
+        let not_new = |id: &str| !new_ids.contains(id);
+        let candidates = |cap| {
+            crate::brute_force_semantic(
+                &existing,
+                &[embeddings[0].as_slice()],
+                &ALL_KINDS,
+                cap,
+                Some(&not_new),
+            )
+        };
+        let edges = build_semantic_edges(&cfg, "b", &stored, &candidates(2));
         assert_eq!(edges.len(), 2, "{edges:?}");
         // similarity-descending order, x2 below threshold, self excluded
         assert_eq!(edges[0].b_id, "x1");
@@ -1003,7 +1018,7 @@ mod tests {
             semantic_edge_cap: 1,
             ..Default::default()
         };
-        let edges = build_semantic_edges(&cfg, "b", &stored, &embeddings, &existing, &new_ids);
+        let edges = build_semantic_edges(&cfg, "b", &stored, &candidates(1));
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].b_id, "x1");
     }

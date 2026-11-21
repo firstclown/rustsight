@@ -22,7 +22,7 @@ pub use entity::{
 pub use error::{Error, Result};
 pub use fusion::{apply_token_budget, bm25_terms, cosine, rrf_fuse};
 pub use links::temporal_weight;
-pub use store::MemoryStore;
+pub use store::{brute_force_semantic, sort_hits, Admit, MemoryStore, SemanticHit};
 pub use temporal::parse_window;
 pub use traits::*;
 pub use types::*;

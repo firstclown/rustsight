@@ -42,9 +42,10 @@ Four memory networks, three operations:
 Background consolidation turns facts into evidence-backed observations;
 mental models are standing answers refreshed from the bank.
 
-Storage: a single SQLite file (WAL, FTS5 for BM25, BLOB embeddings scanned by
-exact cosine - appropriate at desktop scale). Swap-in points for ANN indexes
-and Postgres exist via the `MemoryStore` trait.
+Storage: a single SQLite file (WAL, FTS5 for BM25, BLOB embeddings mirrored
+into a sqlite-vec KNN index - see "Vector index and scale" below). Swap-in
+points for other vector backends and Postgres exist via the `MemoryStore`
+trait (`search_semantic`).
 
 ## Crates
 - rustsight-core      types, provider traits, prompts, pipelines
@@ -88,6 +89,8 @@ and Postgres exist via the `MemoryStore` trait.
                               file whose hash differs is refused
     RUSTSIGHT_RERANK_DEVICE   auto | cpu | cuda (default auto)
     RUSTSIGHT_DB              default ~/.rustsight/rustsight.db
+    RUSTSIGHT_VECTOR_INDEX    on | off (default on); off keeps semantic search
+                              on the brute-force scan (see "Vector index")
     RUSTSIGHT_ASYNC_RETAIN_CONCURRENCY  async retains run at once through the
                               Hindsight API (default 2, range 1-64)
     RUSTSIGHT_API_TOKEN       optional; bearer token required by every HTTP
@@ -286,6 +289,59 @@ tick. Library embedders get the same behavior via
 `Engine::spawn_worker(interval, max_entities)` (returns a tokio JoinHandle;
 abort it to stop).
 
+## Vector index and scale
+The semantic recall arm, and retain's semantic-edge neighbour search, go
+through `MemoryStore::search_semantic`. `SqliteStore` answers it from a
+[sqlite-vec](https://github.com/asg017/sqlite-vec) `vec0` index (0.1.9,
+compiled into the binary, no loadable extension to install; storage cargo
+feature `sqlite-vec`, on by default):
+
+- one `vec_f32_<dim>` virtual table per embedding width, partitioned by
+  bank, memory kind as a filter column. Memories, observations, and
+  opinions are mirrored write-through, in the same transaction as the row.
+- tag scopes still filter before the top-k cut: the KNN fetch widens (x4,
+  up to vec0's k limit of 4096) until enough admitted rows come back, then
+  falls back to the scan.
+- a bank uses the index only when it is marked indexed: banks created by an
+  index-maintaining store are marked from the start. Banks in a database
+  written before RS-7, or written by a build or run without the index
+  (`RUSTSIGHT_VECTOR_INDEX=off`, `--no-default-features`, extension failed
+  to load), stay on the scan (a one-time stderr note says so) until you run
+
+      rustsight reindex --bank <id>     # or omit --bank for every bank
+
+  `reindex` needs no API key. It rebuilds that bank's index from the stored
+  embeddings in one transaction.
+- if the extension cannot initialize, the store logs it and runs every
+  semantic query as a brute-force scan; nothing else changes.
+- vectors wider than 8192 dimensions cannot go in vec0; a bank holding one
+  stays on the scan.
+
+sqlite-vec 0.1.x is an **exact** KNN (a flat scan in C), not an approximate
+one: results match the scan (recall@10 = 1.000 in the bench), only faster
+and without loading every embedding into memory per query. Measured with
+`cargo bench -p rustsight-storage --bench semantic` (16-core laptop CPU,
+in-memory DB, k = 300, world + experience kinds):
+
+                              brute force    sqlite-vec
+    10k vectors  x 384-d      15.9 ms        8.2 ms
+    100k vectors x 384-d      131.9 ms       75.7 ms
+    10k vectors  x 1536-d     47.9 ms        23.6 ms
+    50k vectors  x 1536-d     247.3 ms       115.6 ms
+    retain batch, 20 queries,
+    50k x 1536-d              1.85 s         2.03 s
+
+Single queries (the recall arm) are about 2x faster. A retain batch is about
+break-even: the scan decodes the bank once and reuses it for every new
+fact, while the index runs one KNN per fact but never holds the bank's
+embeddings in memory (~300 MB at 50k x 1536-d). Rough guidance: up to
+~50k memories per bank, either path is fine; at 100k+ x 1536-d, expect
+~0.2 s per semantic arm with the index. Going well past that needs a true
+ANN index (HNSW, or a newer sqlite-vec with ANN support) behind the same
+`search_semantic` seam. Only same-width vectors are compared under the
+index; the scan's cosine truncates mismatched widths, so a bank that mixes
+embedding models should be re-embedded either way.
+
 ## Chunking, retries, and limits
 Retain splits long content into token-sized chunks (default ~3000 tokens with a
 200-token overlap, measured with the configured token estimator; tunable via
@@ -349,7 +405,7 @@ loop's own tool set) — are recorded in
     parse error, lines over 10 MiB a -32600 and are discarded
 
 ## Roadmap
-- sqlite-vec / HNSW ANN backend
+- true ANN (HNSW) vector backend beyond ~100k memories per bank
 - knowledge-page fs mount
 - full TEMR recall parity (per-fact_type arms; see RS-15 in NEXT_STEPS.md)
 - golden-pin the hand-ported final-synthesis builders via scripts/prompt-goldens

@@ -2,6 +2,53 @@ use crate::types::*;
 use crate::Result;
 use std::collections::HashMap;
 
+/// One semantic hit: item id, its kind, and cosine similarity to the query.
+pub type SemanticHit = (MemoryId, MemoryKind, f32);
+
+/// Optional id predicate applied *inside* the semantic search, before its
+/// top-k cut (tag scopes, "not one of this batch's new facts").
+pub type Admit<'a> = Option<&'a (dyn Fn(&str) -> bool + 'a)>;
+
+/// Exhaustive top-k cosine search over a bank's embeddings, one result list
+/// per query: kinds and `admit` filter first, then best-first by
+/// similarity, ties broken by id. The reference semantics every
+/// [`MemoryStore::search_semantic`] implementation must match.
+pub fn brute_force_semantic(
+    all: &[(MemoryId, MemoryKind, Vec<f32>)],
+    queries: &[&[f32]],
+    kinds: &[MemoryKind],
+    k: usize,
+    admit: Admit<'_>,
+) -> Vec<Vec<SemanticHit>> {
+    let pool: Vec<&(MemoryId, MemoryKind, Vec<f32>)> = all
+        .iter()
+        .filter(|(id, kind, v)| {
+            !v.is_empty() && kinds.contains(kind) && admit.is_none_or(|f| f(id))
+        })
+        .collect();
+    queries
+        .iter()
+        .map(|q| {
+            let mut scored: Vec<SemanticHit> = pool
+                .iter()
+                .map(|(id, kind, v)| (id.clone(), *kind, crate::cosine(q, v)))
+                .collect();
+            sort_hits(&mut scored);
+            scored.truncate(k);
+            scored
+        })
+        .collect()
+}
+
+/// Best-first by similarity, ties by id — the canonical semantic order.
+pub fn sort_hits(hits: &mut [SemanticHit]) {
+    hits.sort_by(|a, b| {
+        b.2.partial_cmp(&a.2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+}
+
 pub trait MemoryStore: Send + Sync {
     fn ensure_bank(&self, bank: &Bank) -> Result<()>;
     fn get_bank(&self, bank_id: &str) -> Result<Option<Bank>>;
@@ -13,6 +60,22 @@ pub trait MemoryStore: Send + Sync {
     fn recent_memories(&self, bank_id: &str, limit: usize) -> Result<Vec<Memory>>;
     fn list_memories(&self, bank_id: &str, limit: usize) -> Result<Vec<Memory>>;
     fn all_embeddings(&self, bank_id: &str) -> Result<Vec<(MemoryId, MemoryKind, Vec<f32>)>>;
+    /// Top-`k` items of `kinds` by cosine similarity, one list per query
+    /// (best first, ties by id), with `admit` applied before the cut.
+    /// The default scans [`MemoryStore::all_embeddings`] once for the whole
+    /// batch; an indexed backend (sqlite-vec, RS-7) answers with KNN
+    /// queries instead and must return the same hits.
+    fn search_semantic(
+        &self,
+        bank_id: &str,
+        queries: &[&[f32]],
+        kinds: &[MemoryKind],
+        k: usize,
+        admit: Admit<'_>,
+    ) -> Result<Vec<Vec<SemanticHit>>> {
+        let all = self.all_embeddings(bank_id)?;
+        Ok(brute_force_semantic(&all, queries, kinds, k, admit))
+    }
     fn search_bm25(
         &self,
         bank_id: &str,

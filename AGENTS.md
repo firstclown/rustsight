@@ -96,10 +96,10 @@ Five crates; dependency flow: `core` ← `storage`/`providers` ← `server` ←
 | Crate | Path | Role |
 |---|---|---|
 | rustsight-core | `crates/rustsight-core` | Types, `MemoryStore` trait, provider traits, prompts, engine pipelines (retain/recall/reflect/consolidate/mental) |
-| rustsight-storage | `crates/rustsight-storage` | `SqliteStore`: single SQLite file, WAL, FTS5 BM25, brute-force cosine over BLOB embeddings, typed edge graph |
+| rustsight-storage | `crates/rustsight-storage` | `SqliteStore`: single SQLite file, WAL, FTS5 BM25, sqlite-vec KNN index over BLOB embeddings (`vector.rs`, brute-force fallback), typed edge graph |
 | rustsight-providers | `crates/rustsight-providers` | `OpenAiCompat` LLM/embeddings over HTTP, `ApiRerank` (Jina/Cohere-style `/rerank`), `NoopRerank`, and all mocks (`MockLlm`, `MockEmbed`, `MockRerank`, `SimpleTokenEstimator`) |
 | rustsight-server | `crates/rustsight-server` | axum HTTP router (`http.rs`) + stdio JSON-RPC MCP server (`mcp.rs`); both spawn the consolidation worker |
-| rustsight-cli | `crates/rustsight-cli` | Binary `rustsight`: serve/mcp/retain/recall/reflect/consolidate/inspect/banks/bank-set/mental-model |
+| rustsight-cli | `crates/rustsight-cli` | Binary `rustsight`: serve/mcp/retain/recall/reflect/consolidate/inspect/banks/bank-set/mental-model/reindex |
 
 Key source map:
 
@@ -215,6 +215,14 @@ Key source map:
   delete would deadlock it; pass the guard (`Engine::retain_guarded`).
 - **`enable_observations: false` gates consolidation, not retain.** Dirty
   entities keep queueing so re-enabling catches up.
+- **Embeddings are mirrored write-through into the vec0 index** (RS-7,
+  `crates/rustsight-storage/src/vector.rs`): any store method that writes,
+  updates, or deletes a memory/observation/opinion embedding must call
+  `vec_put`/`vec_remove` in the same transaction. A bank answers from the
+  index only while `vec_indexed_banks` lists it; a store opened without the
+  index clears every marker, and `reindex_vectors` rebuilds. Every
+  `search_semantic` implementation must return what `brute_force_semantic`
+  returns (`assert_matches_scan` in the storage tests).
 - Schema changes are additive column migrations in `SqliteStore::migrate`
   (`CREATE TABLE IF NOT EXISTS` never alters an existing table) — add new
   columns there, with a test that opens an old-schema file.
@@ -262,6 +270,9 @@ Env vars, read in `crates/rustsight-providers/src/env.rs`:
   `NoopRerank` (raw RRF ordering — accuracy caveat, RS-4 tracks a local ONNX
   reranker)
 - `RUSTSIGHT_DB` (default `~/.rustsight/rustsight.db`)
+- `RUSTSIGHT_VECTOR_INDEX` (default on; `off` keeps semantic search on the
+  brute-force scan and invalidates the index markers — run
+  `rustsight reindex` after turning it back on)
 - `RUSTSIGHT_CONSOLIDATE_INTERVAL_MS` (default 5000; worker cadence, invalid
   values fall back to default with a warning)
 - `RUSTSIGHT_ASYNC_RETAIN_CONCURRENCY` (default 2, clamped 1–64; async

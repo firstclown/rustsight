@@ -6,7 +6,7 @@ use rustsight_providers::{
     OperationLlms, ProviderEnv, SimpleTokenEstimator,
 };
 use rustsight_server::{auth::ApiAuth, http, mcp};
-use rustsight_storage::SqliteStore;
+use rustsight_storage::{SqliteStore, StoreOptions};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -100,6 +100,13 @@ enum Cmd {
         #[arg(long)]
         empathy: Option<u8>,
     },
+    /// Rebuild the sqlite-vec KNN index from stored embeddings (RS-7): the
+    /// migration path for banks written before the index existed or by a
+    /// build without it. Omit --bank to reindex every bank.
+    Reindex {
+        #[arg(long)]
+        bank: Option<String>,
+    },
     MentalModel {
         #[arg(long)]
         bank: String,
@@ -122,12 +129,33 @@ fn default_db() -> PathBuf {
     }
 }
 
-async fn build_engine(db: &PathBuf, mock: bool) -> Arc<Engine> {
-    let clock = Arc::new(SystemClock);
-    let store = SqliteStore::open_with_clock(db, clock.clone()).unwrap_or_else(|e| {
+/// `RUSTSIGHT_VECTOR_INDEX` (default on): `off`/`false`/`0`/`no` keeps
+/// semantic search on the brute-force scan.
+fn store_options() -> StoreOptions {
+    let vector_index = match std::env::var("RUSTSIGHT_VECTOR_INDEX") {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "" | "on" | "true" | "1" | "yes" => true,
+            "off" | "false" | "0" | "no" => false,
+            other => {
+                eprintln!("rustsight: invalid RUSTSIGHT_VECTOR_INDEX={other:?}, using default on");
+                true
+            }
+        },
+        Err(_) => true,
+    };
+    StoreOptions { vector_index }
+}
+
+fn open_store(db: &PathBuf, clock: Arc<SystemClock>) -> SqliteStore {
+    SqliteStore::open_with_options(db, clock, &store_options()).unwrap_or_else(|e| {
         eprintln!("failed to open database {}: {e}", db.display());
         std::process::exit(1);
-    });
+    })
+}
+
+async fn build_engine(db: &PathBuf, mock: bool) -> Arc<Engine> {
+    let clock = Arc::new(SystemClock);
+    let store = open_store(db, clock.clone());
     let mut operation_llms = OperationLlms {
         retain: None,
         reflect: None,
@@ -204,6 +232,26 @@ fn print_json<T: serde::Serialize>(value: &T) {
 async fn main() {
     let cli = Cli::parse();
     let db = cli.db.clone().unwrap_or_else(default_db);
+    // Store maintenance needs no providers (and no API key).
+    if let Cmd::Reindex { bank } = &cli.cmd {
+        let store = open_store(&db, Arc::new(SystemClock));
+        match store.reindex_vectors(bank.as_deref()) {
+            Ok(reports) => {
+                for r in reports.iter().filter(|r| r.skipped > 0) {
+                    eprintln!(
+                        "rustsight: bank {} has {} embedding(s) wider than vec0 supports; it stays on brute force",
+                        r.bank_id, r.skipped
+                    );
+                }
+                print_json(&reports);
+                return;
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     let engine = build_engine(&db, cli.mock).await;
     let result: Result<(), rustsight_core::Error> = match cli.cmd {
         Cmd::Serve {
@@ -276,6 +324,7 @@ async fn main() {
             Ok(())
         })(),
         Cmd::Banks => engine.store.list_banks().map(|banks| print_json(&banks)),
+        Cmd::Reindex { .. } => unreachable!("handled before the engine is built"),
         Cmd::BankSet {
             bank,
             mission,
