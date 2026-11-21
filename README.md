@@ -98,7 +98,7 @@ LongMemEval run has been published yet.
 Build from source with a recent stable Rust toolchain:
 
 ```bash
-git clone https://github.com/<owner>/rustsight.git
+git clone https://github.com/firstclown/rustsight.git
 cd rustsight
 cargo build --release          # binary at target/release/rustsight
 ```
@@ -222,9 +222,9 @@ git dependency:
 
 ```toml
 [dependencies]
-rustsight-core      = { git = "https://github.com/<owner>/rustsight" }
-rustsight-storage   = { git = "https://github.com/<owner>/rustsight" }
-rustsight-providers = { git = "https://github.com/<owner>/rustsight" }
+rustsight-core      = { git = "https://github.com/firstclown/rustsight" }
+rustsight-storage   = { git = "https://github.com/firstclown/rustsight" }
+rustsight-providers = { git = "https://github.com/firstclown/rustsight" }
 tokio = { version = "1", features = ["full"] }
 ```
 
