@@ -147,8 +147,12 @@ pub(super) async fn recall(e: &Engine, req: RecallRequest) -> Result<RecallRespo
     let docs: Vec<String> = refs.iter().map(|r| r.text.clone()).collect();
     let rerank = Arc::clone(&e.rerank);
     let query = req.query.clone();
-    let top_k = if e.config.reranker_max_candidates > 0 {
-        refs.len().min(e.config.reranker_max_candidates)
+    let cap = e
+        .resolved_config(&req.bank_id)?
+        .usize("reranker_max_candidates")
+        .unwrap_or(e.config.reranker_max_candidates);
+    let top_k = if cap > 0 {
+        refs.len().min(cap)
     } else {
         refs.len()
     };

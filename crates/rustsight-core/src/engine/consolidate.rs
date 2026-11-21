@@ -287,9 +287,26 @@ fn consolidate_entity<'a>(
                 }
             }
         };
+        // Knobs resolve global → tenant → bank (RS-10f).
+        let resolved = match e.resolved_config(bank_id) {
+            Ok(r) => r,
+            Err(error) => {
+                return EntityStep::Failed {
+                    entity_id: eid.to_string(),
+                    error,
+                }
+            }
+        };
+        let language = resolved.str("output_language");
+        let dupe_cosine = resolved
+            .f32("consolidate_dupe_cosine")
+            .unwrap_or(e.config.consolidate_dupe_cosine);
         let now = e.clock.now_ms();
         let llm = e.llm_for_consolidate();
-        let max_facts = e.config.consolidate_max_facts_per_entity.max(1);
+        let max_facts = resolved
+            .usize("consolidate_max_facts_per_entity")
+            .unwrap_or(e.config.consolidate_max_facts_per_entity)
+            .max(1);
         let mut counts = PlanCounts::default();
         // (observation id, text) pairs needing (re-)embedding, across all
         // of this entity's windows — one batched embed at the end.
@@ -303,7 +320,7 @@ fn consolidate_entity<'a>(
                 window,
                 &existing,
                 mission.as_deref(),
-                e.config.output_language.as_deref(),
+                language,
             );
             let request = LlmRequest {
                 system: Some(system),
@@ -330,7 +347,7 @@ fn consolidate_entity<'a>(
                     }
                 }
             };
-            match apply_consolidation_plan(e, bank_id, eid, window, plan, now).await {
+            match apply_consolidation_plan(e, bank_id, eid, window, plan, now, dupe_cosine).await {
                 Ok((window_counts, pending)) => {
                     counts.add(window_counts);
                     obs_pending.extend(pending);
@@ -458,6 +475,7 @@ async fn apply_consolidation_plan(
     facts: &[Memory],
     plan: ConsolidationPlan,
     now: i64,
+    dupe_cosine: f32,
 ) -> Result<(PlanCounts, Vec<(String, String)>)> {
     // id -> observation, for update/delete/merge target lookup.
     let mut by_id: HashMap<String, Observation> = e
@@ -543,7 +561,7 @@ async fn apply_consolidation_plan(
     let mut create_embs_iter: Vec<Option<Vec<f32>>> = vec![None; plan.creates.len()];
     if !create_texts.is_empty() {
         let embed = Arc::clone(&e.embed);
-        let threshold = e.config.consolidate_dupe_cosine;
+        let threshold = dupe_cosine;
         let wants_embeddings = plan
             .creates
             .iter()
@@ -575,7 +593,7 @@ async fn apply_consolidation_plan(
                     }
                 }
                 if let Some((score, id)) = best {
-                    if score >= e.config.consolidate_dupe_cosine {
+                    if score >= dupe_cosine {
                         dupe_id = Some(id.clone());
                     }
                 }

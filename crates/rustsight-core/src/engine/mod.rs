@@ -184,6 +184,7 @@ pub struct Engine {
     /// Applied to every bank this engine creates (RS-10d,
     /// `RUSTSIGHT_DEFAULT_BANK_TEMPLATE`).
     pub(crate) default_template: Option<Arc<crate::templates::Manifest>>,
+    pub(crate) default_tenant: Option<String>,
 }
 
 impl Engine {
@@ -212,7 +213,15 @@ impl Engine {
             events: std::sync::OnceLock::new(),
             parsers: Arc::new(crate::files::ParserRegistry::builtin()),
             default_template: None,
+            default_tenant: None,
         }
+    }
+
+    /// The tenant banks without their own `tenant` setting resolve
+    /// through (`RUSTSIGHT_DEFAULT_TENANT`, RS-10f).
+    pub fn with_default_tenant(mut self, tenant: Option<String>) -> Self {
+        self.default_tenant = tenant.filter(|t| !t.trim().is_empty());
+        self
     }
 
     /// Apply `template` to every bank created from now on (see
@@ -308,20 +317,19 @@ impl Engine {
     /// its `mission` for reflect only (`mission_scope: "reflect"`), so the
     /// pipeline gets its own mission or none; a natively configured bank
     /// keeps sharing `mission` across pipelines.
+    /// The pipeline's own mission may come from the bank or its tenant.
     pub(crate) fn scoped_mission(&self, bank: &Bank, key: &str) -> Option<String> {
+        if let Some(own) = self
+            .resolved_config(&bank.id)
+            .ok()
+            .and_then(|r| r.str(key).map(str::to_string))
+        {
+            return Some(own);
+        }
         let config = self
             .store
             .bank_config(&bank.id)
             .unwrap_or(serde_json::Value::Null);
-        let own = config
-            .get(key)
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-        if own.is_some() {
-            return own;
-        }
         if config.get("mission_scope").and_then(|v| v.as_str()) == Some("reflect") {
             return None;
         }
@@ -347,10 +355,8 @@ impl Engine {
     /// either way, so re-enabling picks up everything retained meanwhile.
     pub fn observations_enabled(&self, bank_id: &str) -> Result<bool> {
         Ok(self
-            .store
-            .bank_config(bank_id)?
-            .get("enable_observations")
-            .and_then(|v| v.as_bool())
+            .resolved_config(bank_id)?
+            .bool("enable_observations")
             .unwrap_or(true))
     }
 

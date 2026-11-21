@@ -36,11 +36,16 @@ pub(super) async fn reflect(
     if query.trim().is_empty() {
         return Err(Error::BadInput("query is empty".into()));
     }
+    // Knobs resolve global → tenant → bank (RS-10f).
+    let resolved = e.resolved_config(bank_id)?;
     let max_rounds = opts
         .max_rounds
+        .or(resolved.usize("reflect_max_rounds"))
         .unwrap_or(e.config.reflect_max_rounds)
         .max(1);
-    let answer_max_tokens = opts.max_tokens.or(e.config.reflect_answer_max_tokens);
+    let answer_max_tokens = opts
+        .max_tokens
+        .or(resolved.usize("reflect_answer_max_tokens"));
     // `fact_types` restriction: a tool whose kinds are all excluded still
     // answers, with an empty result, so the loop's contract is unchanged.
     let allowed = |kinds: &[MemoryKind]| -> Vec<MemoryKind> {
@@ -59,7 +64,7 @@ pub(super) async fn reflect(
         disposition: Disposition::default(),
     });
     let directives = e.reflect_directives(&bank, opts.tags.as_ref())?;
-    let language = e.config.output_language.as_deref();
+    let language = resolved.str("output_language");
     let system = build_reflect_system(&bank, &directives, language);
     // A configured language goes on the user turn, as upstream's
     // `build_agent_user_prompt` places it (the freshest position).
@@ -429,6 +434,7 @@ pub(super) async fn reflect(
                 query,
                 &context_history,
                 answer_max_tokens,
+                language,
             )
             .await;
             let ms = synthesis_started.elapsed().as_millis() as u64;
@@ -693,7 +699,9 @@ async fn run_recall_tool(
     // Pool width comes from the recall budget config (upstream
     // `_resolve_thinking_budget`: Budget None → MID; fixed function
     // default = 300 per arm).
-    let top_k = e.config.recall_budget.resolve(None, budget.min(6000));
+    let top_k = e
+        .recall_budget_for(&e.resolved_config(bank_id)?)
+        .resolve(None, budget.min(6000));
     let r = if kinds.is_empty() {
         // Every kind this tool serves was excluded by `fact_types`.
         RecallResponse {
@@ -787,6 +795,7 @@ async fn synthesize_answer(
     query: &str,
     history: &[ContextHistoryEntry],
     answer_max_tokens: Option<usize>,
+    language: Option<&str>,
 ) -> Result<String> {
     let tokens = Arc::clone(&e.tokens);
     let count = move |s: &str| tokens.count(s);
@@ -800,7 +809,6 @@ async fn synthesize_answer(
         }),
     };
     let now_str = iso_datetime_utc(e.clock.now_ms());
-    let language = e.config.output_language.as_deref();
     let system = build_final_system_prompt(
         bank.mission.as_deref().filter(|m| !m.trim().is_empty()),
         language,

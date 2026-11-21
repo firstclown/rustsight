@@ -1,4 +1,5 @@
 pub mod bank_config;
+pub mod config_resolver;
 pub mod defense;
 mod engine;
 mod entity;

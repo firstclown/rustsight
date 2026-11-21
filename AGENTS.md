@@ -80,7 +80,7 @@ Every change is complete only when **all** of the following pass locally:
      `crates/rustsight-core/src/fusion.rs`, `temporal.rs`, `prompts/*.rs`).
    - Engine-level/integration tests go in
      `crates/rustsight-storage/tests/engine_flow.rs` (in-memory SQLite +
-     scripted mocks; 71 tests there today).
+     scripted mocks; 72 tests there today).
 4. Docs touched where relevant: `docs/reference.md` (and the README overview) for user-facing behavior/env
    vars, `NEXT_STEPS.md` checkboxes if a ticket's scope changed.
 5. No secrets/API keys committed; `.gitignore` already covers `*.db*`.
@@ -147,6 +147,11 @@ Key source map:
   settings (`CONFIG_KEYS`, validation, `Engine::update_bank_config`) and
   `Engine::provision_bank`; `templates.rs` — bank template manifests
   (parse/import/export) and `Engine::reflect_directives` (RS-10d).
+- `crates/rustsight-core/src/config_resolver.rs` — layered config (RS-10f):
+  the `KEYS` registry, `validate`, the pure `resolve` merge (global →
+  tenant → bank, with provenance), `Engine::resolved_config` /
+  `recall_budget_for` / tenant CRUD. Native routes `/tenants/...` and
+  `GET /banks/{id}/config` live in `http.rs`.
 - `crates/rustsight-core/src/lang.rs` — script detection, CJK bigram
   segmentation (FTS writes go through `cjk_segment`; `bm25_terms` uses
   `search_terms`), and the Chinese relative-period parser (RS-10e).
@@ -240,6 +245,12 @@ Key source map:
 - **Banks are created through `Engine::provision_bank`** (RS-10d): it is
   what applies the default bank template, exactly once, before any caller
   settings. Don't create banks with `store.ensure_bank` in new code paths.
+- **Pipelines read layered knobs through `Engine::resolved_config`**
+  (RS-10f): chunk size/overlap, reflect rounds/answer length, recall
+  budget levels, rerank cap, consolidation window/dupe threshold, output
+  language, missions, observations toggle, labels and Memory Defense. A new
+  tenant/bank-tunable knob goes in `config_resolver::KEYS` +
+  `global_layer`, never as a direct `e.config.*` read in a pipeline.
 - **`enable_observations: false` gates consolidation, not retain.** Dirty
   entities keep queueing so re-enabling catches up.
 - **Embeddings are mirrored write-through into the vec0 index** (RS-7,
@@ -307,6 +318,9 @@ Env vars, read in `crates/rustsight-providers/src/env.rs`:
   to default with a warning)
 - `RUSTSIGHT_LLM_OUTPUT_LANGUAGE` (or `HINDSIGHT_API_*`; RS-10e, sets
   `EngineConfig::output_language`; unset keeps source languages).
+- `RUSTSIGHT_DEFAULT_TENANT` (RS-10f; read by
+  `rustsight_server::default_tenant_from_env`, installed with
+  `Engine::with_default_tenant`).
 - `RUSTSIGHT_DEFAULT_BANK_TEMPLATE` (inline JSON or a file path; RS-10d,
   read by `rustsight_server::default_bank_template_from_env`, installed with
   `Engine::with_default_template`).

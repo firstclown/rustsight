@@ -102,6 +102,12 @@ enum Cmd {
         #[command(subcommand)]
         action: TemplateCmd,
     },
+    /// Layered configuration (global → tenant → bank): tenant overrides,
+    /// bank membership, and a bank's resolved values with their source.
+    Tenant {
+        #[command(subcommand)]
+        action: TenantCmd,
+    },
     BankSet {
         #[arg(long)]
         bank: String,
@@ -136,6 +142,43 @@ enum Cmd {
         #[arg(long)]
         path: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum TenantCmd {
+    /// List tenant ids.
+    List,
+    /// Print a tenant's overrides.
+    Get { tenant: String },
+    /// Set tenant overrides: KEY=VALUE pairs, VALUE parsed as JSON when it
+    /// parses (512, true, {"rules":[]}) and as a string otherwise;
+    /// KEY=null clears a key.
+    Set {
+        tenant: String,
+        #[arg(required = true)]
+        pairs: Vec<String>,
+    },
+    /// Put a bank in a tenant (`--tenant ''` leaves it).
+    Join {
+        #[arg(long)]
+        bank: String,
+        #[arg(long)]
+        tenant: String,
+    },
+    /// Print a bank's resolved configuration and where each value came from.
+    Resolve {
+        #[arg(long)]
+        bank: String,
+    },
+}
+
+/// `key=value` → (key, JSON value; non-JSON text becomes a string).
+fn parse_pair(pair: &str) -> rustsight_core::Result<(String, serde_json::Value)> {
+    let (key, raw) = pair.split_once('=').ok_or_else(|| {
+        rustsight_core::Error::BadInput(format!("expected KEY=VALUE, got {pair:?}"))
+    })?;
+    let value = serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.into()));
+    Ok((key.trim().to_string(), value))
 }
 
 #[derive(Subcommand)]
@@ -240,6 +283,7 @@ async fn build_engine(db: &PathBuf, mock: bool) -> Arc<Engine> {
     engine.consolidate_llm = operation_llms.consolidate;
     engine.config.retain_max_completion_tokens = Some(retain_max_completion_tokens());
     engine.config.output_language = rustsight_server::llm_output_language_from_env();
+    engine = engine.with_default_tenant(rustsight_server::default_tenant_from_env());
     match rustsight_server::default_bank_template_from_env() {
         Ok(Some(template)) => engine = engine.with_default_template(template),
         Ok(None) => {}
@@ -406,6 +450,32 @@ async fn main() {
                 .and_then(|manifest| engine.import_template(&bank, &manifest, dry_run))
                 .map(|report| print_json(&report)),
         },
+        Cmd::Tenant { action } => (|| -> rustsight_core::Result<()> {
+            match action {
+                TenantCmd::List => print_json(&engine.list_tenants()?),
+                TenantCmd::Get { tenant } => print_json(&engine.tenant_config(&tenant)?),
+                TenantCmd::Set { tenant, pairs } => {
+                    let updates = pairs
+                        .iter()
+                        .map(|p| parse_pair(p))
+                        .collect::<rustsight_core::Result<serde_json::Map<_, _>>>()?;
+                    print_json(&engine.update_tenant_config(&tenant, &updates)?);
+                }
+                TenantCmd::Join { bank, tenant } => {
+                    let value = if tenant.trim().is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::Value::String(tenant)
+                    };
+                    let mut updates = serde_json::Map::new();
+                    updates.insert("tenant".into(), value);
+                    engine.update_bank_config(&bank, &updates)?;
+                    print_json(&engine.resolved_config(&bank)?);
+                }
+                TenantCmd::Resolve { bank } => print_json(&engine.resolved_config(&bank)?),
+            }
+            Ok(())
+        })(),
         Cmd::Reindex { .. } => unreachable!("handled before the engine is built"),
         Cmd::BankSet {
             bank,

@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use rustsight_core::config_resolver::Layer;
 use rustsight_core::Engine;
 use rustsight_core::*;
 use rustsight_providers::{
@@ -2387,7 +2388,7 @@ impl LlmProvider for CapturingLlm {
             .lock()
             .unwrap()
             .pop_front()
-            .unwrap_or(synthesis_resp("{}")))
+            .unwrap_or(synthesis_resp(r#"{"facts": []}"#)))
     }
 }
 
@@ -3868,4 +3869,58 @@ async fn output_language_reaches_extraction_and_reflect() {
     let first = llm.prompts.lock().unwrap()[0].clone();
     assert!(first.contains("Respond exclusively in French"), "{first}");
     assert!(!first.contains("## LANGUAGE RULE"));
+}
+
+// ── RS-10f: hierarchical config ──────────────────────────────────────────
+
+#[tokio::test]
+async fn tenant_chunk_size_applies_to_its_banks_and_a_bank_override_wins() {
+    let llm = Arc::new(PromptCapture::new(vec![]));
+    let e = Engine::new(
+        Arc::new(SqliteStore::open_in_memory().unwrap()),
+        llm.clone(),
+        Arc::new(MockEmbed::default()),
+        Arc::new(MockRerank),
+        Arc::new(SimpleTokenEstimator),
+        Arc::new(FixedClock::new(ZH_NOW)),
+    );
+    let mut tenant = serde_json::Map::new();
+    tenant.insert("chunk_size_tokens".into(), json!(40));
+    tenant.insert("chunk_overlap_tokens".into(), json!(0));
+    e.update_tenant_config("acme", &tenant).unwrap();
+    let join = |bank: &str, extra: Option<(&str, serde_json::Value)>| {
+        let mut updates = serde_json::Map::new();
+        updates.insert("tenant".into(), json!("acme"));
+        if let Some((k, v)) = extra {
+            updates.insert(k.into(), v);
+        }
+        e.update_bank_config(bank, &updates).unwrap();
+    };
+    join("in-tenant", None);
+    join("overridden", Some(("chunk_size_tokens", json!(100_000))));
+
+    let content = (0..60)
+        .map(|i| format!("Sentence number {i} says Alice visited place {i}."))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let calls = |bank: &'static str| {
+        let content = content.clone();
+        let llm = llm.clone();
+        let e = &e;
+        async move {
+            llm.prompts.lock().unwrap().clear();
+            retain(e, bank, &content).await;
+            llm.prompts.lock().unwrap().len()
+        }
+    };
+    let alone = calls("no-tenant").await;
+    let tenant_calls = calls("in-tenant").await;
+    let overridden = calls("overridden").await;
+    assert_eq!(alone, 1, "global chunk size: one extraction");
+    assert!(tenant_calls > 1, "tenant chunk size splits: {tenant_calls}");
+    assert_eq!(overridden, 1, "the bank's own value beats the tenant");
+
+    let r = e.resolved_config("overridden").unwrap();
+    assert_eq!(r.source("chunk_size_tokens"), Some(Layer::Bank));
+    assert_eq!(r.source("chunk_overlap_tokens"), Some(Layer::Tenant));
 }

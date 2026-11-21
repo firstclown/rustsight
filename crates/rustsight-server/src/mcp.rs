@@ -177,6 +177,9 @@ async fn call_tool(
                 .get("query")
                 .and_then(|v| v.as_str())
                 .ok_or("query required")?;
+            let resolved = engine
+                .resolved_config(&bank_id)
+                .map_err(|e| e.to_string())?;
             let r = engine
                 .recall(RecallRequest {
                     bank_id,
@@ -185,7 +188,7 @@ async fn call_tool(
                         .get("token_budget")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(1000) as usize,
-                    top_k_per_arm: engine.config.recall_budget.resolve(
+                    top_k_per_arm: engine.recall_budget_for(&resolved).resolve(
                         None,
                         args.get("token_budget")
                             .and_then(|v| v.as_u64())

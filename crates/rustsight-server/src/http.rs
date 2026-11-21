@@ -1,6 +1,6 @@
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post, MethodRouter};
+use axum::routing::{get, patch, post, MethodRouter};
 use axum::{Json, Router};
 use rustsight_core::types::*;
 use rustsight_core::{Engine, Error};
@@ -35,6 +35,12 @@ fn native_routes() -> Vec<(&'static str, MethodRouter<Arc<Engine>>)> {
         (
             "/banks/{bank_id}/mental-models",
             get(list_mental_models).post(refresh_mental_model),
+        ),
+        ("/banks/{bank_id}/config", get(get_resolved_config)),
+        ("/tenants", get(list_tenants)),
+        (
+            "/tenants/{tenant_id}/config",
+            get(get_tenant_config).merge(patch(patch_tenant_config)),
         ),
     ]
 }
@@ -251,6 +257,53 @@ async fn upsert_bank(
     Ok(Json(bank))
 }
 
+/// A bank's effective configuration (RS-10f): every layered key's value
+/// and the layer it came from (`default`, `global`, `tenant`, `bank`).
+async fn get_resolved_config(
+    State(engine): State<Arc<Engine>>,
+    Path(bank_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let resolved = engine.resolved_config(&bank_id).map_err(http_err)?;
+    Ok(Json(json!({
+        "bank_id": bank_id,
+        "tenant": resolved.tenant,
+        "config": resolved.config,
+    })))
+}
+
+async fn list_tenants(
+    State(engine): State<Arc<Engine>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let tenants = engine.list_tenants().map_err(http_err)?;
+    Ok(Json(json!({ "tenants": tenants })))
+}
+
+async fn get_tenant_config(
+    State(engine): State<Arc<Engine>>,
+    Path(tenant_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let config = engine.tenant_config(&tenant_id).map_err(http_err)?;
+    Ok(Json(json!({ "tenant_id": tenant_id, "config": config })))
+}
+
+#[derive(Deserialize)]
+struct TenantConfigUpdate {
+    updates: Map<String, Value>,
+}
+
+/// Merge overrides into a tenant's layer (`null` clears a key); every
+/// value is type-checked first and unknown keys are refused.
+async fn patch_tenant_config(
+    State(engine): State<Arc<Engine>>,
+    Path(tenant_id): Path<String>,
+    Json(body): Json<TenantConfigUpdate>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let config = engine
+        .update_tenant_config(&tenant_id, &body.updates)
+        .map_err(http_err)?;
+    Ok(Json(json!({ "tenant_id": tenant_id, "config": config })))
+}
+
 async fn get_bank(
     State(engine): State<Arc<Engine>>,
     Path(bank_id): Path<String>,
@@ -302,14 +355,19 @@ async fn recall(
     Path(bank_id): Path<String>,
     Json(body): Json<RecallBody>,
 ) -> Result<Json<RecallResponse>, (StatusCode, String)> {
+    let top_k_per_arm = match body.top_k_per_arm {
+        Some(k) => k,
+        None => {
+            let resolved = engine.resolved_config(&bank_id).map_err(http_err)?;
+            engine.recall_budget_for(&resolved).resolve(None, 1000)
+        }
+    };
     engine
         .recall(RecallRequest {
             bank_id,
             query: body.query,
             token_budget: body.token_budget.unwrap_or(1000),
-            top_k_per_arm: body
-                .top_k_per_arm
-                .unwrap_or_else(|| engine.config.recall_budget.resolve(None, 1000)),
+            top_k_per_arm,
             kinds: None,
             ..Default::default()
         })
@@ -461,6 +519,104 @@ mod tests {
             .oneshot(req.body(Body::empty()).unwrap())
             .await
             .unwrap()
+    }
+
+    async fn send(
+        router: Router,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body.map_or_else(Body::empty, |b| Body::from(b.to_string())))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into()));
+        (status, value)
+    }
+
+    #[tokio::test]
+    async fn tenant_config_round_trips_and_resolution_reports_provenance() {
+        let engine = Arc::new(Engine::new(
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+            Arc::new(MockLlm::demo()),
+            Arc::new(MockEmbed::default()),
+            Arc::new(MockRerank),
+            Arc::new(SimpleTokenEstimator),
+            Arc::new(SystemClock),
+        ));
+        let r = router(Arc::clone(&engine), Arc::new(ApiAuth::None));
+
+        let (status, body) = send(
+            r.clone(),
+            "PATCH",
+            "/tenants/acme/config",
+            Some(json!({"updates": {"chunk_size_tokens": 512, "retain_mission": "Acme facts."}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["config"]["chunk_size_tokens"], 512);
+        let (_, body) = send(r.clone(), "GET", "/tenants/acme/config", None).await;
+        assert_eq!(body["config"]["retain_mission"], "Acme facts.");
+        let (_, body) = send(r.clone(), "GET", "/tenants", None).await;
+        assert_eq!(body["tenants"], json!(["acme"]));
+
+        // Wrong types and unknown keys are refused; nothing is stored.
+        for updates in [json!({"chunk_size_tokens": "big"}), json!({"chunk_sz": 1})] {
+            let (status, _) = send(
+                r.clone(),
+                "PATCH",
+                "/tenants/acme/config",
+                Some(json!({ "updates": updates })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+
+        // A bank joins the tenant and overrides one key itself.
+        let mut updates = Map::new();
+        updates.insert("tenant".into(), json!("acme"));
+        updates.insert("reflect_max_rounds".into(), json!(4));
+        engine.update_bank_config("b1", &updates).unwrap();
+        let (status, body) = send(r.clone(), "GET", "/banks/b1/config", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["tenant"], "acme");
+        let c = &body["config"];
+        assert_eq!(
+            c["chunk_size_tokens"],
+            json!({"value": 512, "source": "tenant"})
+        );
+        assert_eq!(
+            c["reflect_max_rounds"],
+            json!({"value": 4, "source": "bank"})
+        );
+        assert_eq!(
+            c["chunk_overlap_tokens"],
+            json!({"value": 200, "source": "global"})
+        );
+        assert_eq!(
+            c["enable_observations"],
+            json!({"value": null, "source": "default"})
+        );
+
+        // Clearing the tenant key drops it back to the global value.
+        send(
+            r.clone(),
+            "PATCH",
+            "/tenants/acme/config",
+            Some(json!({"updates": {"chunk_size_tokens": null}})),
+        )
+        .await;
+        let (_, body) = send(r, "GET", "/banks/b1/config", None).await;
+        assert_eq!(body["config"]["chunk_size_tokens"]["source"], "global");
     }
 
     #[tokio::test]

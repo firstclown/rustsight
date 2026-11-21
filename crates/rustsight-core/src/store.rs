@@ -177,6 +177,14 @@ pub trait MemoryStore: Send + Sync {
     fn bank_config(&self, bank_id: &str) -> Result<serde_json::Value>;
     fn set_bank_config(&self, bank_id: &str, config: &serde_json::Value) -> Result<()>;
 
+    /// A tenant's config layer (RS-10f): a JSON object of overrides, or
+    /// `None` for a tenant never written.
+    fn tenant_config(&self, tenant_id: &str) -> Result<Option<serde_json::Value>>;
+    /// Create or replace a tenant's config layer.
+    fn set_tenant_config(&self, tenant_id: &str, config: &serde_json::Value) -> Result<()>;
+    /// Every tenant id, sorted.
+    fn list_tenants(&self) -> Result<Vec<String>>;
+
     /// Insert or replace a document record (keeps `created_at_ms` of an
     /// existing row).
     fn upsert_document(&self, doc: &Document) -> Result<()>;

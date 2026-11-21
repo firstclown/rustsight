@@ -27,6 +27,15 @@ pub fn consolidate_interval_from_env() -> Duration {
     }
 }
 
+/// `RUSTSIGHT_DEFAULT_TENANT`: the tenant config layer banks without
+/// their own `tenant` setting resolve through (RS-10f). Unset = none.
+pub fn default_tenant_from_env() -> Option<String> {
+    std::env::var("RUSTSIGHT_DEFAULT_TENANT")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 /// `RUSTSIGHT_LLM_OUTPUT_LANGUAGE` (or `HINDSIGHT_API_LLM_OUTPUT_LANGUAGE`):
 /// the language facts, observations and reflect answers are written in.
 /// Unset keeps the source language.

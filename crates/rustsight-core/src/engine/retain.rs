@@ -99,7 +99,8 @@ fn screen_content(
     operation_id: &str,
 ) -> Result<Option<crate::defense::DefenseReport>> {
     use crate::defense::{parse_policy, screen, DefenseAction, DefenseReport};
-    let config = e.store.bank_config(&req.bank_id)?;
+    // The policy may come from the bank or its tenant (RS-10f).
+    let config = e.resolved_config(&req.bank_id)?;
     let policy = parse_policy(config.get("memory_defense"))?;
     if !policy.enabled {
         return Ok(None);
@@ -135,11 +136,17 @@ async fn retain_screened(e: &Engine, req: RetainRequest) -> Result<RetainRespons
     }
     let bank = e.provision_bank(&req.bank_id)?;
     let now = req.timestamp_ms.unwrap_or_else(|| e.clock.now_ms());
+    // Knobs and settings resolve global → tenant → bank (RS-10f).
+    let resolved = e.resolved_config(&bank.id)?;
 
     let chunks = split_chunks(
         &req.content,
-        e.config.chunk_size_tokens,
-        e.config.chunk_overlap_tokens,
+        resolved
+            .usize("chunk_size_tokens")
+            .unwrap_or(e.config.chunk_size_tokens),
+        resolved
+            .usize("chunk_overlap_tokens")
+            .unwrap_or(e.config.chunk_overlap_tokens),
         e.tokens.as_ref(),
     );
     // `timestamp: "unset"` (timeless content): the extractor gets no event
@@ -179,15 +186,11 @@ async fn retain_screened(e: &Engine, req: RetainRequest) -> Result<RetainRespons
     let total_chunks = chunks.len();
     let retain_mission = e.scoped_mission(&bank, "retain_mission");
     let bank_mission = retain_mission.as_deref();
-    let bank_config = e.store.bank_config(&bank.id)?;
-    let free_form = bank_config
-        .get("entities_allow_free_form")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-    let labels = BankLabels::parse(bank_config.get("entity_labels"), free_form)?;
+    let free_form = resolved.bool("entities_allow_free_form").unwrap_or(true);
+    let labels = BankLabels::parse(resolved.get("entity_labels"), free_form)?;
     let mut extract_config = e.config.extract.clone();
-    if let Some(language) = &e.config.output_language {
-        extract_config.output_language = Some(language.clone());
+    if let Some(language) = resolved.str("output_language") {
+        extract_config.output_language = Some(language.to_string());
     }
     if let Some(labels) = &labels {
         extract_config.entity_labels = Some(labels.groups.clone()).filter(|g| !g.is_empty());

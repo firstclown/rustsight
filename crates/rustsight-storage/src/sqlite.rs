@@ -244,6 +244,11 @@ CREATE TABLE IF NOT EXISTS directives(
   updated_at_ms INTEGER NOT NULL,
   UNIQUE(bank_id, name)
 );
+CREATE TABLE IF NOT EXISTS tenants(
+  id TEXT PRIMARY KEY,
+  config_json TEXT NOT NULL,
+  updated_at_ms INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS store_flags(
   name TEXT PRIMARY KEY,
   set_at_ms INTEGER NOT NULL
@@ -1884,6 +1889,39 @@ impl MemoryStore for SqliteStore {
         )
         .map_err(store_err)?;
         Ok(())
+    }
+
+    fn tenant_config(&self, tenant_id: &str) -> Result<Option<serde_json::Value>> {
+        let conn = self.lock_conn();
+        conn.query_row(
+            "SELECT config_json FROM tenants WHERE id = ?1",
+            params![tenant_id],
+            |r| json_col(r, 0),
+        )
+        .optional()
+        .map_err(store_err)
+    }
+
+    fn set_tenant_config(&self, tenant_id: &str, config: &serde_json::Value) -> Result<()> {
+        let now = self.clock.now_ms();
+        let conn = self.lock_conn();
+        conn.execute(
+            "INSERT INTO tenants(id, config_json, updated_at_ms) VALUES (?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET config_json = excluded.config_json,
+               updated_at_ms = excluded.updated_at_ms",
+            params![tenant_id, config.to_string(), now],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    fn list_tenants(&self) -> Result<Vec<String>> {
+        let conn = self.lock_conn();
+        let mut stmt = conn
+            .prepare("SELECT id FROM tenants ORDER BY id")
+            .map_err(store_err)?;
+        let rows = stmt.query_map([], |r| r.get(0)).map_err(store_err)?;
+        rows.collect::<rusqlite::Result<_>>().map_err(store_err)
     }
 
     fn upsert_document(&self, doc: &Document) -> Result<()> {

@@ -99,6 +99,8 @@ trait (`search_semantic`).
     RUSTSIGHT_LLM_OUTPUT_LANGUAGE  write facts, observations and reflect answers
                               in this language (e.g. English); unset keeps
                               each source's own language (see "Multilingual")
+    RUSTSIGHT_DEFAULT_TENANT  tenant config layer for banks without their own
+                              `tenant` setting (see "Layered configuration")
     RUSTSIGHT_DEFAULT_BANK_TEMPLATE  a bank template (inline JSON, or a path to a
                               JSON file) applied to every new bank; an invalid
                               one stops startup (see "Bank templates")
@@ -401,7 +403,8 @@ embedding models should be re-embedded either way.
 ## Chunking, retries, and limits
 Retain splits long content into token-sized chunks (default ~3000 tokens with a
 200-token overlap, measured with the configured token estimator; tunable via
-`EngineConfig.chunk_size_tokens` / `chunk_overlap_tokens`) and extracts each
+`EngineConfig.chunk_size_tokens` / `chunk_overlap_tokens`, or per tenant or
+bank — see "Layered configuration") and extracts each
 chunk separately. Chunk-local causal fact indexes are remapped to a global
 index before edges are built, and facts re-extracted from the overlap region
 (normalized similarity >= 0.9) are stored once. Every provider call (LLM,
@@ -413,6 +416,46 @@ and `retry_base_delay_ms`; other errors (auth, bad requests) fail fast. If a
 chunk's extraction output fails to parse (e.g. JSON truncated by an output
 token limit), the chunk is re-asked once at half size before the error
 surfaces.
+
+## Layered configuration
+Settings resolve per request in three layers: **global** (the server's own
+configuration — env vars and `EngineConfig`), then a **tenant**, then the
+**bank**. The most specific value wins. A tenant is just a named set of
+overrides; a bank joins one through its `tenant` setting, or falls back to
+`RUSTSIGHT_DEFAULT_TENANT`. Tenants share configuration only — they are not
+an isolation or auth boundary (the API token still covers everything).
+
+Layered keys (type-checked on write at either layer; unknown keys are
+refused, `null` clears an override):
+
+| Key | Type | Global value |
+|---|---|---|
+| `chunk_size_tokens` / `chunk_overlap_tokens` | integer | 3000 / 200 |
+| `reflect_max_rounds` | integer 1–100 | 8 (native reflect; requests naming a budget keep their own) |
+| `reflect_answer_max_tokens` | integer | unset |
+| `recall_budget_low` / `_mid` / `_high` | integer (results per arm) | 100 / 300 / 1000 |
+| `reranker_max_candidates` | integer (0 = all) | 0 |
+| `consolidate_max_facts_per_entity` | integer | 200 |
+| `consolidate_dupe_cosine` | number 0–1 | 0.9 |
+| `output_language` | string | `RUSTSIGHT_LLM_OUTPUT_LANGUAGE` |
+| `retain_mission`, `observations_mission` | string | none |
+| `enable_observations`, `entities_allow_free_form` | boolean | true |
+| `entity_labels`, `memory_defense` | as in bank config | none |
+
+A bank sets its own overrides (and `tenant`) through the same
+`PATCH /v1/default/banks/{id}/config` it already uses; the bank-row settings
+(`reflect_mission`, dispositions) are bank-only.
+
+    curl -X PATCH localhost:8888/tenants/acme/config -H 'content-type: application/json' \
+        -d '{"updates": {"chunk_size_tokens": 1500, "output_language": "English"}}'
+    curl localhost:8888/tenants/acme/config      # the tenant's overrides
+    curl localhost:8888/tenants                  # tenant ids
+    curl localhost:8888/banks/demo/config        # resolved values + source layer
+
+`GET /banks/{id}/config` reports every key as
+`{"value": ..., "source": "default" | "global" | "tenant" | "bank"}`.
+CLI: `rustsight tenant list | get T | set T key=value... | join --bank B
+--tenant T | resolve --bank B` (values parse as JSON, else as text).
 
 ## Multilingual
 Content is remembered in the language it was written in. With

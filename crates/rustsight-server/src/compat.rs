@@ -450,7 +450,7 @@ async fn delete_bank(State(engine): State<Arc<Engine>>, Path(bank_id): Path<Stri
 
 // ── Bank config ──────────────────────────────────────────────────────────
 
-use rustsight_core::bank_config::is_config_key;
+use rustsight_core::bank_config::is_bank_key;
 
 #[derive(Deserialize)]
 struct BankConfigUpdate {
@@ -468,10 +468,12 @@ fn bank_config_json(engine: &Engine, bank: &Bank) -> Result<Value, ApiError> {
     let stored = bank_config_map(engine, &bank.id)?;
     let overrides: Map<String, Value> = stored
         .iter()
-        .filter(|(key, _)| is_config_key(key))
+        .filter(|(key, _)| is_bank_key(key))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
-    let setting = |key: &str, default: Value| stored.get(key).cloned().unwrap_or(default);
+    // Effective values: the bank's own, else its tenant's (RS-10f).
+    let resolved = engine.resolved_config(&bank.id)?;
+    let setting = |key: &str, default: Value| resolved.get(key).cloned().unwrap_or(default);
     Ok(json!({
         "bank_id": bank.id,
         "config": {
@@ -813,7 +815,7 @@ fn blocked_items(
     operation_id: &str,
 ) -> Result<HashSet<usize>, ApiError> {
     use rustsight_core::defense::{parse_policy, screen, DefenseAction};
-    let config = engine.store.bank_config(bank_id)?;
+    let config = engine.resolved_config(bank_id)?;
     let policy = parse_policy(config.get("memory_defense"))?;
     if !policy.enabled {
         return Ok(HashSet::new());
@@ -1557,8 +1559,7 @@ async fn recall(
             query: body.query.clone(),
             token_budget: max_tokens,
             top_k_per_arm: engine
-                .config
-                .recall_budget
+                .recall_budget_for(&engine.resolved_config(&bank_id)?)
                 .resolve(Some(budget), max_tokens),
             kinds: Some(kinds.clone()),
             tags,

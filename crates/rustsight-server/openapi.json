@@ -12,7 +12,8 @@
     { "name": "memory", "description": "Retain, recall, reflect, consolidate." },
     { "name": "inspect", "description": "Read-only listings of a bank's contents." },
     { "name": "mental-models", "description": "Question-scoped summaries built from observations." },
-    { "name": "health", "description": "Liveness." }
+    { "name": "health", "description": "Liveness." },
+    { "name": "config", "description": "Layered configuration: global → tenant → bank." }
   ],
   "paths": {
     "/healthz": {
@@ -329,6 +330,94 @@
           "500": { "$ref": "#/components/responses/InternalError" }
         }
       }
+    },
+    "/banks/{bank_id}/config": {
+      "parameters": [{ "$ref": "#/components/parameters/BankId" }],
+      "get": {
+        "tags": ["config"],
+        "operationId": "getResolvedConfig",
+        "summary": "A bank's effective configuration, with provenance",
+        "responses": {
+          "200": {
+            "description": "Every layered key's value and the layer it came from.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ResolvedConfig" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
+    "/tenants": {
+      "get": {
+        "tags": ["config"],
+        "operationId": "listTenants",
+        "summary": "List tenants",
+        "responses": {
+          "200": {
+            "description": "Tenant ids, sorted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["tenants"],
+                  "properties": { "tenants": { "type": "array", "items": { "type": "string" } } }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
+    "/tenants/{tenant_id}/config": {
+      "parameters": [{ "$ref": "#/components/parameters/TenantId" }],
+      "get": {
+        "tags": ["config"],
+        "operationId": "getTenantConfig",
+        "summary": "A tenant's overrides",
+        "responses": {
+          "200": {
+            "description": "The tenant's stored overrides (empty for an unknown tenant).",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TenantConfig" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      },
+      "patch": {
+        "tags": ["config"],
+        "operationId": "patchTenantConfig",
+        "summary": "Update a tenant's overrides",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["updates"],
+                "properties": {
+                  "updates": {
+                    "type": "object",
+                    "description": "Keys to set; null clears one. Values are type-checked and unknown keys refused (400).",
+                    "additionalProperties": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The tenant's overrides after the update.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TenantConfig" } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "422": { "$ref": "#/components/responses/InvalidBody" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
     }
   },
   "components": {
@@ -344,6 +433,13 @@
         "name": "bank_id",
         "in": "path",
         "required": true,
+        "schema": { "type": "string" }
+      },
+      "TenantId": {
+        "name": "tenant_id",
+        "in": "path",
+        "required": true,
+        "description": "Tenant id (a named config layer).",
         "schema": { "type": "string" }
       }
     },
@@ -369,6 +465,42 @@
       }
     },
     "schemas": {
+      "ConfigEntry": {
+        "type": "object",
+        "required": ["value", "source"],
+        "properties": {
+          "value": { "description": "Effective value (null = unset)." },
+          "source": {
+            "type": "string",
+            "enum": ["default", "global", "tenant", "bank"],
+            "description": "The layer the value came from."
+          }
+        }
+      },
+      "ResolvedConfig": {
+        "type": "object",
+        "required": ["bank_id", "tenant", "config"],
+        "properties": {
+          "bank_id": { "type": "string" },
+          "tenant": {
+            "type": ["string", "null"],
+            "description": "The tenant the bank resolves through: its `tenant` setting, else RUSTSIGHT_DEFAULT_TENANT."
+          },
+          "config": {
+            "type": "object",
+            "description": "Layered keys: chunk_size_tokens, chunk_overlap_tokens, reflect_max_rounds, reflect_answer_max_tokens, recall_budget_low, recall_budget_mid, recall_budget_high, reranker_max_candidates, consolidate_max_facts_per_entity, consolidate_dupe_cosine, output_language, retain_mission, observations_mission, enable_observations, entity_labels, entities_allow_free_form, memory_defense.",
+            "additionalProperties": { "$ref": "#/components/schemas/ConfigEntry" }
+          }
+        }
+      },
+      "TenantConfig": {
+        "type": "object",
+        "required": ["tenant_id", "config"],
+        "properties": {
+          "tenant_id": { "type": "string" },
+          "config": { "type": "object", "description": "The tenant's stored overrides.", "additionalProperties": true }
+        }
+      },
       "MemoryKind": {
         "type": "string",
         "enum": ["world", "experience", "observation", "opinion"]

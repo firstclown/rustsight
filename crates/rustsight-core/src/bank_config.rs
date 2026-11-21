@@ -32,6 +32,24 @@ pub fn is_config_key(key: &str) -> bool {
     CONFIG_KEYS.contains(&key)
 }
 
+/// Everything a bank's config can override: the Hindsight settings, the
+/// layered engine knobs (RS-10f) and the bank's `tenant` membership.
+pub fn is_bank_key(key: &str) -> bool {
+    is_config_key(key) || crate::config_resolver::is_engine_knob(key) || key == "tenant"
+}
+
+fn supported_keys() -> String {
+    let mut keys: Vec<&str> = CONFIG_KEYS.to_vec();
+    keys.extend(
+        crate::config_resolver::KEYS
+            .iter()
+            .filter(|k| k.engine)
+            .map(|k| k.name),
+    );
+    keys.push("tenant");
+    keys.join(", ")
+}
+
 /// Upstream accepts both `retain_mission` and `HINDSIGHT_API_RETAIN_MISSION`.
 pub fn normalize_key(raw: &str) -> String {
     let lower = raw.to_lowercase();
@@ -98,10 +116,18 @@ pub fn apply_update(bank: &mut Bank, key: &str, value: &Value) -> Result<()> {
                 )?,
             };
         }
+        "tenant" => {
+            if !(value.is_string() || value.is_null()) {
+                return Err(wrong_type("a string or null"));
+            }
+        }
+        knob if crate::config_resolver::is_engine_knob(knob) => {
+            crate::config_resolver::validate(knob, value)?;
+        }
         other => {
             return Err(Error::BadInput(format!(
                 "Unsupported bank config key {other:?}; supported keys: {}",
-                CONFIG_KEYS.join(", ")
+                supported_keys()
             )))
         }
     }
@@ -153,10 +179,10 @@ impl Engine {
         let mut config = self.bank_config_map(bank_id)?;
         for (raw_key, value) in updates {
             let key = normalize_key(raw_key);
-            if !is_config_key(&key) {
+            if !is_bank_key(&key) {
                 return Err(Error::BadInput(format!(
                     "Unsupported bank config key {raw_key:?}; supported keys: {}",
-                    CONFIG_KEYS.join(", ")
+                    supported_keys()
                 )));
             }
             apply_update(&mut bank, &key, value)?;
@@ -176,7 +202,7 @@ impl Engine {
         let mut config = self.bank_config_map(bank_id)?;
         let overridden: Vec<String> = config
             .keys()
-            .filter(|key| is_config_key(key))
+            .filter(|key| is_bank_key(key))
             .cloned()
             .collect();
         for key in overridden {

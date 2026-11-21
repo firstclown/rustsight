@@ -789,10 +789,10 @@ overrides, resolved per request.
   (resolved values + which layer each came from); CLI `rustsight tenant`.
 
 DoD:
-- [ ] Unit: layer precedence, type validation, unknown keys refused.
-- [ ] engine_flow: a tenant chunk-size override changes retain chunking for
+- [x] Unit: layer precedence, type validation, unknown keys refused.
+- [x] engine_flow: a tenant chunk-size override changes retain chunking for
       its banks only; a bank override beats the tenant.
-- [ ] HTTP: tenant config round-trip; resolved view reports provenance.
+- [x] HTTP: tenant config round-trip; resolved view reports provenance.
 
 ---
 

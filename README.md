@@ -30,6 +30,9 @@ agents.
 - **Any language.** Facts keep the language and script they were written
   in, Chinese/Japanese/Korean text is keyword-searchable, and Chinese date
   phrases like 上周 narrow recall. Or force one output language.
+- **Layered config.** Global → tenant → bank: give a group of banks shared
+  chunking, budgets, missions or a Memory Defense policy, override per
+  bank, and see where each effective value came from.
 - **Templates.** Export a bank's settings, mental models and directives and
   import them elsewhere, or give every new bank a default template.
 - **Files in, facts out.** Upload text, markdown or HTML files; their facts
