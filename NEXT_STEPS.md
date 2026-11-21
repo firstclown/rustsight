@@ -279,6 +279,13 @@ Done Oct 2026. Facts for later tickets:
 
 ## RS-6 — LongMemEval-S evaluation harness · P1 · L
 
+> **Status (2026-11-20): withdrawn.** The `rustsight-eval` crate, its
+> fixtures, and `scripts/fullstack-smoke` / `scripts/hindsight-record-sync`
+> were removed from the workspace — the harness never produced a full run.
+> Benchmarks now run externally through the Agent Memory Benchmark's
+> Hindsight HTTP adapter (results in the README). The notes below are kept
+> as history; paths they mention no longer exist.
+
 ### Description
 No evidence yet that the Rust engine approaches the paper's accuracy. Build
 the `rustsight-eval` crate (it was in the original workspace plan but was

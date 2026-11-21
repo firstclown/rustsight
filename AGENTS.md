@@ -49,18 +49,6 @@ cargo run -p rustsight-cli -- serve --addr 127.0.0.1:8888   # HTTP API (needs AP
 cargo run -p rustsight-cli -- mcp --bank demo                # stdio MCP server
 ```
 
-Eval harness (RS-6, offline smoke):
-
-```bash
-cargo run -p rustsight-eval -- --mock --dataset-path <fixture.json> --out /tmp/eval-smoke/
-cargo run -p rustsight-eval -- analyze --run /tmp/eval-smoke/          # failure clusters
-cargo run -p rustsight-eval -- compare --run /tmp/eval-smoke/          # per-question parity vs Hindsight
-cargo run -p rustsight-eval -- download                                # real dataset (network)
-scripts/fullstack-smoke [--mock]        # full stack front-to-back on the committed fixture
-                                        # (real providers + judge by default; rotates its out dir)
-scripts/hindsight-record-sync           # refresh the committed Hindsight LongMemEval-S record
-```
-
 Smoke-test the Hindsight-compatible API (what Hindsight clients call):
 
 ```bash
@@ -93,7 +81,7 @@ Every change is complete only when **all** of the following pass locally:
    - Engine-level/integration tests go in
      `crates/rustsight-storage/tests/engine_flow.rs` (in-memory SQLite +
      scripted mocks; 59 tests there today).
-4. Docs touched where relevant: README sections for user-facing behavior/env
+4. Docs touched where relevant: `docs/reference.md` (and the README overview) for user-facing behavior/env
    vars, `NEXT_STEPS.md` checkboxes if a ticket's scope changed.
 5. No secrets/API keys committed; `.gitignore` already covers `*.db*`.
 
@@ -102,8 +90,8 @@ the gate, so run them before declaring done.
 
 ## Workspace layout
 
-Six crates; dependency flow: `core` ← `storage`/`providers` ← `server` ←
-`cli`, and `core`/`storage`/`providers` ← `eval`.
+Five crates; dependency flow: `core` ← `storage`/`providers` ← `server` ←
+`cli`.
 
 | Crate | Path | Role |
 |---|---|---|
@@ -112,7 +100,6 @@ Six crates; dependency flow: `core` ← `storage`/`providers` ← `server` ←
 | rustsight-providers | `crates/rustsight-providers` | `OpenAiCompat` LLM/embeddings over HTTP, `ApiRerank` (Jina/Cohere-style `/rerank`), `NoopRerank`, and all mocks (`MockLlm`, `MockEmbed`, `MockRerank`, `SimpleTokenEstimator`) |
 | rustsight-server | `crates/rustsight-server` | axum HTTP router (`http.rs`) + stdio JSON-RPC MCP server (`mcp.rs`); both spawn the consolidation worker |
 | rustsight-cli | `crates/rustsight-cli` | Binary `rustsight`: serve/mcp/retain/recall/reflect/consolidate/inspect/banks/bank-set/mental-model |
-| rustsight-eval | `crates/rustsight-eval` | LongMemEval-S harness (RS-6): dataset ingest, bank-per-conversation retain with synthesized timestamps, fixed-clock reflect, `\boxed{yes/no}` LLM judge, resumable state, reports + failure analysis |
 
 Key source map:
 
@@ -155,7 +142,7 @@ Key source map:
   hindsight-api 1.2.x request/response shapes, merged into the same router
   as the native API. Shapes were checked against the installed upstream
   `api/http.py` and exercised with the real `@vectorize-io/hindsight-client`;
-  the README's compatibility matrix lists what is accepted-but-ignored.
+  `docs/reference.md`'s compatibility matrix lists what is accepted-but-ignored.
 - `crates/rustsight-cli/src/main.rs` — `build_engine` is the three-line
   embedding recipe desktop apps copy.
 
@@ -283,9 +270,6 @@ Env vars, read in `crates/rustsight-providers/src/env.rs`:
 - `RUSTSIGHT_API_TOKEN` / `RUSTSIGHT_API_TOKEN_FILE` (optional; bearer-token
   auth for the HTTP API — without one, `serve` refuses non-loopback binds
   unless `--allow-unauth`. MCP stdio needs no auth.)
-- `RUSTSIGHT_EVAL_JUDGE_BASE_URL`/`_API_KEY`/`_MODEL` (eval harness only,
-  all three required for real judge runs — read in
-  `crates/rustsight-eval/src/judge.rs`, no fallback to the LLM provider)
 
 ## Conventions
 
@@ -296,8 +280,8 @@ Env vars, read in `crates/rustsight-providers/src/env.rs`:
   `RS-2: add background consolidation worker`. Never commit without an explicit
   request.
 - `NEXT_STEPS.md` is the roadmap (RS-1..RS-12, P0..P3, each with need-to-know
-  facts and its own DoD). RS-1..RS-5 are done; RS-6's harness is done (its
-  hosted baseline run + iteration are pending). Read the relevant ticket
+  facts and its own DoD). RS-1..RS-5 are done; RS-6's in-repo eval harness was
+  removed (benchmarks now run externally through the Agent Memory Benchmark). Read the relevant ticket
   before touching engine code — it records upstream-pinned facts (tag `v1.1.0`,
   commit `a5a619b5`) you'd otherwise have to rediscover.
 - License is MIT; upstream material keeps MIT headers and a `NOTICE` entry.

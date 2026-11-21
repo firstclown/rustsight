@@ -1725,24 +1725,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustsight-eval"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "clap",
- "futures",
- "reqwest",
- "rustsight-core",
- "rustsight-providers",
- "rustsight-storage",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
-]
-
-[[package]]
 name = "rustsight-providers"
 version = "0.1.0"
 dependencies = [

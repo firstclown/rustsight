@@ -34,15 +34,3 @@ Licensed, Copyright (c) 2025 Vectorize AI, Inc. See
 those files' prompt-building logic; see
 `crates/rustsight-core/prompts/upstream/DIVERGENCES.md` for intentional
 differences.
-
-Benchmark record data
----------------------
-`crates/rustsight-eval/fixtures/hindsight_longmemeval_s.json` embeds the
-per-question LongMemEval-S verdicts of upstream Hindsight's own benchmark run
-(published by the Agent Memory Benchmark at
-https://github.com/vectorize-io/agent-memory-benchmark,
-outputs/longmemeval/hindsight/rag/s.json.gz; fetched 2026-11-04). It is used
-as an internal parity reference by `rustsight-eval compare`. That repository
-carries no license file; the retained data is limited to per-question judge
-outcomes with trimmed answers/judge reasons, and is not a code derivative of
-any Vectorize work. `scripts/hindsight-record-sync` re-fetches it.
