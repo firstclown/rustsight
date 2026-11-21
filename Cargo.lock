@@ -1870,13 +1870,17 @@ dependencies = [
  "async-trait",
  "axum",
  "chrono",
+ "futures",
+ "reqwest",
  "rustsight-core",
  "rustsight-providers",
  "rustsight-storage",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tower",
+ "url",
  "uuid",
 ]
 

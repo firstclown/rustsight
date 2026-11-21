@@ -36,6 +36,8 @@ sqlite-vec = "=0.1.9"
 criterion = { version = "0.5", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 axum = "0.8"
+# Host classification for the webhook SSRF guard (RS-10b; reqwest already depends on it)
+url = "2"
 tower = { version = "0.5", features = ["util"] }
 clap = { version = "4", features = ["derive"] }
 # Optional deps for the `onnx-rerank` feature (RS-4). Heavy: only pulled in

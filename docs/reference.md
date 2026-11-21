@@ -96,6 +96,13 @@ trait (`search_semantic`).
     RUSTSIGHT_API_TOKEN       optional; bearer token required by every HTTP
                               endpoint except /healthz (see below)
     RUSTSIGHT_API_TOKEN_FILE  optional; read the token from a file instead
+    RUSTSIGHT_WEBHOOK_URL     optional global webhook for every bank (see
+                              "Webhooks"); _SECRET signs it, _EVENT_TYPES is a
+                              comma list (default consolidation.completed)
+    RUSTSIGHT_WEBHOOK_ALLOWED_HOSTS  hostnames / IPs / CIDRs webhooks may reach
+                              despite being private or loopback
+    RUSTSIGHT_WEBHOOK_EXPOSE_RESPONSE_BODY  true returns receivers' response
+                              bodies from the deliveries API (default false)
 
 Every LLM setting above also answers to its `HINDSIGHT_API_*` name
 (`HINDSIGHT_API_LLM_BASE_URL` / `_API_KEY` / `_MODEL`, and the
@@ -128,6 +135,9 @@ untouched and served side by side.
     GET    /v1/default/banks/{bank_id}/operations          list, newest first
     GET    /v1/default/banks/{bank_id}/operations/{id}     async retain status
     POST   /v1/default/banks/{bank_id}/operations/{id}/retry
+    POST   /v1/default/banks/{bank_id}/webhooks            register (GET lists)
+    PATCH  /v1/default/banks/{bank_id}/webhooks/{id}       (DELETE too)
+    GET    /v1/default/banks/{bank_id}/webhooks/{id}/deliveries
 
 `rustsight serve --host 127.0.0.1 --port 8888 --log-level warning` accepts
 the `hindsight-api` command line, and the server drains on SIGTERM as well
@@ -195,7 +205,9 @@ Behavioral differences to know before swapping:
   Hindsight splits at 3000 characters, so each chunk holds more text. And
   `include.chunks` draws on the results that survived `max_tokens`, where
   Hindsight uses the ranked results from before that cut.
-- Not implemented: mental-model / page / directive / webhook / file-upload
+- **Webhook event types are validated.** Registering an event type other
+  than the three below is a 422; Hindsight accepts it and never fires it.
+- Not implemented: mental-model / page / directive / file-upload
   endpoints, cancelling or deleting operations, the HTTP MCP endpoint, opinions
   via this API (a rustsight-native kind, never returned here).
 
@@ -381,6 +393,50 @@ and `retry_base_delay_ms`; other errors (auth, bad requests) fail fast. If a
 chunk's extraction output fails to parse (e.g. JSON truncated by an output
 token limit), the chunk is re-asked once at half size before the error
 surfaces.
+
+## Webhooks
+Rustsight reports three lifecycle events, with Hindsight's names, statuses
+and payloads:
+
+| Event | Fires | `status` | `data` |
+|---|---|---|---|
+| `retain.completed` | once per document, after its memories are stored | `completed` | `document_id`, `tags`, `memory_unit_count` (0 = extraction found nothing) |
+| `consolidation.completed` | after each consolidation pass that had queued work | `completed` / `failed` | `observations_created` / `_updated` / `_deleted`, or `error_message` |
+| `memory_defense.triggered` | when [Memory Defense](#memory-defense) redacts or blocks an item | `redact` / `block` | `action`, `detector`, `document_id`, `matched_types`, `message`, `hits` (fingerprints only) |
+
+The body is `{"event_id", "event", "bank_id", "operation_id", "status",
+"timestamp", "data"}`; `event_id` is shared by every delivery of one event
+and stable across retries, so receivers dedupe on it. All items of one
+retain request share an `operation_id`.
+
+Register webhooks per bank through the Hindsight API
+(`POST /v1/default/banks/{id}/webhooks` with `url`, `secret`, `event_types`,
+`enabled`, `http_config: {method, timeout_seconds, headers, params}`), or
+set one global webhook with `RUSTSIGHT_WEBHOOK_URL`. Secrets are never
+returned. Delivery follows Hindsight:
+
+- Headers `X-Hindsight-Event`, `X-Hindsight-Event-Id`,
+  `X-Hindsight-Delivery-Id`; with a secret, `X-Hindsight-Signature` and
+  `X-Hub-Signature-256` (`sha256=<HMAC-SHA256 of the body>`) plus
+  `X-Hindsight-Signature-V2` (`t=<unix secs>,v1=<HMAC of "<t>.<body>">`,
+  for replay windows). Custom headers cannot override the Hindsight ones.
+- A non-2xx answer or a transport failure retries after 5s, 5m, 30m, 2h and
+  5h (six attempts in all), then the delivery is `failed`. Deliveries are
+  stored when the event fires, so a restart resumes them. They are not
+  operations: waiting for zero pending operations never waits on a webhook.
+- **SSRF guard.** Loopback, private, link-local (incl. the cloud metadata
+  address), CGNAT, reserved and multicast destinations are refused unless
+  `RUSTSIGHT_WEBHOOK_ALLOWED_HOSTS` lists the host or a covering IP/CIDR —
+  IP literals at registration, every resolved address at delivery (the
+  connection is pinned to the checked addresses; redirects are not
+  followed). For a receiver on the same machine, set
+  `RUSTSIGHT_WEBHOOK_ALLOWED_HOSTS=127.0.0.1`.
+- `GET .../webhooks/{id}/deliveries` lists attempts, status codes and
+  errors, newest first (`limit`, `cursor`).
+
+Embedders get the same events without HTTP: `Engine::with_event_sink`
+(or `set_event_sink` on a shared engine) takes any
+`rustsight_core::events::EventSink`.
 
 ## Memory Defense
 Opt-in, per-bank screening of everything retained for secrets and PII — a

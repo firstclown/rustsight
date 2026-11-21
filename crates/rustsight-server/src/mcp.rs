@@ -224,14 +224,21 @@ pub async fn run_stdio(
     engine: Arc<Engine>,
     default_bank: Option<String>,
 ) -> rustsight_core::Result<()> {
-    run_io(
+    // Bank webhooks fire for MCP retains too (RS-10b).
+    let webhook_settings = Arc::new(crate::webhooks::WebhookSettings::from_env());
+    crate::webhooks::set_settings(Arc::clone(&webhook_settings));
+    let webhooks = crate::webhooks::start(&engine, webhook_settings);
+    let result = run_io(
         engine,
         default_bank,
         BufReader::new(tokio::io::stdin()),
         tokio::io::stdout(),
         MAX_LINE_BYTES,
     )
-    .await
+    .await;
+    webhooks.abort();
+    let _ = webhooks.await;
+    result
 }
 
 pub(crate) async fn run_io<R, W>(

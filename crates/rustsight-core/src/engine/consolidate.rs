@@ -17,13 +17,48 @@ use std::sync::Arc;
 /// extraction, CR-19).
 type EntityFut<'a> = Pin<Box<dyn Future<Output = EntityStep> + Send + 'a>>;
 
+/// Observation rows a plan (or a whole pass) changed — the
+/// `consolidation.completed` event counts. Evidence merged into an existing
+/// observation (a dupe-guarded create, a delete's survivor) counts as an
+/// update.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PlanCounts {
+    pub created: usize,
+    pub updated: usize,
+    pub deleted: usize,
+}
+
+impl PlanCounts {
+    fn add(&mut self, other: PlanCounts) {
+        self.created += other.created;
+        self.updated += other.updated;
+        self.deleted += other.deleted;
+    }
+
+    /// Observation rows written (creates + updates) — what a pass reports.
+    fn written(&self) -> usize {
+        self.created + self.updated
+    }
+}
+
+/// What one pass did.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PassOutcome {
+    /// Whether the pass found queued work (an empty queue is not a pass
+    /// worth reporting).
+    pub ran: bool,
+    /// Observation rows written, the public `consolidate_once` count.
+    pub written: usize,
+    pub counts: PlanCounts,
+}
+
 /// What happened to one dirty entity inside a pass.
 enum EntityStep {
     /// Observations were written and embedded; the entity's dirty row was
     /// cleared.
     Done {
         entity_id: String,
-        observations: usize,
+        counts: PlanCounts,
     },
     /// Fewer than two facts and no existing observations — nothing to
     /// synthesize; the dirty row was cleared (new facts re-dirty it).
@@ -40,13 +75,13 @@ pub(super) async fn consolidate_once(
     e: &Engine,
     bank_id: &str,
     max_entities: usize,
-) -> Result<usize> {
+) -> Result<PassOutcome> {
     if e.store.get_bank(bank_id)?.is_none() {
         return Err(Error::NotFound(format!("bank {bank_id}")));
     }
     let dirty = e.store.list_dirty_entities(bank_id, max_entities.max(1))?;
     if dirty.is_empty() {
-        return Ok(0);
+        return Ok(PassOutcome::default());
     }
     // Soft deadline: no NEW entity work starts once the pass budget
     // elapses; the caller (background worker or eval loop) immediately
@@ -69,7 +104,7 @@ pub(super) async fn consolidate_once(
         futs.push(consolidate_entity(e, bank_id, eid, deadline));
     }
 
-    let mut updated = 0usize;
+    let mut counts = PlanCounts::default();
     let mut failed = 0usize;
     let mut deadline_skips = 0usize;
     let mut done: Vec<String> = vec![];
@@ -81,9 +116,9 @@ pub(super) async fn consolidate_once(
         match step {
             EntityStep::Done {
                 entity_id,
-                observations,
+                counts: entity_counts,
             } => {
-                updated += observations;
+                counts.add(entity_counts);
                 done.push(entity_id);
             }
             EntityStep::Ineligible => {}
@@ -183,7 +218,11 @@ pub(super) async fn consolidate_once(
         }
     }
 
-    Ok(updated)
+    Ok(PassOutcome {
+        ran: true,
+        written: counts.written(),
+        counts,
+    })
 }
 
 /// Consolidate one dirty entity: synthesize (or refine) its observations,
@@ -251,7 +290,7 @@ fn consolidate_entity<'a>(
         let now = e.clock.now_ms();
         let llm = e.llm_for_consolidate();
         let max_facts = e.config.consolidate_max_facts_per_entity.max(1);
-        let mut wrote = 0usize;
+        let mut counts = PlanCounts::default();
         // (observation id, text) pairs needing (re-)embedding, across all
         // of this entity's windows — one batched embed at the end.
         let mut obs_pending: Vec<(String, String)> = vec![];
@@ -291,8 +330,8 @@ fn consolidate_entity<'a>(
                 }
             };
             match apply_consolidation_plan(e, bank_id, eid, window, plan, now).await {
-                Ok((w, pending)) => {
-                    wrote += w;
+                Ok((window_counts, pending)) => {
+                    counts.add(window_counts);
                     obs_pending.extend(pending);
                     // Later windows see earlier windows' observations so the
                     // model UPDATEs/merges instead of re-CREATEing (the
@@ -342,7 +381,7 @@ fn consolidate_entity<'a>(
         }
         EntityStep::Done {
             entity_id: eid.to_string(),
-            observations: wrote,
+            counts,
         }
     })
 }
@@ -418,7 +457,7 @@ async fn apply_consolidation_plan(
     facts: &[Memory],
     plan: ConsolidationPlan,
     now: i64,
-) -> Result<(usize, Vec<(String, String)>)> {
+) -> Result<(PlanCounts, Vec<(String, String)>)> {
     // id -> observation, for update/delete/merge target lookup.
     let mut by_id: HashMap<String, Observation> = e
         .store
@@ -433,7 +472,7 @@ async fn apply_consolidation_plan(
         .map(|(id, o)| (norm_text(&o.text), id.clone()))
         .collect();
 
-    let mut wrote = 0usize;
+    let mut counts = PlanCounts::default();
     // (observation id, text) pairs needing (re-)embedding.
     let mut obs_pending: Vec<(String, String)> = vec![];
 
@@ -464,7 +503,7 @@ async fn apply_consolidation_plan(
         e.store.upsert_observation(&upd)?;
         by_text.insert(norm_text(&upd.text), upd.id.clone());
         by_id.insert(upd.id.clone(), upd);
-        wrote += 1;
+        counts.updated += 1;
     }
 
     // ---- deletes (after updates: merged_into targets carry new text) ----
@@ -486,10 +525,11 @@ async fn apply_consolidation_plan(
                 survivor.proof_count = survivor.evidence.len();
                 survivor.updated_at_ms = now;
                 e.store.upsert_observation(survivor)?;
-                wrote += 1;
+                counts.updated += 1;
             }
         }
         e.store.delete_observation(bank_id, &victim.id)?;
+        counts.deleted += 1;
         by_text.remove(&norm_text(&victim.text));
         by_id.remove(&victim.id);
     }
@@ -560,7 +600,7 @@ async fn apply_consolidation_plan(
                     }
                 }
                 e.store.upsert_observation(obs)?;
-                wrote += 1;
+                counts.updated += 1;
             }
             continue;
         }
@@ -585,10 +625,10 @@ async fn apply_consolidation_plan(
         e.store.upsert_observation(&o)?;
         by_text.insert(norm, id.clone());
         by_id.insert(id, o);
-        wrote += 1;
+        counts.created += 1;
     }
 
-    Ok((wrote, obs_pending))
+    Ok((counts, obs_pending))
 }
 
 /// Clear a dirty row for an entity with nothing to synthesize.

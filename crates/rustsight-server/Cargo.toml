@@ -13,6 +13,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
+# Webhook delivery + signing (RS-10b)
+reqwest = { workspace = true }
+sha2 = { workspace = true }
+url = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }

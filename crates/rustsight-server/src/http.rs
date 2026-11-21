@@ -133,6 +133,9 @@ pub async fn serve(
         )));
     }
     let worker = engine.spawn_worker(consolidate_interval_from_env(), 50);
+    let webhook_settings = Arc::new(crate::webhooks::WebhookSettings::from_env());
+    crate::webhooks::set_settings(Arc::clone(&webhook_settings));
+    let webhooks = crate::webhooks::start(&engine, webhook_settings);
     let resumed = crate::compat::resume_pending_operations(&engine);
     if resumed > 0 {
         eprintln!("rustsight: resuming {resumed} unfinished async retain operation(s)");
@@ -146,6 +149,8 @@ pub async fn serve(
         .map_err(|e| Error::Store(format!("server: {e}")))?;
     worker.abort();
     let _ = worker.await;
+    webhooks.abort();
+    let _ = webhooks.await;
     Ok(())
 }
 

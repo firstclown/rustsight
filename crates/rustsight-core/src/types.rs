@@ -315,6 +315,10 @@ pub struct RetainRequest {
     /// Caller-supplied entities, attached to every fact extracted from this
     /// content alongside the extractor's own (upstream `entities`).
     pub entities: Vec<ExtractedEntity>,
+    /// The operation this retain belongs to, reported on its lifecycle
+    /// events (one id shared by every item of a request). `None` = a fresh
+    /// id per retain.
+    pub operation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -473,6 +477,82 @@ pub struct Operation {
     pub error: Option<String>,
     /// The queued request, so a restart can resume unfinished work.
     pub payload: serde_json::Value,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+/// How a webhook is called (upstream `WebhookHttpConfig`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebhookHttpConfig {
+    /// `GET` or `POST`.
+    #[serde(default = "default_webhook_method")]
+    pub method: String,
+    #[serde(default = "default_webhook_timeout")]
+    pub timeout_seconds: u64,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub params: BTreeMap<String, String>,
+}
+
+fn default_webhook_method() -> String {
+    "POST".into()
+}
+
+fn default_webhook_timeout() -> u64 {
+    30
+}
+
+impl Default for WebhookHttpConfig {
+    fn default() -> Self {
+        Self {
+            method: default_webhook_method(),
+            timeout_seconds: default_webhook_timeout(),
+            headers: BTreeMap::new(),
+            params: BTreeMap::new(),
+        }
+    }
+}
+
+/// A registered webhook (RS-10b). `bank_id: None` is a global webhook.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Webhook {
+    pub id: String,
+    pub bank_id: Option<String>,
+    pub url: String,
+    pub secret: Option<String>,
+    pub event_types: Vec<String>,
+    pub enabled: bool,
+    pub http_config: WebhookHttpConfig,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+/// One event queued for one webhook. The URL, secret and HTTP config are
+/// captured when the event fires, so later edits to the webhook do not
+/// rewrite deliveries already in flight (upstream's task payload).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebhookDelivery {
+    pub id: String,
+    /// `None` for the global (env-configured) webhook.
+    pub webhook_id: Option<String>,
+    pub bank_id: String,
+    pub event_id: String,
+    pub event_type: String,
+    pub url: String,
+    pub secret: Option<String>,
+    pub http_config: WebhookHttpConfig,
+    /// The exact body sent (and signed).
+    pub payload: String,
+    /// `pending` | `completed` | `failed`.
+    pub status: String,
+    /// Failed attempts so far; upstream reports `attempts = retry_count + 1`.
+    pub retry_count: u32,
+    pub next_attempt_at_ms: i64,
+    pub last_error: Option<String>,
+    pub last_response_status: Option<u16>,
+    pub last_response_body: Option<String>,
+    pub last_attempt_at_ms: Option<i64>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }

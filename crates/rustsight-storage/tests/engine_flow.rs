@@ -3458,3 +3458,128 @@ async fn memory_defense_malformed_policy_fails_closed() {
     assert!(matches!(err, Error::BadInput(_)), "{err:?}");
     assert!(!stored_text(&e, "bad").contains(GH_TOKEN));
 }
+
+// ── RS-10b: lifecycle events ─────────────────────────────────────────────
+
+#[derive(Default)]
+struct CaptureSink(std::sync::Mutex<Vec<events::EngineEvent>>);
+
+impl events::EventSink for CaptureSink {
+    fn emit(&self, event: &events::EngineEvent) {
+        self.0.lock().unwrap().push(event.clone());
+    }
+}
+
+impl CaptureSink {
+    fn of(&self, t: events::EventType) -> Vec<events::EngineEvent> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.event == t)
+            .cloned()
+            .collect()
+    }
+}
+
+#[tokio::test]
+async fn events_report_retain_consolidation_and_defense() {
+    use events::{EventData, EventType};
+    let script = MockLlm::script(vec![
+        facts_resp(&[
+            ("Alice joined Google as an engineer.", "Alice"),
+            ("Alice works on search infrastructure.", "Alice"),
+        ]),
+        LlmResponse {
+            content: Some(
+                r#"{"observations":[{"text":"Alice works at Google on search.","evidence":[{"fact_index":0,"quote":""}]}]}"#
+                    .into(),
+            ),
+            tool_calls: vec![],
+        },
+    ]);
+    let sink = Arc::new(CaptureSink::default());
+    let e = Engine::new(
+        Arc::new(SqliteStore::open_in_memory().unwrap()),
+        Arc::new(script),
+        Arc::new(MockEmbed::default()),
+        Arc::new(MockRerank),
+        Arc::new(SimpleTokenEstimator),
+        Arc::new(FixedClock::new(1_800_000_000_000)),
+    )
+    .with_event_sink(sink.clone());
+
+    set_defense(&e, "ev", "redact", true);
+    e.retain(RetainRequest {
+        bank_id: "ev".into(),
+        content: format!("Alice joined Google as an engineer. Token {GH_TOKEN}."),
+        document_id: Some("doc-1".into()),
+        tags: vec!["team".into()],
+        operation_id: Some("op-1".into()),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let retained = sink.of(EventType::RetainCompleted);
+    assert_eq!(retained.len(), 1);
+    let r = &retained[0];
+    assert_eq!(
+        (r.bank_id.as_str(), r.operation_id.as_str()),
+        ("ev", "op-1")
+    );
+    assert_eq!(r.status, "completed");
+    assert_eq!(
+        r.data,
+        EventData::Retain {
+            document_id: Some("doc-1".into()),
+            tags: Some(vec!["team".into()]),
+            memory_unit_count: Some(2),
+        }
+    );
+    let defended = sink.of(EventType::MemoryDefenseTriggered);
+    assert_eq!(defended.len(), 1);
+    assert_eq!(defended[0].status, "redact");
+    assert_eq!(defended[0].operation_id, "op-1");
+    let wire: serde_json::Value = serde_json::from_str(&defended[0].wire_json()).unwrap();
+    assert_eq!(wire["event"], "memory_defense.triggered");
+    assert_eq!(wire["data"]["document_id"], "doc-1");
+    assert_eq!(wire["data"]["matched_types"], json!(["github_token"]));
+    assert_eq!(wire["data"]["hits"][0]["preview"], "ghp_...6789");
+    assert!(!defended[0].wire_json().contains(GH_TOKEN));
+
+    // A pass with work is reported; a pass over the drained queue is not.
+    assert_eq!(e.consolidate_once("ev", 10).await.unwrap(), 1);
+    assert_eq!(e.consolidate_once("ev", 10).await.unwrap(), 0);
+    let consolidated = sink.of(EventType::ConsolidationCompleted);
+    assert_eq!(consolidated.len(), 1);
+    assert_eq!(consolidated[0].status, "completed");
+    assert_eq!(
+        consolidated[0].data,
+        EventData::Consolidation {
+            observations_created: Some(1),
+            observations_updated: Some(0),
+            observations_deleted: Some(0),
+            error_message: None,
+        }
+    );
+}
+
+#[tokio::test]
+async fn blocked_retain_reports_defense_but_not_completion() {
+    let sink = Arc::new(CaptureSink::default());
+    let e = engine().with_event_sink(sink.clone());
+    set_defense(&e, "evb", "block", true);
+    let err = e
+        .retain(RetainRequest {
+            bank_id: "evb".into(),
+            content: format!("token {GH_TOKEN}"),
+            ..Default::default()
+        })
+        .await;
+    assert!(err.is_err());
+    assert!(sink.of(events::EventType::RetainCompleted).is_empty());
+    let blocked = sink.of(events::EventType::MemoryDefenseTriggered);
+    assert_eq!(blocked.len(), 1);
+    assert_eq!(blocked[0].status, "block");
+}

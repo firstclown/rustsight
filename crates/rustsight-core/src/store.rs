@@ -229,6 +229,33 @@ pub trait MemoryStore: Send + Sync {
         offset: usize,
     ) -> Result<(Vec<Operation>, usize)>;
 
+    /// Insert or replace a webhook by id (RS-10b).
+    fn upsert_webhook(&self, w: &Webhook) -> Result<()>;
+    fn get_webhook(&self, bank_id: &str, id: &str) -> Result<Option<Webhook>>;
+    /// A bank's webhooks, oldest first, with the bank's total count.
+    fn list_webhooks(
+        &self,
+        bank_id: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<Webhook>, usize)>;
+    /// Remove a webhook and its still-pending deliveries; false if absent.
+    fn delete_webhook(&self, bank_id: &str, id: &str) -> Result<bool>;
+    fn upsert_webhook_delivery(&self, d: &WebhookDelivery) -> Result<()>;
+    /// Pending deliveries due at `now_ms`, oldest due first.
+    fn due_webhook_deliveries(&self, now_ms: i64, limit: usize) -> Result<Vec<WebhookDelivery>>;
+    /// When the earliest pending delivery is due, if any.
+    fn next_webhook_delivery_at(&self) -> Result<Option<i64>>;
+    /// A webhook's deliveries, newest first, created strictly before
+    /// `before` (`(created_at_ms, id)`) when given.
+    fn list_webhook_deliveries(
+        &self,
+        bank_id: &str,
+        webhook_id: &str,
+        limit: usize,
+        before: Option<(i64, String)>,
+    ) -> Result<Vec<WebhookDelivery>>;
+
     fn upsert_mental_model(&self, m: &MentalModel) -> Result<()>;
     fn list_mental_models(&self, bank_id: &str) -> Result<Vec<MentalModel>>;
     fn delete_mental_model(&self, id: &str) -> Result<()>;

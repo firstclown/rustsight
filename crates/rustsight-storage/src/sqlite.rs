@@ -184,6 +184,40 @@ CREATE TABLE IF NOT EXISTS chunks(
   PRIMARY KEY(bank_id, id)
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_document ON chunks(bank_id, document_id, chunk_index);
+CREATE TABLE IF NOT EXISTS webhooks(
+  id TEXT PRIMARY KEY,
+  bank_id TEXT,
+  url TEXT NOT NULL,
+  secret TEXT,
+  event_types_json TEXT NOT NULL DEFAULT '[]',
+  enabled INTEGER NOT NULL DEFAULT 1,
+  http_config_json TEXT NOT NULL DEFAULT '{}',
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_webhooks_bank ON webhooks(bank_id, created_at_ms);
+CREATE TABLE IF NOT EXISTS webhook_deliveries(
+  id TEXT PRIMARY KEY,
+  webhook_id TEXT,
+  bank_id TEXT NOT NULL,
+  event_id TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  url TEXT NOT NULL,
+  secret TEXT,
+  http_config_json TEXT NOT NULL DEFAULT '{}',
+  payload TEXT NOT NULL,
+  status TEXT NOT NULL,
+  retry_count INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at_ms INTEGER NOT NULL,
+  last_error TEXT,
+  last_response_status INTEGER,
+  last_response_body TEXT,
+  last_attempt_at_ms INTEGER,
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_deliveries_due ON webhook_deliveries(status, next_attempt_at_ms);
+CREATE INDEX IF NOT EXISTS idx_deliveries_webhook ON webhook_deliveries(bank_id, webhook_id, created_at_ms);
 CREATE TABLE IF NOT EXISTS mental_models(
   id TEXT PRIMARY KEY,
   bank_id TEXT NOT NULL,
@@ -194,6 +228,63 @@ CREATE TABLE IF NOT EXISTS mental_models(
   created_at_ms INTEGER NOT NULL
 );
 "#;
+
+const WEBHOOK_COLS: &str = "id, bank_id, url, secret, event_types_json, enabled, http_config_json, created_at_ms, updated_at_ms";
+
+const DELIVERY_COLS: &str = "id, webhook_id, bank_id, event_id, event_type, url, secret, http_config_json, payload, status, retry_count, next_attempt_at_ms, last_error, last_response_status, last_response_body, last_attempt_at_ms, created_at_ms, updated_at_ms";
+
+fn json_err(e: serde_json::Error) -> Error {
+    Error::Store(format!("json: {e}"))
+}
+
+/// A JSON column that fails to decode surfaces as a row error rather
+/// than a silently defaulted value.
+fn json_col<T: serde::de::DeserializeOwned>(
+    row: &rusqlite::Row,
+    idx: usize,
+) -> rusqlite::Result<T> {
+    let raw: String = row.get(idx)?;
+    serde_json::from_str(&raw).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(idx, rusqlite::types::Type::Text, Box::new(e))
+    })
+}
+
+fn row_webhook(r: &rusqlite::Row) -> rusqlite::Result<Webhook> {
+    Ok(Webhook {
+        id: r.get(0)?,
+        bank_id: r.get(1)?,
+        url: r.get(2)?,
+        secret: r.get(3)?,
+        event_types: json_col(r, 4)?,
+        enabled: r.get(5)?,
+        http_config: json_col(r, 6)?,
+        created_at_ms: r.get(7)?,
+        updated_at_ms: r.get(8)?,
+    })
+}
+
+fn row_delivery(r: &rusqlite::Row) -> rusqlite::Result<WebhookDelivery> {
+    Ok(WebhookDelivery {
+        id: r.get(0)?,
+        webhook_id: r.get(1)?,
+        bank_id: r.get(2)?,
+        event_id: r.get(3)?,
+        event_type: r.get(4)?,
+        url: r.get(5)?,
+        secret: r.get(6)?,
+        http_config: json_col(r, 7)?,
+        payload: r.get(8)?,
+        status: r.get(9)?,
+        retry_count: r.get(10)?,
+        next_attempt_at_ms: r.get(11)?,
+        last_error: r.get(12)?,
+        last_response_status: r.get(13)?,
+        last_response_body: r.get(14)?,
+        last_attempt_at_ms: r.get(15)?,
+        created_at_ms: r.get(16)?,
+        updated_at_ms: r.get(17)?,
+    })
+}
 
 fn emb_to_blob(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
@@ -1979,11 +2070,13 @@ impl MemoryStore for SqliteStore {
     fn delete_bank(&self, bank_id: &str) -> Result<BankDeletion> {
         let mut conn = self.lock_conn();
         let tx = conn.transaction().map_err(store_err)?;
-        tx.execute(
+        for sql in [
             "DELETE FROM operations WHERE bank_id = ?1",
-            params![bank_id],
-        )
-        .map_err(store_err)?;
+            "DELETE FROM webhooks WHERE bank_id = ?1",
+            "DELETE FROM webhook_deliveries WHERE bank_id = ?1",
+        ] {
+            tx.execute(sql, params![bank_id]).map_err(store_err)?;
+        }
         let exists = tx
             .prepare("SELECT 1 FROM banks WHERE id = ?1")
             .and_then(|mut st| st.exists(params![bank_id]))
@@ -2083,6 +2176,180 @@ impl MemoryStore for SqliteStore {
             }
         }
         out.extend(derived);
+        Ok(out)
+    }
+
+    fn upsert_webhook(&self, w: &Webhook) -> Result<()> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "INSERT OR REPLACE INTO webhooks(id, bank_id, url, secret, event_types_json, enabled, http_config_json, created_at_ms, updated_at_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                w.id,
+                w.bank_id,
+                w.url,
+                w.secret,
+                serde_json::to_string(&w.event_types).map_err(json_err)?,
+                w.enabled,
+                serde_json::to_string(&w.http_config).map_err(json_err)?,
+                w.created_at_ms,
+                w.updated_at_ms
+            ],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    fn get_webhook(&self, bank_id: &str, id: &str) -> Result<Option<Webhook>> {
+        let conn = self.lock_conn();
+        conn.query_row(
+            &format!("SELECT {WEBHOOK_COLS} FROM webhooks WHERE bank_id = ?1 AND id = ?2"),
+            params![bank_id, id],
+            row_webhook,
+        )
+        .optional()
+        .map_err(store_err)
+    }
+
+    fn list_webhooks(
+        &self,
+        bank_id: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<Webhook>, usize)> {
+        let conn = self.lock_conn();
+        let total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM webhooks WHERE bank_id = ?1",
+                params![bank_id],
+                |r| r.get(0),
+            )
+            .map_err(store_err)?;
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {WEBHOOK_COLS} FROM webhooks WHERE bank_id = ?1
+                 ORDER BY created_at_ms, id LIMIT ?2 OFFSET ?3"
+            ))
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![bank_id, limit as i64, offset as i64], row_webhook)
+            .map_err(store_err)?;
+        let mut out = vec![];
+        for r in rows {
+            out.push(r.map_err(store_err)?);
+        }
+        Ok((out, total as usize))
+    }
+
+    fn delete_webhook(&self, bank_id: &str, id: &str) -> Result<bool> {
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction().map_err(store_err)?;
+        let n = tx
+            .execute(
+                "DELETE FROM webhooks WHERE bank_id = ?1 AND id = ?2",
+                params![bank_id, id],
+            )
+            .map_err(store_err)?;
+        // Nothing left to deliver to; finished rows stay as history.
+        tx.execute(
+            "DELETE FROM webhook_deliveries WHERE bank_id = ?1 AND webhook_id = ?2 AND status = 'pending'",
+            params![bank_id, id],
+        )
+        .map_err(store_err)?;
+        tx.commit().map_err(store_err)?;
+        Ok(n > 0)
+    }
+
+    fn upsert_webhook_delivery(&self, d: &WebhookDelivery) -> Result<()> {
+        let conn = self.lock_conn();
+        conn.execute(
+            &format!(
+                "INSERT OR REPLACE INTO webhook_deliveries({DELIVERY_COLS})
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)"
+            ),
+            params![
+                d.id,
+                d.webhook_id,
+                d.bank_id,
+                d.event_id,
+                d.event_type,
+                d.url,
+                d.secret,
+                serde_json::to_string(&d.http_config).map_err(json_err)?,
+                d.payload,
+                d.status,
+                d.retry_count,
+                d.next_attempt_at_ms,
+                d.last_error,
+                d.last_response_status,
+                d.last_response_body,
+                d.last_attempt_at_ms,
+                d.created_at_ms,
+                d.updated_at_ms
+            ],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    fn due_webhook_deliveries(&self, now_ms: i64, limit: usize) -> Result<Vec<WebhookDelivery>> {
+        let conn = self.lock_conn();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {DELIVERY_COLS} FROM webhook_deliveries
+                 WHERE status = 'pending' AND next_attempt_at_ms <= ?1
+                 ORDER BY next_attempt_at_ms, created_at_ms, id LIMIT ?2"
+            ))
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![now_ms, limit as i64], row_delivery)
+            .map_err(store_err)?;
+        let mut out = vec![];
+        for r in rows {
+            out.push(r.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
+    fn next_webhook_delivery_at(&self) -> Result<Option<i64>> {
+        let conn = self.lock_conn();
+        conn.query_row(
+            "SELECT MIN(next_attempt_at_ms) FROM webhook_deliveries WHERE status = 'pending'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(store_err)
+    }
+
+    fn list_webhook_deliveries(
+        &self,
+        bank_id: &str,
+        webhook_id: &str,
+        limit: usize,
+        before: Option<(i64, String)>,
+    ) -> Result<Vec<WebhookDelivery>> {
+        let conn = self.lock_conn();
+        let (before_ms, before_id) = before.unwrap_or((i64::MAX, String::new()));
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {DELIVERY_COLS} FROM webhook_deliveries
+                 WHERE bank_id = ?1 AND webhook_id = ?2
+                   AND (created_at_ms < ?3 OR (created_at_ms = ?3 AND id < ?4))
+                 ORDER BY created_at_ms DESC, id DESC LIMIT ?5"
+            ))
+            .map_err(store_err)?;
+        // `id < ''` is never true, so the unbounded first page relies on
+        // created_at_ms < i64::MAX alone.
+        let rows = stmt
+            .query_map(
+                params![bank_id, webhook_id, before_ms, before_id, limit as i64],
+                row_delivery,
+            )
+            .map_err(store_err)?;
+        let mut out = vec![];
+        for r in rows {
+            out.push(r.map_err(store_err)?);
+        }
         Ok(out)
     }
 

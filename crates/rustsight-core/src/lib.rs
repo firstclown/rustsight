@@ -2,6 +2,7 @@ pub mod defense;
 mod engine;
 mod entity;
 mod error;
+pub mod events;
 mod fusion;
 pub mod labels;
 mod links;

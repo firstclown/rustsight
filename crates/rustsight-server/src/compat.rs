@@ -100,6 +100,7 @@ pub fn public_routes() -> Router {
 /// Bank-scoped routes; the caller wraps them in the token middleware.
 pub fn routes() -> Router<Arc<Engine>> {
     Router::new()
+        .merge(crate::webhooks::routes())
         .route("/v1/default/banks", get(list_banks))
         .route(
             "/v1/default/banks/{bank_id}",
@@ -144,19 +145,19 @@ pub fn routes() -> Router<Arc<Engine>> {
 pub struct ApiError(StatusCode, String, Option<Value>);
 
 impl ApiError {
-    fn new(status: StatusCode, msg: impl Into<String>) -> Self {
+    pub(crate) fn new(status: StatusCode, msg: impl Into<String>) -> Self {
         Self(status, msg.into(), None)
     }
 
-    fn bad_request(msg: impl Into<String>) -> Self {
+    pub(crate) fn bad_request(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, msg)
     }
 
-    fn unprocessable(msg: impl Into<String>) -> Self {
+    pub(crate) fn unprocessable(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::UNPROCESSABLE_ENTITY, msg)
     }
 
-    fn not_found(msg: impl Into<String>) -> Self {
+    pub(crate) fn not_found(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, msg)
     }
 }
@@ -194,7 +195,7 @@ type ApiResult = Result<Json<Value>, ApiError>;
 
 /// ms-epoch → ISO 8601 with a UTC offset, the form Python's
 /// `datetime.isoformat()` produces upstream (`2024-01-15T10:30:00+00:00`).
-fn iso(ms: i64) -> Option<String> {
+pub(crate) fn iso(ms: i64) -> Option<String> {
     DateTime::<Utc>::from_timestamp_millis(ms).map(|dt| dt.to_rfc3339())
 }
 
@@ -286,6 +287,9 @@ async fn openapi() -> Json<Value> {
             (format!("{bank}/operations")): { "get": {} },
             (format!("{bank}/operations/{{operation_id}}")): { "get": {} },
             (format!("{bank}/operations/{{operation_id}}/retry")): { "post": {} },
+            (format!("{bank}/webhooks")): { "get": {}, "post": {} },
+            (format!("{bank}/webhooks/{{webhook_id}}")): { "patch": {}, "delete": {} },
+            (format!("{bank}/webhooks/{{webhook_id}}/deliveries")): { "get": {} },
         },
         "components": { "schemas": { "RecallRequest": {
             "type": "object",
@@ -866,6 +870,7 @@ fn blocked_items(
     engine: &Engine,
     bank_id: &str,
     items: &[Value],
+    operation_id: &str,
 ) -> Result<HashSet<usize>, ApiError> {
     use rustsight_core::defense::{parse_policy, screen, DefenseAction};
     let config = engine.store.bank_config(bank_id)?;
@@ -878,6 +883,13 @@ fn blocked_items(
         let item = parse_item(raw, index)?;
         let decision = screen(&policy, &item.content);
         if decision.action == DefenseAction::Block {
+            // Dropped items never reach Engine::retain, so report them here.
+            engine.emit_defense(
+                bank_id,
+                operation_id,
+                item.document_id.as_deref(),
+                &decision,
+            );
             violations.push(json!({
                 "index": index,
                 "detector": decision.detector,
@@ -911,8 +923,9 @@ async fn run_retain(
     bank_id: &str,
     items: &[Value],
     document_tags: &[String],
+    operation_id: &str,
 ) -> Result<usize, ApiError> {
-    let blocked = blocked_items(engine, bank_id, items)?;
+    let blocked = blocked_items(engine, bank_id, items, operation_id)?;
     let mut seen_documents: HashSet<String> = HashSet::new();
     for (index, raw) in items.iter().enumerate() {
         if blocked.contains(&index) {
@@ -948,6 +961,7 @@ async fn run_retain(
                     tags,
                     metadata: item.metadata,
                     entities: item.entities,
+                    operation_id: Some(operation_id.to_string()),
                 },
             )
             .await?;
@@ -990,7 +1004,8 @@ fn spawn_operation(engine: Arc<Engine>, op: Operation) {
             "document_tags",
         )
         .unwrap_or_default();
-        let outcome = run_retain(&engine, &guard, &op.bank_id, &items, &document_tags).await;
+        let outcome =
+            run_retain(&engine, &guard, &op.bank_id, &items, &document_tags, &op.id).await;
         if let Err(ApiError(_, detail, _)) = &outcome {
             eprintln!(
                 "rustsight: async retain {} (bank {}) failed: {detail}",
@@ -1037,7 +1052,17 @@ async fn retain(
 
     if !body.is_async {
         let guard = engine.bank_read(&bank_id).await;
-        let count = run_retain(&engine, &guard, &bank_id, &body.items, &document_tags).await?;
+        // One id for every item of the request, as upstream's retain events.
+        let operation_id = uuid::Uuid::new_v4().simple().to_string();
+        let count = run_retain(
+            &engine,
+            &guard,
+            &bank_id,
+            &body.items,
+            &document_tags,
+            &operation_id,
+        )
+        .await?;
         return Ok(Json(json!({
             "success": true,
             "bank_id": bank_id,

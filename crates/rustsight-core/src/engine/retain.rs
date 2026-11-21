@@ -1,6 +1,7 @@
 use crate::engine::chunks::{merge_chunk_facts, split_chunks, split_half, OVERLAP_DEDUP_THRESHOLD};
 use crate::engine::{with_retry, Engine, EngineConfig};
 use crate::entity::{collapse_ws, normalize_name, score_candidate};
+use crate::events::{EngineEvent, EventData, EventType};
 use crate::labels::BankLabels;
 use crate::prompts::extraction::{
     build_extraction_messages, parse_extraction_with_reference, ExtractionConfig,
@@ -28,10 +29,62 @@ type ChunkFut<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<ExtractedFact>>> + Send + 'a>>;
 
 pub(super) async fn retain(e: &Engine, mut req: RetainRequest) -> Result<RetainResponse> {
-    let defense = screen_content(e, &mut req)?;
+    let operation_id = req
+        .operation_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+    let defense = screen_content(e, &mut req, &operation_id)?;
+    let bank_id = req.bank_id.clone();
+    let tags = req.tags.clone();
     let mut resp = retain_screened(e, req).await?;
     resp.defense = defense;
+    // retain.completed, once the memories are durable. The count is asked
+    // of the store so it is the document's total after an append.
+    let count = match &resp.document_id {
+        Some(doc) => Some(e.store.count_document_memories(&bank_id, doc)?),
+        None => None,
+    };
+    e.emit(EngineEvent::new(
+        EventType::RetainCompleted,
+        &bank_id,
+        &operation_id,
+        "completed",
+        e.clock.now_ms(),
+        EventData::Retain {
+            document_id: resp.document_id.clone(),
+            tags: Some(tags),
+            memory_unit_count: count,
+        },
+    ));
     Ok(resp)
+}
+
+/// `memory_defense.triggered` for a non-allow decision (upstream
+/// `_fire_memory_defense_webhook`). Public through `Engine` so a batch
+/// front end that drops blocked items before retaining can report them.
+pub(crate) fn defense_event(
+    e: &Engine,
+    bank_id: &str,
+    operation_id: &str,
+    document_id: Option<&str>,
+    decision: &crate::defense::DefenseDecision,
+) -> EngineEvent {
+    let nonempty = |v: &Vec<String>| (!v.is_empty()).then(|| v.clone());
+    EngineEvent::new(
+        EventType::MemoryDefenseTriggered,
+        bank_id,
+        operation_id,
+        decision.action.as_str(),
+        e.clock.now_ms(),
+        EventData::MemoryDefense {
+            action: decision.action.as_str().to_string(),
+            detector: decision.detector.clone(),
+            document_id: document_id.map(str::to_string),
+            matched_types: nonempty(&decision.matched_types),
+            message: Some(decision.message.clone()).filter(|m| !m.is_empty()),
+            hits: Some(decision.hits.clone()).filter(|h| !h.is_empty()),
+        },
+    )
 }
 
 /// Memory Defense pre-parse hook (RS-10a): screen the content under the
@@ -43,6 +96,7 @@ pub(super) async fn retain(e: &Engine, mut req: RetainRequest) -> Result<RetainR
 fn screen_content(
     e: &Engine,
     req: &mut RetainRequest,
+    operation_id: &str,
 ) -> Result<Option<crate::defense::DefenseReport>> {
     use crate::defense::{parse_policy, screen, DefenseAction, DefenseReport};
     let config = e.store.bank_config(&req.bank_id)?;
@@ -51,6 +105,15 @@ fn screen_content(
         return Ok(None);
     }
     let decision = screen(&policy, &req.content);
+    if decision.action != DefenseAction::Allow {
+        e.emit(defense_event(
+            e,
+            &req.bank_id,
+            operation_id,
+            req.document_id.as_deref(),
+            &decision,
+        ));
+    }
     match decision.action {
         DefenseAction::Allow => Ok(None),
         DefenseAction::Redact => {

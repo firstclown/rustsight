@@ -7,6 +7,7 @@ mod reflect;
 mod retain;
 mod scoring;
 
+use crate::events::{EngineEvent, EventSink};
 use crate::prompts::extraction::ExtractionConfig;
 use crate::traits::{Clock, EmbedProvider, LlmProvider, RerankProvider, TokenEstimator};
 use crate::types::*;
@@ -168,6 +169,9 @@ pub struct Engine {
     pub(crate) consolidate_lock: Mutex<()>,
     /// Keeps bank deletion from interleaving with work writing to the bank.
     pub(crate) bank_gates: Arc<BankGates>,
+    /// Lifecycle event receiver (RS-10b); unset drops events. Settable
+    /// once, also after the engine is shared (`set_event_sink`).
+    events: std::sync::OnceLock<Arc<dyn EventSink>>,
 }
 
 impl Engine {
@@ -193,6 +197,50 @@ impl Engine {
             wakeup: Notify::new(),
             consolidate_lock: Mutex::new(()),
             bank_gates: Arc::default(),
+            events: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Route lifecycle events (retain / consolidation / memory defense) to
+    /// `sink` — the server's webhook dispatcher, or an embedder's own.
+    pub fn with_event_sink(self, sink: Arc<dyn EventSink>) -> Self {
+        let _ = self.events.set(sink);
+        self
+    }
+
+    /// Install the event sink on an engine that is already shared (a
+    /// server that receives an `Arc<Engine>`). Errs with the sink back if
+    /// one is already installed.
+    pub fn set_event_sink(
+        &self,
+        sink: Arc<dyn EventSink>,
+    ) -> std::result::Result<(), Arc<dyn EventSink>> {
+        self.events.set(sink)
+    }
+
+    /// Report a non-allow Memory Defense decision made outside
+    /// `Engine::retain` (a batch front end that drops blocked items before
+    /// retaining them) as `memory_defense.triggered`.
+    pub fn emit_defense(
+        &self,
+        bank_id: &str,
+        operation_id: &str,
+        document_id: Option<&str>,
+        decision: &crate::defense::DefenseDecision,
+    ) {
+        self.emit(retain::defense_event(
+            self,
+            bank_id,
+            operation_id,
+            document_id,
+            decision,
+        ));
+    }
+
+    /// Report an event to the configured sink, if any.
+    pub fn emit(&self, event: EngineEvent) {
+        if let Some(sink) = self.events.get() {
+            sink.emit(&event);
         }
     }
 
@@ -382,12 +430,50 @@ impl Engine {
             Duration::from_secs(wall),
             consolidate::consolidate_once(self, bank_id, max_entities),
         );
-        match pass.await {
+        let result = match pass.await {
             Ok(result) => result,
             Err(_elapsed) => Err(Error::Llm(format!(
                 "consolidation pass for bank {bank_id} timed out after {wall}s"
             ))),
-        }
+        };
+        self.emit_consolidation(bank_id, &result);
+        result.map(|outcome| outcome.written)
+    }
+
+    /// `consolidation.completed` for a pass that had work (upstream fires
+    /// one per consolidation job; a pass over an empty queue is no job).
+    fn emit_consolidation(&self, bank_id: &str, result: &Result<consolidate::PassOutcome>) {
+        let (status, data) = match result {
+            Ok(outcome) if !outcome.ran => return,
+            Ok(outcome) => (
+                "completed",
+                crate::events::EventData::Consolidation {
+                    observations_created: Some(outcome.counts.created),
+                    observations_updated: Some(outcome.counts.updated),
+                    observations_deleted: Some(outcome.counts.deleted),
+                    error_message: None,
+                },
+            ),
+            // A bank deleted mid-pass has no one left to tell.
+            Err(Error::NotFound(_)) => return,
+            Err(err) => (
+                "failed",
+                crate::events::EventData::Consolidation {
+                    observations_created: None,
+                    observations_updated: None,
+                    observations_deleted: None,
+                    error_message: Some(err.to_string()),
+                },
+            ),
+        };
+        self.emit(EngineEvent::new(
+            crate::events::EventType::ConsolidationCompleted,
+            bank_id,
+            &uuid::Uuid::new_v4().to_string(),
+            status,
+            self.clock.now_ms(),
+            data,
+        ));
     }
 
     /// Wake the background worker without blocking (used by `retain`).

@@ -2,6 +2,7 @@ pub mod auth;
 pub mod compat;
 pub mod http;
 pub mod mcp;
+pub mod webhooks;
 
 use std::time::Duration;
 

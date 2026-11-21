@@ -676,12 +676,12 @@ retry). What is missing is the event side.
   `PATCH/DELETE …/webhooks/{webhook_id}`, `GET …/{webhook_id}/deliveries`.
 
 DoD:
-- [ ] engine_flow: a capturing sink sees retain, consolidation and defense
+- [x] engine_flow: a capturing sink sees retain, consolidation and defense
       events with the upstream payload fields.
-- [ ] server tests: CRUD + validation (SSRF, unknown event type), signed
+- [x] server tests: CRUD + validation (SSRF, unknown event type), signed
       delivery to a local receiver (allowlisted), retry scheduling after a
       500, deliveries listing.
-- [ ] docs/reference.md env vars + compat matrix.
+- [x] docs/reference.md env vars + compat matrix.
 
 ### RS-10c — File ingest + attachments · M
 

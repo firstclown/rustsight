@@ -98,7 +98,7 @@ Five crates; dependency flow: `core` ← `storage`/`providers` ← `server` ←
 | rustsight-core | `crates/rustsight-core` | Types, `MemoryStore` trait, provider traits, prompts, engine pipelines (retain/recall/reflect/consolidate/mental) |
 | rustsight-storage | `crates/rustsight-storage` | `SqliteStore`: single SQLite file, WAL, FTS5 BM25, sqlite-vec KNN index over BLOB embeddings (`vector.rs`, brute-force fallback), typed edge graph |
 | rustsight-providers | `crates/rustsight-providers` | `OpenAiCompat` LLM/embeddings over HTTP, `ApiRerank` (Jina/Cohere-style `/rerank`), `NoopRerank`, and all mocks (`MockLlm`, `MockEmbed`, `MockRerank`, `SimpleTokenEstimator`) |
-| rustsight-server | `crates/rustsight-server` | axum HTTP router (`http.rs`) + stdio JSON-RPC MCP server (`mcp.rs`); both spawn the consolidation worker |
+| rustsight-server | `crates/rustsight-server` | axum HTTP router (`http.rs`) + stdio JSON-RPC MCP server (`mcp.rs`); both spawn the consolidation worker and the webhook delivery worker (`webhooks.rs`) |
 | rustsight-cli | `crates/rustsight-cli` | Binary `rustsight`: serve/mcp/retain/recall/reflect/consolidate/inspect/banks/bank-set/mental-model/reindex |
 
 Key source map:
@@ -220,6 +220,12 @@ Key source map:
   A malformed policy fails the retain — never skip screening (fail closed).
   The pattern catalog is held to upstream by `memory_defense_parity.rs`;
   regenerate with `scripts/defense-goldens`, never hand-edit the fixture.
+- **Events are emitted after the work they report is durable**
+  (`Engine::emit`, `events.rs`, RS-10b): `retain.completed` after the
+  memories are stored, `consolidation.completed` once per pass that found
+  work, `memory_defense.triggered` for every redact/block. Sinks run
+  synchronously, so they must only queue (the webhook sink writes delivery
+  rows) — never make network calls inside `EventSink::emit`.
 - **`enable_observations: false` gates consolidation, not retain.** Dirty
   entities keep queueing so re-enabling catches up.
 - **Embeddings are mirrored write-through into the vec0 index** (RS-7,
@@ -285,6 +291,10 @@ Env vars, read in `crates/rustsight-providers/src/env.rs`:
 - `RUSTSIGHT_ASYNC_RETAIN_CONCURRENCY` (default 2, clamped 1–64; async
   retains running at once through the compat API, invalid values fall back
   to default with a warning)
+- `RUSTSIGHT_WEBHOOK_URL` / `_SECRET` / `_EVENT_TYPES`,
+  `RUSTSIGHT_WEBHOOK_ALLOWED_HOSTS`, `RUSTSIGHT_WEBHOOK_EXPOSE_RESPONSE_BODY`
+  (RS-10b; read in `crates/rustsight-server/src/webhooks.rs`, each also
+  answers to `HINDSIGHT_API_*`).
 - `RUSTSIGHT_API_TOKEN` / `RUSTSIGHT_API_TOKEN_FILE` (optional; bearer-token
   auth for the HTTP API — without one, `serve` refuses non-loopback binds
   unless `--allow-unauth`. MCP stdio needs no auth.)
