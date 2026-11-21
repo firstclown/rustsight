@@ -113,7 +113,8 @@ the official clients (`@vectorize-io/hindsight-client`,
 use FastAPI's `{"detail": "..."}` body. The native API (`/banks/...`) is
 untouched and served side by side.
 
-    GET    /health, /version, /openapi.json                (public)
+    GET    /health, /version                               (public)
+    GET    /openapi.json                                   (public; see below)
     GET    /v1/default/banks
     PUT    /v1/default/banks/{bank_id}                     create/update (PATCH too)
     DELETE /v1/default/banks/{bank_id}                     delete bank and contents
@@ -196,6 +197,28 @@ Behavioral differences to know before swapping:
 - Not implemented: mental-model / page / directive / webhook / file-upload
   endpoints, cancelling or deleting operations, the HTTP MCP endpoint, opinions
   via this API (a rustsight-native kind, never returned here).
+
+## OpenAPI description
+`GET /openapi.json` (public, no token) returns one OpenAPI 3.1 document for
+both surfaces:
+
+- **Native API** (`/healthz`, `/banks/...`): fully described — request
+  bodies (`Native*Request` schemas), response shapes, error codes, and the
+  bearer-token security scheme. The source is the hand-written
+  `crates/rustsight-server/openapi.json`; tests in `http.rs` fail if it
+  drifts from the router (paths and methods), from the request-body
+  structs (field names and which are required), or from the core types'
+  serialized fields and enum values.
+- **Hindsight-compatible API** (`/v1/default/...`): paths only, plus the
+  `RecallRequest` field list. A recall field is listed only when rustsight
+  acts on it, so clients that probe the document for a feature get an
+  honest answer. `info.version` stays the Hindsight API version (`1.1.0`).
+
+Native request bodies refuse fields they do not know with a 422 (for
+example ``unknown field `kinds` ``) instead of ignoring them, so the schemas
+list every field the server acts on and nothing else. Adding a native route
+or body field means adding it to `openapi.json` too; the tests point at
+whatever is missing.
 
 ## HTTP API authentication
 Set `RUSTSIGHT_API_TOKEN` (or point `RUSTSIGHT_API_TOKEN_FILE` at a file

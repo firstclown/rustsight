@@ -236,9 +236,10 @@ async fn version() -> Json<Value> {
     }))
 }
 
-/// The API description, limited to what clients probe for: a recall field
-/// is listed only when this server acts on it, so a client checking for a
-/// feature gets an honest answer.
+/// The API description. The Hindsight part is limited to what clients probe
+/// for: a recall field is listed only when this server acts on it, so a
+/// client checking for a feature gets an honest answer. The native API's
+/// full description (`openapi.json`) is merged in alongside.
 async fn openapi() -> Json<Value> {
     let recall_fields = [
         "query",
@@ -259,7 +260,7 @@ async fn openapi() -> Json<Value> {
         .map(|field| (field.to_string(), json!({})))
         .collect();
     let bank = "/v1/default/banks/{bank_id}";
-    Json(json!({
+    let mut doc = json!({
         "openapi": "3.1.0",
         "info": { "title": "rustsight", "version": HINDSIGHT_API_VERSION },
         "paths": {
@@ -285,7 +286,9 @@ async fn openapi() -> Json<Value> {
             "required": ["query"],
             "properties": properties,
         } } },
-    }))
+    });
+    crate::http::merge_native_openapi(&mut doc);
+    Json(doc)
 }
 
 // ── Banks ────────────────────────────────────────────────────────────────

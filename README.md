@@ -148,6 +148,9 @@ curl -X POST localhost:8888/banks/demo/reflect -H 'content-type: application/jso
     -d '{"query": "What do we know about Alice?"}'
 ```
 
+`GET /openapi.json` describes every endpoint, request body, and response
+shape (OpenAPI 3.1; source in `crates/rustsight-server/openapi.json`).
+
 The same server also speaks the **Hindsight API** under `/v1/default/...`.
 To switch an existing Hindsight client over, point its `baseUrl` at
 Rustsight:

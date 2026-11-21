@@ -1,0 +1,649 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "rustsight native API",
+    "description": "The native rustsight HTTP API (`/banks/...`). Served at `GET /openapi.json`, merged with the Hindsight-compatible paths (`/v1/default/...`). Timestamps are milliseconds since the Unix epoch. Errors are a plain-text body with the status code: 400 for invalid input, 422 for a request body that does not match its schema (unknown fields included), 404 for a missing bank, 500 (body `internal error`) for anything else. When `RUSTSIGHT_API_TOKEN` is set, every path except `/healthz`, `/health*`, `/version` and `/openapi.json` requires `Authorization: Bearer <token>`.",
+    "version": "native",
+    "license": { "name": "MIT" }
+  },
+  "security": [{ "bearerAuth": [] }],
+  "tags": [
+    { "name": "banks", "description": "Memory banks and their reflect persona." },
+    { "name": "memory", "description": "Retain, recall, reflect, consolidate." },
+    { "name": "inspect", "description": "Read-only listings of a bank's contents." },
+    { "name": "mental-models", "description": "Question-scoped summaries built from observations." },
+    { "name": "health", "description": "Liveness." }
+  ],
+  "paths": {
+    "/healthz": {
+      "get": {
+        "tags": ["health"],
+        "operationId": "healthz",
+        "summary": "Liveness probe",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "The server is up.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["status"],
+                  "properties": { "status": { "type": "string", "const": "ok" } }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/banks": {
+      "get": {
+        "tags": ["banks"],
+        "operationId": "listBanks",
+        "summary": "List banks",
+        "responses": {
+          "200": {
+            "description": "Every bank.",
+            "content": {
+              "application/json": {
+                "schema": { "type": "array", "items": { "$ref": "#/components/schemas/Bank" } }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      },
+      "post": {
+        "tags": ["banks"],
+        "operationId": "upsertBank",
+        "summary": "Create a bank or update its settings",
+        "description": "Creates the bank when it does not exist. Fields left out keep their stored value (or the default on create). Disposition traits are clamped to 1-5 and `bias_strength` to 0-1.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/NativeBankRequest" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The bank as stored.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Bank" } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "422": { "$ref": "#/components/responses/InvalidBody" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
+    "/banks/{bank_id}": {
+      "parameters": [{ "$ref": "#/components/parameters/BankId" }],
+      "get": {
+        "tags": ["banks"],
+        "operationId": "getBank",
+        "summary": "Get a bank",
+        "responses": {
+          "200": {
+            "description": "The bank.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Bank" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
+    "/banks/{bank_id}/retain": {
+      "parameters": [{ "$ref": "#/components/parameters/BankId" }],
+      "post": {
+        "tags": ["memory"],
+        "operationId": "retain",
+        "summary": "Extract and store memories from content",
+        "description": "Chunks the content, extracts facts with the LLM, resolves entities, embeds, and links the new memories into the graph. Returns once the memories are stored; consolidation into observations runs afterwards in the background worker.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/NativeRetainRequest" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "What was stored.",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/RetainResponse" } }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "422": { "$ref": "#/components/responses/InvalidBody" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
+    "/banks/{bank_id}/recall": {
+      "parameters": [{ "$ref": "#/components/parameters/BankId" }],
+      "post": {
+        "tags": ["memory"],
+        "operationId": "recall",
+        "summary": "Search memories",
+        "description": "Runs the semantic, keyword (BM25), graph and temporal arms, fuses them with RRF, reranks, applies combined scoring, and cuts the result to the token budget. Searches every memory kind.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/NativeRecallRequest" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Ranked memories.",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/RecallResponse" } }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "422": { "$ref": "#/components/responses/InvalidBody" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
+    "/banks/{bank_id}/reflect": {
+      "parameters": [{ "$ref": "#/components/parameters/BankId" }],
+      "post": {
+        "tags": ["memory"],
+        "operationId": "reflect",
+        "summary": "Answer a question from memory",
+        "description": "Runs the reflect tool loop (up to `reflect_max_rounds`, default 8) over the bank and returns a cited answer. Citations are limited to memory ids the loop actually retrieved. Opinions are formed in the background after the response.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/NativeReflectRequest" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The answer.",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/ReflectResponse" } }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "422": { "$ref": "#/components/responses/InvalidBody" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
+    "/banks/{bank_id}/consolidate": {
+      "parameters": [{ "$ref": "#/components/parameters/BankId" }],
+      "post": {
+        "tags": ["memory"],
+        "operationId": "consolidate",
+        "summary": "Run one consolidation pass now",
+        "description": "Consolidates up to 50 dirty entities into observations and waits for the pass to finish. The background worker does this on its own; call this to force it.",
+        "responses": {
+          "200": {
+            "description": "How many observations the pass wrote.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ConsolidateResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
+    "/banks/{bank_id}/memories": {
+      "parameters": [{ "$ref": "#/components/parameters/BankId" }],
+      "get": {
+        "tags": ["inspect"],
+        "operationId": "listMemories",
+        "summary": "List raw memories",
+        "description": "The bank's world and experience memories, at most 500.",
+        "responses": {
+          "200": {
+            "description": "Memories.",
+            "content": {
+              "application/json": {
+                "schema": { "type": "array", "items": { "$ref": "#/components/schemas/Memory" } }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
+    "/banks/{bank_id}/entities": {
+      "parameters": [{ "$ref": "#/components/parameters/BankId" }],
+      "get": {
+        "tags": ["inspect"],
+        "operationId": "listEntities",
+        "summary": "List canonical entities",
+        "responses": {
+          "200": {
+            "description": "Entities.",
+            "content": {
+              "application/json": {
+                "schema": { "type": "array", "items": { "$ref": "#/components/schemas/Entity" } }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
+    "/banks/{bank_id}/observations": {
+      "parameters": [{ "$ref": "#/components/parameters/BankId" }],
+      "get": {
+        "tags": ["inspect"],
+        "operationId": "listObservations",
+        "summary": "List observations",
+        "responses": {
+          "200": {
+            "description": "Observations.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/Observation" }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
+    "/banks/{bank_id}/opinions": {
+      "parameters": [{ "$ref": "#/components/parameters/BankId" }],
+      "get": {
+        "tags": ["inspect"],
+        "operationId": "listOpinions",
+        "summary": "List opinions",
+        "responses": {
+          "200": {
+            "description": "Opinions.",
+            "content": {
+              "application/json": {
+                "schema": { "type": "array", "items": { "$ref": "#/components/schemas/Opinion" } }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
+    "/banks/{bank_id}/mental-models": {
+      "parameters": [{ "$ref": "#/components/parameters/BankId" }],
+      "get": {
+        "tags": ["mental-models"],
+        "operationId": "listMentalModels",
+        "summary": "List mental models",
+        "responses": {
+          "200": {
+            "description": "Mental models.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/MentalModel" }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      },
+      "post": {
+        "tags": ["mental-models"],
+        "operationId": "refreshMentalModel",
+        "summary": "Create or refresh a mental model",
+        "description": "Builds (or rebuilds) the mental model answering `question` from the bank's observations.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/NativeMentalModelRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The mental model as stored.",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/MentalModel" } }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "422": { "$ref": "#/components/responses/InvalidBody" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Required only when the server runs with `RUSTSIGHT_API_TOKEN` (or `RUSTSIGHT_API_TOKEN_FILE`)."
+      }
+    },
+    "parameters": {
+      "BankId": {
+        "name": "bank_id",
+        "in": "path",
+        "required": true,
+        "schema": { "type": "string" }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Invalid input.",
+        "content": { "text/plain": { "schema": { "type": "string" } } }
+      },
+      "InvalidBody": {
+        "description": "The JSON body is malformed, misses a required field, has a wrong-typed field, or carries a field this endpoint does not accept (unknown fields are refused, never ignored).",
+        "content": { "text/plain": { "schema": { "type": "string" } } }
+      },
+      "Unauthorized": {
+        "description": "Missing or wrong bearer token."
+      },
+      "NotFound": {
+        "description": "No such bank.",
+        "content": { "text/plain": { "schema": { "type": "string" } } }
+      },
+      "InternalError": {
+        "description": "Server-side failure (store, LLM, embedding provider). The body is always `internal error`.",
+        "content": { "text/plain": { "schema": { "type": "string" } } }
+      }
+    },
+    "schemas": {
+      "MemoryKind": {
+        "type": "string",
+        "enum": ["world", "experience", "observation", "opinion"]
+      },
+      "EntityType": {
+        "type": "string",
+        "enum": ["person", "organization", "location", "product", "concept", "other"]
+      },
+      "AnswerPath": {
+        "type": "string",
+        "enum": ["loop", "forced-done", "synthesis"],
+        "description": "Which call wrote the reflect answer: the loop's volunteered finish, the forced closing ask, or the final-synthesis fallback."
+      },
+      "Metadata": {
+        "type": ["object", "null"],
+        "additionalProperties": { "type": "string" }
+      },
+      "NullableEmbedding": {
+        "type": ["array", "null"],
+        "items": { "type": "number" }
+      },
+      "Disposition": {
+        "type": "object",
+        "required": ["skepticism", "literalism", "empathy", "bias_strength"],
+        "properties": {
+          "skepticism": { "type": "integer", "minimum": 1, "maximum": 5 },
+          "literalism": { "type": "integer", "minimum": 1, "maximum": 5 },
+          "empathy": { "type": "integer", "minimum": 1, "maximum": 5 },
+          "bias_strength": { "type": "number", "minimum": 0, "maximum": 1 }
+        }
+      },
+      "Bank": {
+        "type": "object",
+        "required": ["id", "mission", "directives", "background", "disposition"],
+        "properties": {
+          "id": { "type": "string" },
+          "mission": { "type": ["string", "null"] },
+          "directives": { "type": ["string", "null"] },
+          "background": { "type": ["string", "null"] },
+          "disposition": { "$ref": "#/components/schemas/Disposition" }
+        }
+      },
+      "NativeBankRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["bank_id"],
+        "properties": {
+          "bank_id": { "type": "string" },
+          "mission": { "type": "string" },
+          "directives": { "type": "string" },
+          "background": { "type": "string" },
+          "skepticism": { "type": "integer", "minimum": 0, "maximum": 255, "description": "Clamped to 1-5." },
+          "literalism": { "type": "integer", "minimum": 0, "maximum": 255, "description": "Clamped to 1-5." },
+          "empathy": { "type": "integer", "minimum": 0, "maximum": 255, "description": "Clamped to 1-5." },
+          "bias_strength": { "type": "number", "description": "Clamped to 0-1." }
+        }
+      },
+      "NativeRetainRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["content"],
+        "properties": {
+          "content": { "type": "string", "description": "Text to extract memories from; long content is chunked." },
+          "context": { "type": "string", "description": "Label stored with every extracted memory (e.g. the conversation's source)." },
+          "timestamp_ms": { "type": "integer", "format": "int64", "description": "When the content was said; anchors relative dates. Defaults to now." }
+        }
+      },
+      "NativeRecallRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["query"],
+        "properties": {
+          "query": { "type": "string" },
+          "token_budget": { "type": "integer", "minimum": 0, "default": 1000, "description": "Results are cut greedily to fit this many tokens." },
+          "top_k_per_arm": { "type": "integer", "minimum": 0, "description": "Candidates each search arm contributes before fusion. Defaults to the engine's recall budget for a 1000-token request." }
+        }
+      },
+      "NativeReflectRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["query"],
+        "properties": {
+          "query": { "type": "string" }
+        }
+      },
+      "NativeMentalModelRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["question"],
+        "properties": {
+          "question": { "type": "string" },
+          "path": { "type": "string", "description": "Folder-style location for the model, e.g. `people/alice`." }
+        }
+      },
+      "RetainResponse": {
+        "type": "object",
+        "required": ["memories_stored", "entities", "edges_created", "reasks", "document_id"],
+        "properties": {
+          "memories_stored": { "type": "integer", "minimum": 0 },
+          "entities": { "type": "array", "items": { "type": "string" }, "description": "Canonical names of the entities the new memories link to." },
+          "edges_created": { "type": "integer", "minimum": 0 },
+          "reasks": { "type": "integer", "minimum": 0, "description": "Chunk extractions re-asked at half size after a parse failure." },
+          "document_id": { "type": ["string", "null"], "description": "The document the memories were filed under (generated when not given)." }
+        }
+      },
+      "MemoryRef": {
+        "type": "object",
+        "required": [
+          "id", "kind", "text", "score", "occurred_start_ms", "occurred_end_ms",
+          "mentioned_at_ms", "entity_ids", "proof_count", "context", "document_id",
+          "tags", "metadata"
+        ],
+        "properties": {
+          "id": { "type": "string" },
+          "kind": { "$ref": "#/components/schemas/MemoryKind" },
+          "text": { "type": "string" },
+          "score": { "type": "number" },
+          "occurred_start_ms": { "type": ["integer", "null"], "format": "int64" },
+          "occurred_end_ms": { "type": ["integer", "null"], "format": "int64" },
+          "mentioned_at_ms": { "type": ["integer", "null"], "format": "int64" },
+          "entity_ids": { "type": "array", "items": { "type": "string" } },
+          "proof_count": { "type": ["integer", "null"], "minimum": 0, "description": "Evidence count; set for observations only." },
+          "context": { "type": ["string", "null"] },
+          "document_id": { "type": ["string", "null"] },
+          "tags": { "type": "array", "items": { "type": "string" }, "description": "For observations: the union of the evidence facts' tags." },
+          "metadata": { "$ref": "#/components/schemas/Metadata" }
+        }
+      },
+      "RecallResponse": {
+        "type": "object",
+        "required": ["memories", "window", "strategies_used"],
+        "properties": {
+          "memories": { "type": "array", "items": { "$ref": "#/components/schemas/MemoryRef" } },
+          "window": {
+            "type": ["array", "null"],
+            "items": { "type": "integer", "format": "int64" },
+            "minItems": 2,
+            "maxItems": 2,
+            "description": "`[start_ms, end_ms]` parsed from the query's time expression, if any."
+          },
+          "strategies_used": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "ReflectResponse": {
+        "type": "object",
+        "required": [
+          "answer", "citations", "rounds", "retrieved", "retrieved_ids", "answer_path",
+          "synthesized", "loop_ms", "synthesis_ms", "structured_output",
+          "structured_output_error"
+        ],
+        "properties": {
+          "answer": { "type": "string" },
+          "citations": { "type": "array", "items": { "type": "string" }, "description": "Memory ids backing the answer; always a subset of `retrieved_ids`." },
+          "rounds": { "type": "integer", "minimum": 0 },
+          "retrieved": { "type": "integer", "minimum": 0 },
+          "retrieved_ids": { "type": "array", "items": { "type": "string" } },
+          "answer_path": { "$ref": "#/components/schemas/AnswerPath" },
+          "synthesized": { "type": "boolean", "description": "True only when `answer_path` is `synthesis`." },
+          "loop_ms": { "type": "integer", "minimum": 0 },
+          "synthesis_ms": { "type": ["integer", "null"], "minimum": 0 },
+          "structured_output": { "description": "Unused by the native API (always null)." },
+          "structured_output_error": { "type": ["string", "null"] }
+        }
+      },
+      "ConsolidateResponse": {
+        "type": "object",
+        "required": ["observations_updated"],
+        "properties": {
+          "observations_updated": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "Memory": {
+        "type": "object",
+        "required": [
+          "id", "bank_id", "kind", "text", "confidence", "occurred_start_ms",
+          "occurred_end_ms", "mentioned_at_ms", "source", "context", "document_id",
+          "tags", "metadata"
+        ],
+        "properties": {
+          "id": { "type": "string" },
+          "bank_id": { "type": "string" },
+          "kind": { "$ref": "#/components/schemas/MemoryKind" },
+          "text": { "type": "string" },
+          "confidence": { "type": ["number", "null"] },
+          "occurred_start_ms": { "type": ["integer", "null"], "format": "int64" },
+          "occurred_end_ms": { "type": ["integer", "null"], "format": "int64" },
+          "mentioned_at_ms": { "type": "integer", "format": "int64" },
+          "source": { "type": ["string", "null"] },
+          "context": { "type": ["string", "null"] },
+          "document_id": { "type": ["string", "null"] },
+          "tags": { "type": "array", "items": { "type": "string" } },
+          "metadata": { "$ref": "#/components/schemas/Metadata" }
+        }
+      },
+      "Entity": {
+        "type": "object",
+        "required": ["id", "bank_id", "name", "etype", "last_mentioned_ms"],
+        "properties": {
+          "id": { "type": "string" },
+          "bank_id": { "type": "string" },
+          "name": { "type": "string" },
+          "etype": { "$ref": "#/components/schemas/EntityType" },
+          "last_mentioned_ms": { "type": "integer", "format": "int64" }
+        }
+      },
+      "Evidence": {
+        "type": "object",
+        "required": ["memory_id", "quote"],
+        "properties": {
+          "memory_id": { "type": "string" },
+          "quote": { "type": "string" }
+        }
+      },
+      "Observation": {
+        "type": "object",
+        "required": [
+          "id", "bank_id", "entity_id", "text", "evidence", "proof_count", "history",
+          "updated_at_ms", "created_at_ms", "embedding"
+        ],
+        "properties": {
+          "id": { "type": "string" },
+          "bank_id": { "type": "string" },
+          "entity_id": { "type": "string" },
+          "text": { "type": "string" },
+          "evidence": { "type": "array", "items": { "$ref": "#/components/schemas/Evidence" } },
+          "proof_count": { "type": "integer", "minimum": 0 },
+          "history": { "type": "array", "items": { "type": "string" }, "description": "Earlier versions of `text`, oldest first." },
+          "updated_at_ms": { "type": "integer", "format": "int64" },
+          "created_at_ms": { "type": "integer", "format": "int64" },
+          "embedding": { "$ref": "#/components/schemas/NullableEmbedding" }
+        }
+      },
+      "ConfidencePoint": {
+        "type": "object",
+        "required": ["confidence", "at_ms", "reason"],
+        "properties": {
+          "confidence": { "type": "number" },
+          "at_ms": { "type": "integer", "format": "int64" },
+          "reason": { "type": "string" }
+        }
+      },
+      "Opinion": {
+        "type": "object",
+        "required": [
+          "id", "bank_id", "text", "confidence", "evidence", "history", "entity_ids",
+          "updated_at_ms", "created_at_ms", "embedding"
+        ],
+        "properties": {
+          "id": { "type": "string" },
+          "bank_id": { "type": "string" },
+          "text": { "type": "string" },
+          "confidence": { "type": "number" },
+          "evidence": { "type": "array", "items": { "$ref": "#/components/schemas/Evidence" } },
+          "history": { "type": "array", "items": { "$ref": "#/components/schemas/ConfidencePoint" } },
+          "entity_ids": { "type": "array", "items": { "type": "string" }, "description": "Canonical entities the opinion is about; consolidation reinforces it when they get new facts." },
+          "updated_at_ms": { "type": "integer", "format": "int64" },
+          "created_at_ms": { "type": "integer", "format": "int64" },
+          "embedding": { "$ref": "#/components/schemas/NullableEmbedding" }
+        }
+      },
+      "MentalModel": {
+        "type": "object",
+        "required": [
+          "id", "bank_id", "question", "path", "content", "last_refreshed_ms", "created_at_ms"
+        ],
+        "properties": {
+          "id": { "type": "string" },
+          "bank_id": { "type": "string" },
+          "question": { "type": "string" },
+          "path": { "type": ["string", "null"] },
+          "content": { "type": "string" },
+          "last_refreshed_ms": { "type": ["integer", "null"], "format": "int64" },
+          "created_at_ms": { "type": "integer", "format": "int64" }
+        }
+      }
+    }
+  }
+}

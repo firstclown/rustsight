@@ -543,8 +543,16 @@ for basic retain/recall/reflect.
       under `/v1/compat`, and always on rather than feature-gated: a client
       has to work with only its `baseUrl` changed, and the paths do not
       collide with the native API.
-- [ ] OpenAPI document generated for our native API (utoipa or hand-written
-      spec) and served at `/openapi.json`.
+- [x] OpenAPI document generated for our native API (utoipa or hand-written
+      spec) and served at `/openapi.json`. Hand-written
+      (`crates/rustsight-server/openapi.json`, OpenAPI 3.1) and merged into
+      the compat document already served at that path. Tests pin it to the
+      router (paths and methods come from the same `native_routes()` list
+      the router is built from; undocumented methods must 405), to the
+      request-body structs (native bodies are `deny_unknown_fields` → 422,
+      schemas `additionalProperties: false`, field lists compared via
+      serde's expected-fields error), and to the core types' serialized
+      fields and enum values.
 - [x] Smoke test with a real Hindsight client: `@vectorize-io/hindsight-client`
       1.2.1 (TypeScript) pointed at `rustsight --mock serve` performs
       createBank → retain (plain / document+tags+metadata / append / async /
