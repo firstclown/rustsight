@@ -1,6 +1,7 @@
 mod bank_gate;
 mod chunks;
 mod consolidate;
+mod curate;
 mod mental;
 mod recall;
 mod reflect;

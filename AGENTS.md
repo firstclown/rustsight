@@ -80,7 +80,7 @@ Every change is complete only when **all** of the following pass locally:
      `crates/rustsight-core/src/fusion.rs`, `temporal.rs`, `prompts/*.rs`).
    - Engine-level/integration tests go in
      `crates/rustsight-storage/tests/engine_flow.rs` (in-memory SQLite +
-     scripted mocks; 72 tests there today).
+     scripted mocks; 79 tests there today).
 4. Docs touched where relevant: `docs/reference.md` (and the README overview) for user-facing behavior/env
    vars, `NEXT_STEPS.md` checkboxes if a ticket's scope changed.
 5. No secrets/API keys committed; `.gitignore` already covers `*.db*`.

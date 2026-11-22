@@ -39,6 +39,9 @@ agents.
   link back to the stored original.
 - **Secrets stay out.** Opt-in per-bank Memory Defense redacts or blocks
   API keys, tokens and PII before anything is stored.
+- **Curate single facts.** Correct a wrongly extracted fact, or retire it
+  reversibly (out of recall and consolidation, kept for audit), over HTTP,
+  MCP or the CLI, with Hindsight's `PATCH /memories/{id}` semantics.
 
 ## How it works
 
@@ -192,7 +195,9 @@ request and allow non-loopback binds.
 rustsight mcp --bank my-agent
 ```
 
-This exposes `retain`, `recall`, and `reflect` as MCP tools over stdio. For
+This exposes `retain`, `recall`, and `reflect` as MCP tools over stdio, plus
+`get_memory`, `list_memories`, `update_memory` and `invalidate_memory` for
+curating single facts. For
 example, in an MCP client config:
 
 ```json

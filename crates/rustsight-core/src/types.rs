@@ -488,6 +488,159 @@ pub struct Chunk {
     pub document_tags: Vec<String>,
 }
 
+/// Curation state of a raw fact (RS-22, upstream `state`). Invalidated
+/// facts live in the `invalidated_memories` archive, not the live table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryState {
+    #[default]
+    Valid,
+    Invalidated,
+}
+
+impl MemoryState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MemoryState::Valid => "valid",
+            MemoryState::Invalidated => "invalidated",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "valid" => Some(MemoryState::Valid),
+            "invalidated" => Some(MemoryState::Invalidated),
+            _ => None,
+        }
+    }
+}
+
+/// Field changes of a curation edit (upstream `UpdateMemoryRequest`). For
+/// the `Option<Option<_>>` fields: `None` leaves the field unchanged,
+/// `Some(None)` clears it, `Some(Some(v))` sets it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MemoryEdit {
+    pub text: Option<String>,
+    pub context: Option<Option<String>>,
+    pub occurred_start_ms: Option<Option<i64>>,
+    pub occurred_end_ms: Option<Option<i64>>,
+    /// Clearing resets it to the fact's ingest time: `mentioned_at` is
+    /// never null here (upstream nulls it).
+    pub mentioned_at_ms: Option<Option<i64>>,
+    /// Reclassify: world or experience only.
+    pub kind: Option<MemoryKind>,
+    /// Replace the whole entity set; `Some(vec![])` detaches every entity.
+    pub entities: Option<Vec<String>>,
+}
+
+impl MemoryEdit {
+    pub fn is_empty(&self) -> bool {
+        *self == MemoryEdit::default()
+    }
+}
+
+/// One curation request: edit, invalidate, revert, or edit then invalidate.
+#[derive(Debug, Clone)]
+pub struct CurateRequest {
+    pub bank_id: String,
+    pub memory_id: MemoryId,
+    pub edit: MemoryEdit,
+    /// `true` (upstream default) resolves `edit.entities` like retain
+    /// does; `false` takes the names literally (reuse only on a
+    /// case-insensitive name match).
+    pub resolve_entities: bool,
+    pub state: Option<MemoryState>,
+    pub reason: Option<String>,
+}
+
+impl CurateRequest {
+    pub fn new(bank_id: impl Into<String>, memory_id: impl Into<String>) -> Self {
+        Self {
+            bank_id: bank_id.into(),
+            memory_id: memory_id.into(),
+            edit: MemoryEdit::default(),
+            resolve_entities: true,
+            state: None,
+            reason: None,
+        }
+    }
+}
+
+/// The resolved values a curation edit writes (built by the engine after
+/// its provider calls; the store applies it in one transaction).
+#[derive(Debug, Clone)]
+pub struct MemoryRewrite {
+    pub kind: MemoryKind,
+    pub text: String,
+    pub context: Option<String>,
+    pub occurred_start_ms: Option<i64>,
+    pub occurred_end_ms: Option<i64>,
+    pub mentioned_at_ms: i64,
+    pub embedding: Vec<f32>,
+    /// New `(entity_id, mention)` links replacing the current set; `None`
+    /// keeps the links as they are.
+    pub entity_links: Option<Vec<(String, String)>>,
+    /// The edit's time, stamped as `edited_at_ms`.
+    pub edited_at_ms: i64,
+}
+
+/// What a curation store write touched: entities to re-queue for
+/// consolidation and the observations it deleted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CurationEffect {
+    pub dirty_entities: Vec<String>,
+    pub deleted_observations: Vec<String>,
+}
+
+/// One memory as the curation surface shows it (upstream
+/// `get_memory_unit` / `list_memory_units` rows): a live or archived raw
+/// fact, or an observation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryUnit {
+    pub id: MemoryId,
+    pub bank_id: String,
+    pub kind: MemoryKind,
+    pub text: String,
+    pub context: Option<String>,
+    pub occurred_start_ms: Option<i64>,
+    pub occurred_end_ms: Option<i64>,
+    /// `None` for observations.
+    pub mentioned_at_ms: Option<i64>,
+    pub document_id: Option<String>,
+    pub chunk_id: Option<String>,
+    pub tags: Vec<String>,
+    pub metadata: Option<BTreeMap<String, String>>,
+    /// Linked entity names, sorted (empty for archived facts: the archive
+    /// holds no links, as upstream).
+    pub entities: Vec<String>,
+    pub state: MemoryState,
+    pub invalidation_reason: Option<String>,
+    pub invalidated_at_ms: Option<i64>,
+    /// Last user edit (never set by retain or consolidation).
+    pub edited_at_ms: Option<i64>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: Option<i64>,
+    /// An observation's evidence facts (empty for raw facts).
+    pub source_memory_ids: Vec<String>,
+    pub proof_count: usize,
+}
+
+/// Filters for listing memory units (upstream `GET /memories/list`).
+#[derive(Debug, Clone, Default)]
+pub struct MemoryListQuery {
+    /// `None` = live facts (and observations).
+    pub state: Option<MemoryState>,
+    /// `None` = every listable kind (world, experience, observation).
+    pub kind: Option<MemoryKind>,
+    /// Case-insensitive substring over text and context.
+    pub q: Option<String>,
+    pub document_id: Option<String>,
+    pub entity_id: Option<String>,
+    pub tags: Option<TagFilter>,
+    pub limit: usize,
+    pub offset: usize,
+}
+
 /// What deleting a bank removed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BankDeletion {

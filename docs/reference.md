@@ -143,6 +143,8 @@ untouched and served side by side.
     POST   /v1/default/banks/{bank_id}/memories            retain (sync or async)
     POST   /v1/default/banks/{bank_id}/memories/recall
     POST   /v1/default/banks/{bank_id}/reflect
+    GET    /v1/default/banks/{bank_id}/memories/list        browse facts (?state=invalidated)
+    GET    /v1/default/banks/{bank_id}/memories/{id}        one memory (PATCH: curate)
     GET    /v1/default/banks/{bank_id}/documents
     GET    /v1/default/banks/{bank_id}/documents/{id}      (DELETE too)
     GET    /v1/default/banks/{bank_id}/operations          list, newest first
@@ -195,14 +197,22 @@ What works the Hindsight way:
   operation, so waiting for zero open operations includes observations.
 - **Documents**: fetch (`original_text`, `memory_unit_count`, tags,
   metadata), list, delete (cascades to the document's memories).
+- **Memory curation** (see [Memory curation](#memory-curation)): `PATCH
+  /memories/{id}` edits, invalidates or restores one fact with the 1.2.1
+  `UpdateMemoryRequest` body; `GET /memories/{id}` adds `state`,
+  `invalidation_reason`, `invalidated_at`, `edited_at`; `GET
+  /memories/list` takes `state`, `type`, `q`, `document_id`, `entity_id`,
+  `tags` / `tags_match`, `limit` / `offset`.
 
 Accepted but not acted on (the request succeeds, the option is ignored):
-`observation_scopes`, `strategy`, `resolve_entities`, `min_scores.semantic` /
+`observation_scopes`, `strategy`, retain's `resolve_entities`, `min_scores.semantic` /
 `keyword` / `reranker`, `rerank.prune` / `dedup`, `temporal_window`,
 `exclude_mental_models*`, `apply_all_directives`, `include.tool_calls`
 (`trace` is null), the retain-tuning and retrieval-toggle fields of bank
-create. `usage` is always null. Rejected with a 400: image/file content
-blocks.
+create; on `GET /memories/list`, `consolidation_state`, `time_field` /
+`start_date` / `end_date`. `usage` is always null; `consolidated_at` /
+`consolidation_failed_at` on memories are always null. Rejected with a 400:
+image/file content blocks.
 
 Behavioral differences to know before swapping:
 
@@ -229,6 +239,14 @@ Behavioral differences to know before swapping:
   are not built in; naming them is the same 400 Hindsight gives for a
   parser the server does not enable. PDF and Office files fail their
   operation until a parser for them is registered.
+- **Curation edges are rebuilt inline.** Upstream leaves an edited or
+  restored fact's temporal/semantic links to a background graph sweep;
+  rustsight rebuilds that fact's entity, temporal and semantic edges in the
+  same request. Invalidating also trims the fact from opinion evidence
+  (opinions are rustsight-only). Clearing `mentioned_at` resets it to the
+  fact's ingest time (it is never null here), and an edit re-embeds the
+  fact text alone, as retain does (upstream folds dates and entity names
+  into the embedded text).
 - Not implemented: mental-model / page / directive
   endpoints, cancelling or deleting operations, the HTTP MCP endpoint, opinions
   via this API (a rustsight-native kind, never returned here).
@@ -628,6 +646,52 @@ The patterns target high-confidence prefixes; context-dependent secrets
 (a bare 40-character string next to the word "cohere") are out of scope, as
 upstream.
 
+## Memory curation
+Fix or retire a single extracted fact without touching its document (RS-22,
+upstream's "Curate memory unit"). Only world/experience facts can be
+curated; observations are derived and regenerate from their sources.
+
+- **Edit** — any of `text`, `context`, `occurred_start`, `occurred_end`,
+  `mentioned_at` (ISO 8601; `""` clears, omitted leaves unchanged, an
+  explicit `null` on a date clears it), `fact_type` (`world` /
+  `experience`), `entities` (replaces the set; `[]` detaches all). The fact
+  is re-embedded and re-indexed, stamped `edited_at`, every observation
+  citing it is deleted, its entity/temporal/semantic edges are rebuilt, and
+  its entities (old and new) are queued for consolidation. **Causal edges
+  survive edits.** `resolve_entities: true` (default) resolves names like
+  retain does (fuzzy matching may land a near-miss on an existing entity);
+  `false` reuses an entity only on a case-insensitive name match, which is
+  what hand corrections want.
+- **Invalidate** (`state: "invalidated"`, optional `reason`) — moves the fact
+  into an archive table, so recall (all four arms), reflect, consolidation
+  and the graph never see it. Its FTS row, vector, entity links and edges go;
+  its entity links and causal edges are snapshotted; observations citing it
+  are deleted and their entities re-queued. Invalidating an archived fact
+  with a `reason` only updates the reason.
+- **Restore** (`state: "valid"`) — moves it back: re-embeds, re-links the
+  entities that still exist, restores causal edges whose other end is live,
+  rebuilds its other edges and re-queues consolidation.
+- An edit plus `state: "invalidated"` in one request edits, then archives.
+  Editing an archived fact is a 400 (restore it first); an empty request is
+  a 422, a non-UUID id or an observation a 400, an unknown id a 404.
+- There is no permanent single-fact delete (as upstream). Archived facts are
+  purged with their document (delete, or `update_mode: replace`) and with
+  their bank.
+
+Surfaces: the compat API above; native `GET|PATCH
+/banks/{bank_id}/memories/{memory_id}` (same body, native `MemoryUnit`
+response with ms timestamps); MCP tools `get_memory`, `list_memories`,
+`update_memory` and `invalidate_memory` (`restore: true` brings a fact back;
+annotated destructive); and the CLI:
+
+    rustsight memory list --bank demo [--state invalidated] [--type world] [--q text]
+    rustsight memory get --bank demo <id>
+    rustsight memory edit --bank demo <id> --text "..." [--entity Name ...] [--clear-entities] [--fuzzy-entities]
+    rustsight memory invalidate --bank demo <id> [--reason "..."]
+    rustsight memory restore --bank demo <id>
+
+The CLI takes `--entity` names literally unless `--fuzzy-entities` is given.
+
 ## Offline demo (no API key)
     rustsight --mock --db /tmp/demo.db retain --bank demo \
         --content "Last week Alice joined Google. Alice works on search infrastructure."
@@ -670,7 +734,11 @@ loop's own tool set) — are recorded in
 
 ## MCP (stdio)
     rustsight mcp --bank demo
-    tools: retain(bank_id?, content), recall(bank_id?, query), reflect(bank_id?, query)
+    tools: retain(bank_id?, content), recall(bank_id?, query), reflect(bank_id?, query),
+           get_memory(memory_id), list_memories(type?, q?, state?, limit?, offset?, tags?),
+           update_memory(memory_id, text?, context?, occurred_*?, mentioned_at?,
+                         fact_type?, entities?, resolve_entities?),
+           invalidate_memory(memory_id, reason?, restore?)
     JSON-RPC over newline-delimited stdin; malformed lines get a -32700
     parse error, lines over 10 MiB a -32600 and are discarded
 

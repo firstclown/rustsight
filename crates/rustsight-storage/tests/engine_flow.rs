@@ -3924,3 +3924,545 @@ async fn tenant_chunk_size_applies_to_its_banks_and_a_bank_override_wins() {
     assert_eq!(r.source("chunk_size_tokens"), Some(Layer::Bank));
     assert_eq!(r.source("chunk_overlap_tokens"), Some(Layer::Tenant));
 }
+
+// --- RS-22: memory curation (edit / invalidate / restore) ------------------
+
+/// Embedder that fails permanently (HTTP 400, never retried) while its
+/// switch is on — proves curation makes its provider call before writing.
+struct SwitchEmbed {
+    inner: MockEmbed,
+    fail: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl EmbedProvider for SwitchEmbed {
+    async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::EmbedStatus {
+                status: 400,
+                message: "switched off".into(),
+            });
+        }
+        self.inner.embed(texts).await
+    }
+
+    fn dim(&self) -> usize {
+        self.inner.dim()
+    }
+}
+
+const CURATE_NOW: i64 = 1_800_000_000_000;
+
+fn curate_engine_with(llm: Arc<dyn LlmProvider>, embed: Arc<dyn EmbedProvider>) -> Engine {
+    Engine::new(
+        Arc::new(SqliteStore::open_in_memory().unwrap()),
+        llm,
+        embed,
+        Arc::new(MockRerank),
+        Arc::new(SimpleTokenEstimator),
+        Arc::new(FixedClock::new(CURATE_NOW)),
+    )
+}
+
+fn mem_id(e: &Engine, bank: &str, needle: &str) -> String {
+    e.store
+        .list_memories(bank, 1000)
+        .unwrap()
+        .into_iter()
+        .find(|m| m.text.contains(needle))
+        .unwrap_or_else(|| panic!("no memory containing {needle:?}"))
+        .id
+}
+
+fn causal(bank: &str, a: &str, b: &str) -> Edge {
+    Edge {
+        bank_id: bank.into(),
+        a_id: a.into(),
+        b_id: b.into(),
+        kind: EdgeKind::Causal,
+        label: Some("causes".into()),
+        weight: 1.0,
+    }
+}
+
+fn has_causal(e: &Engine, bank: &str, a: &str, b: &str) -> bool {
+    e.store
+        .edges_for_bank(bank, 10_000)
+        .unwrap()
+        .iter()
+        .any(|x| x.kind == EdgeKind::Causal && x.a_id == a && x.b_id == b)
+}
+
+/// The store's semantic search agrees with the exhaustive scan.
+fn assert_semantic_matches_scan(e: &Engine, bank: &str, query: &[f32]) {
+    let kinds = [
+        MemoryKind::World,
+        MemoryKind::Experience,
+        MemoryKind::Observation,
+        MemoryKind::Opinion,
+    ];
+    let all = e.store.all_embeddings(bank).unwrap();
+    let scan = brute_force_semantic(&all, &[query], &kinds, 50, None);
+    let got = e
+        .store
+        .search_semantic(bank, &[query], &kinds, 50, None)
+        .unwrap();
+    let ids = |h: &[SemanticHit]| h.iter().map(|x| x.0.clone()).collect::<Vec<_>>();
+    assert_eq!(ids(&got[0]), ids(&scan[0]));
+}
+
+async fn embed_text(text: &str) -> Vec<f32> {
+    MockEmbed::default()
+        .embed(vec![text.into()])
+        .await
+        .unwrap()
+        .remove(0)
+}
+
+async fn recall_ids(e: &Engine, bank: &str, query: &str) -> Vec<String> {
+    e.recall(RecallRequest {
+        bank_id: bank.into(),
+        query: query.into(),
+        token_budget: 5000,
+        top_k_per_arm: 50,
+        kinds: None,
+        ..Default::default()
+    })
+    .await
+    .unwrap()
+    .memories
+    .into_iter()
+    .map(|m| m.id)
+    .collect()
+}
+
+#[tokio::test]
+async fn curation_edit_reembeds_drops_observations_and_keeps_causal_edges() {
+    let e = engine();
+    retain(
+        &e,
+        "ed",
+        "Alice joined Google. Alice works on search infrastructure.",
+    )
+    .await;
+    let joined = mem_id(&e, "ed", "joined Google");
+    let works = mem_id(&e, "ed", "search infrastructure");
+    e.store.add_edges(&[causal("ed", &joined, &works)]).unwrap();
+    e.consolidate_once("ed", 10).await.unwrap();
+    assert_eq!(e.store.observations_for_bank("ed").unwrap().len(), 1);
+    assert!(e.store.list_dirty_entities("ed", 10).unwrap().is_empty());
+    let alice_entities = e.store.memory_entity_ids(&works).unwrap();
+    assert!(!alice_entities.is_empty());
+
+    let mut req = CurateRequest::new("ed", &works);
+    req.edit.text = Some("Alice works on the ads ranking team".into());
+    let unit = e.curate_memory(req).await.unwrap();
+    assert_eq!(unit.text, "Alice works on the ads ranking team");
+    assert_eq!(unit.edited_at_ms, Some(CURATE_NOW));
+    assert_eq!(unit.state, MemoryState::Valid);
+    // Entities untouched by a text-only edit.
+    assert_eq!(e.store.memory_entity_ids(&works).unwrap(), alice_entities);
+
+    // The observation citing the fact is gone; its causal edge survives;
+    // its entities are queued again.
+    assert!(e.store.observations_for_bank("ed").unwrap().is_empty());
+    assert!(has_causal(&e, "ed", &joined, &works));
+    let dirty = e.store.list_dirty_entities("ed", 10).unwrap();
+    assert!(
+        alice_entities.iter().all(|x| dirty.contains(x)),
+        "{dirty:?}"
+    );
+
+    // Re-embedded and re-indexed: the new text is found, the old is not.
+    let old_hits = e
+        .store
+        .search_bm25("ed", &["infrastructure".into()], 10)
+        .unwrap();
+    assert!(old_hits.iter().all(|h| h.0 != works), "{old_hits:?}");
+    let new_hits = e.store.search_bm25("ed", &["ranking".into()], 10).unwrap();
+    assert!(new_hits.iter().any(|h| h.0 == works));
+    let q = embed_text("Alice works on the ads ranking team").await;
+    let sem = e
+        .store
+        .search_semantic("ed", &[&q], &[MemoryKind::World], 1, None)
+        .unwrap();
+    assert_eq!(sem[0][0].0, works);
+    assert!(sem[0][0].2 > 0.99);
+    assert_semantic_matches_scan(&e, "ed", &q);
+    assert!(recall_ids(&e, "ed", "ads ranking team")
+        .await
+        .contains(&works));
+
+    // Consolidation rebuilds an observation from the edited text.
+    e.consolidate_once("ed", 10).await.unwrap();
+    let obs = e.store.observations_for_bank("ed").unwrap();
+    assert!(
+        obs.iter()
+            .any(|o| o.text.contains("ads ranking")
+                && o.evidence.iter().any(|ev| ev.memory_id == works)),
+        "{obs:?}"
+    );
+}
+
+#[tokio::test]
+async fn curation_invalidate_hides_everywhere_and_restore_brings_it_back() {
+    let e = engine();
+    retain(
+        &e,
+        "inv",
+        "Alice joined Google. Alice works on search infrastructure.",
+    )
+    .await;
+    let joined = mem_id(&e, "inv", "joined Google");
+    let works = mem_id(&e, "inv", "search infrastructure");
+    e.store
+        .add_edges(&[causal("inv", &joined, &works)])
+        .unwrap();
+    e.consolidate_once("inv", 10).await.unwrap();
+    let entities_before = e.store.memory_entity_ids(&works).unwrap();
+    assert!(recall_ids(&e, "inv", "search infrastructure")
+        .await
+        .contains(&works));
+
+    let mut req = CurateRequest::new("inv", &works);
+    req.state = Some(MemoryState::Invalidated);
+    req.reason = Some("superseded".into());
+    let unit = e.curate_memory(req).await.unwrap();
+    assert_eq!(unit.state, MemoryState::Invalidated);
+    assert_eq!(unit.invalidation_reason.as_deref(), Some("superseded"));
+    assert_eq!(unit.invalidated_at_ms, Some(CURATE_NOW));
+
+    // Gone from every recall arm.
+    assert!(!recall_ids(&e, "inv", "search infrastructure")
+        .await
+        .contains(&works));
+    assert!(e
+        .store
+        .search_bm25("inv", &["infrastructure".into()], 10)
+        .unwrap()
+        .iter()
+        .all(|h| h.0 != works));
+    let q = embed_text("Alice works on search infrastructure").await;
+    assert!(e
+        .store
+        .search_semantic("inv", &[&q], &[MemoryKind::World], 10, None)
+        .unwrap()[0]
+        .iter()
+        .all(|h| h.0 != works));
+    assert_semantic_matches_scan(&e, "inv", &q);
+    assert!(!e
+        .store
+        .neighbors("inv", std::slice::from_ref(&joined), 2, 100)
+        .unwrap()
+        .contains(&works));
+    assert!(e
+        .store
+        .memories_in_window("inv", 0, i64::MAX, 100)
+        .unwrap()
+        .iter()
+        .all(|m| m.id != works));
+    // No link rows left behind; the citing observation is deleted.
+    assert!(e.store.memory_entity_ids(&works).unwrap().is_empty());
+    assert!(e
+        .store
+        .edges_for_bank("inv", 10_000)
+        .unwrap()
+        .iter()
+        .all(|x| x.a_id != works && x.b_id != works));
+    assert!(e.store.observations_for_bank("inv").unwrap().is_empty());
+    let archived = e
+        .list_memory_units(
+            "inv",
+            &MemoryListQuery {
+                state: Some(MemoryState::Invalidated),
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(archived.1, 1);
+    assert_eq!(archived.0[0].id, works);
+
+    // A reason-only update of an archived row.
+    let mut req = CurateRequest::new("inv", &works);
+    req.state = Some(MemoryState::Invalidated);
+    req.reason = Some("server decommissioned".into());
+    let unit = e.curate_memory(req).await.unwrap();
+    assert_eq!(
+        unit.invalidation_reason.as_deref(),
+        Some("server decommissioned")
+    );
+
+    // Restore: recall, entity links and the causal edge come back.
+    let mut req = CurateRequest::new("inv", &works);
+    req.state = Some(MemoryState::Valid);
+    let unit = e.curate_memory(req).await.unwrap();
+    assert_eq!(unit.state, MemoryState::Valid);
+    assert!(unit.invalidation_reason.is_none());
+    assert!(recall_ids(&e, "inv", "search infrastructure")
+        .await
+        .contains(&works));
+    assert_eq!(e.store.memory_entity_ids(&works).unwrap(), entities_before);
+    assert!(has_causal(&e, "inv", &joined, &works));
+    assert_semantic_matches_scan(&e, "inv", &q);
+    assert!(e
+        .list_memory_units(
+            "inv",
+            &MemoryListQuery {
+                state: Some(MemoryState::Invalidated),
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .0
+        .is_empty());
+}
+
+#[tokio::test]
+async fn curation_invalidated_fact_is_invisible_to_reflect_recall() {
+    let script = MockLlm::script(vec![
+        causal_facts_resp(&[
+            ("Gus maintains the billing service.", &[]),
+            ("Gus maintains the payroll service.", &[]),
+        ]),
+        tool_call("1", "recall", json!({"query": "Gus maintains service"})),
+    ]);
+    let e = curate_engine_with(Arc::new(script), Arc::new(MockEmbed::default()));
+    retain(&e, "rf", "Gus maintains billing and payroll.").await;
+    let billing = mem_id(&e, "rf", "billing");
+    let payroll = mem_id(&e, "rf", "payroll");
+    let mut req = CurateRequest::new("rf", &billing);
+    req.state = Some(MemoryState::Invalidated);
+    e.curate_memory(req).await.unwrap();
+
+    // The finish cites both facts; only what the recall tool retrieved
+    // survives citation validation.
+    let finish = tool_call(
+        "2",
+        "finish",
+        json!({"answer": "Gus maintains services.", "citations": [billing, payroll]}),
+    );
+    let e2_script = MockLlm::script(vec![
+        tool_call("1", "recall", json!({"query": "Gus maintains service"})),
+        finish.clone(),
+        finish,
+    ]);
+    let e = Engine::new(
+        Arc::clone(&e.store),
+        Arc::new(e2_script),
+        Arc::new(MockEmbed::default()),
+        Arc::new(MockRerank),
+        Arc::new(SimpleTokenEstimator),
+        Arc::new(FixedClock::new(CURATE_NOW)),
+    );
+    let resp = e.reflect("rf", "What does Gus maintain?").await.unwrap();
+    assert!(resp.citations.contains(&payroll), "{resp:?}");
+    assert!(!resp.citations.contains(&billing), "{resp:?}");
+}
+
+#[tokio::test]
+async fn curation_resolve_entities_literal_vs_fuzzy() {
+    let e = engine();
+    retain(&e, "ent", "Someone joined the search team.").await;
+    let fact = mem_id(&e, "ent", "search team");
+    let existing = e
+        .store
+        .create_entity(&NewEntity {
+            bank_id: "ent".into(),
+            name: "Jonathan Smith".into(),
+            etype: EntityType::Person,
+        })
+        .unwrap();
+
+    // Literal: a near-miss name becomes its own entity.
+    let mut req = CurateRequest::new("ent", &fact);
+    req.edit.entities = Some(vec!["Jonathon Smith".into()]);
+    req.resolve_entities = false;
+    let unit = e.curate_memory(req).await.unwrap();
+    assert_eq!(unit.entities, vec!["Jonathon Smith".to_string()]);
+    let linked = e.store.memory_entity_ids(&fact).unwrap();
+    assert_eq!(linked.len(), 1);
+    assert_ne!(linked[0], existing.id);
+
+    // Literal still reuses a case-insensitive exact match.
+    let mut req = CurateRequest::new("ent", &fact);
+    req.edit.entities = Some(vec!["jonathan smith".into()]);
+    req.resolve_entities = false;
+    e.curate_memory(req).await.unwrap();
+    assert_eq!(
+        e.store.memory_entity_ids(&fact).unwrap(),
+        vec![existing.id.clone()]
+    );
+
+    // Fuzzy (retain's resolver): the near-miss lands on the existing one.
+    let mut req = CurateRequest::new("ent", &fact);
+    req.edit.entities = Some(vec!["Jonathan Smyth".into()]);
+    let unit = e.curate_memory(req).await.unwrap();
+    assert_eq!(e.store.memory_entity_ids(&fact).unwrap(), vec![existing.id]);
+    assert_eq!(unit.entities, vec!["Jonathan Smith".to_string()]);
+
+    // [] detaches every entity.
+    let mut req = CurateRequest::new("ent", &fact);
+    req.edit.entities = Some(vec![]);
+    let unit = e.curate_memory(req).await.unwrap();
+    assert!(unit.entities.is_empty());
+    assert!(e.store.memory_entity_ids(&fact).unwrap().is_empty());
+}
+
+fn archived(e: &Engine, bank: &str) -> usize {
+    e.list_memory_units(
+        bank,
+        &MemoryListQuery {
+            state: Some(MemoryState::Invalidated),
+            limit: 100,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .1
+}
+
+async fn invalidate(e: &Engine, bank: &str, id: &str) {
+    let mut req = CurateRequest::new(bank, id);
+    req.state = Some(MemoryState::Invalidated);
+    e.curate_memory(req).await.unwrap();
+}
+
+#[tokio::test]
+async fn curation_archive_follows_document_and_bank_deletion() {
+    let e = engine();
+    let retain_doc = |doc: &'static str, content: &'static str| {
+        e.retain(RetainRequest {
+            bank_id: "arc".into(),
+            content: content.into(),
+            document_id: Some(doc.into()),
+            ..Default::default()
+        })
+    };
+    retain_doc("d1", "Hana likes tea. Hana owns a bicycle.")
+        .await
+        .unwrap();
+    invalidate(&e, "arc", &mem_id(&e, "arc", "tea")).await;
+    assert_eq!(archived(&e, "arc"), 1);
+    e.forget_document("arc", "d1").unwrap();
+    assert_eq!(archived(&e, "arc"), 0);
+
+    // update_mode: replace drops the old version's archived rows too.
+    retain_doc("d2", "Ivan likes coffee. Ivan owns a kayak.")
+        .await
+        .unwrap();
+    invalidate(&e, "arc", &mem_id(&e, "arc", "coffee")).await;
+    assert_eq!(archived(&e, "arc"), 1);
+    retain_doc("d2", "Ivan likes cocoa now.").await.unwrap();
+    assert_eq!(archived(&e, "arc"), 0);
+
+    retain_doc("d3", "Jun likes juice.").await.unwrap();
+    invalidate(&e, "arc", &mem_id(&e, "arc", "juice")).await;
+    assert_eq!(archived(&e, "arc"), 1);
+    e.delete_bank("arc").await.unwrap();
+    assert_eq!(archived(&e, "arc"), 0);
+}
+
+#[tokio::test]
+async fn curation_refuses_with_upstream_errors() {
+    let e = engine();
+    retain(
+        &e,
+        "ref",
+        "Alice joined Google. Alice works on search infrastructure.",
+    )
+    .await;
+    e.consolidate_once("ref", 10).await.unwrap();
+    let fact = mem_id(&e, "ref", "joined Google");
+    let obs = e.store.observations_for_bank("ref").unwrap()[0].id.clone();
+
+    let mut req = CurateRequest::new("ref", &obs);
+    req.state = Some(MemoryState::Invalidated);
+    let err = e.curate_memory(req).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::BadInput(m) if m.contains("observation")),
+        "{err:?}"
+    );
+
+    let err = e
+        .curate_memory(CurateRequest::new("ref", &fact))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::BadInput(m) if m.contains("at least one")),
+        "{err:?}"
+    );
+
+    let mut req = CurateRequest::new("ref", "not-a-uuid");
+    req.state = Some(MemoryState::Invalidated);
+    let err = e.curate_memory(req).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::BadInput(m) if m.contains("UUID")),
+        "{err:?}"
+    );
+
+    let mut req = CurateRequest::new("ref", uuid_like());
+    req.state = Some(MemoryState::Invalidated);
+    let err = e.curate_memory(req).await.unwrap_err();
+    assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+
+    invalidate(&e, "ref", &fact).await;
+    let mut req = CurateRequest::new("ref", &fact);
+    req.edit.text = Some("Alice joined Alphabet".into());
+    let err = e.curate_memory(req).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::BadInput(m) if m.contains("revert")),
+        "{err:?}"
+    );
+
+    let mut req = CurateRequest::new("ref", &fact);
+    req.edit.kind = Some(MemoryKind::Observation);
+    let err = e.curate_memory(req).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::BadInput(m) if m.contains("fact_type")),
+        "{err:?}"
+    );
+}
+
+fn uuid_like() -> String {
+    "00000000-0000-4000-8000-000000000000".into()
+}
+
+#[tokio::test]
+async fn curation_failed_embed_leaves_the_row_untouched() {
+    let embed = Arc::new(SwitchEmbed {
+        inner: MockEmbed::default(),
+        fail: false.into(),
+    });
+    let e = curate_engine_with(Arc::new(MockLlm::demo()), embed.clone());
+    retain(&e, "fe", "Kim plays the cello.").await;
+    let fact = mem_id(&e, "fe", "cello");
+    let before = e.get_memory_unit("fe", &fact).unwrap().unwrap();
+    let entities = e.store.memory_entity_ids(&fact).unwrap();
+
+    embed.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut req = CurateRequest::new("fe", &fact);
+    req.edit.text = Some("Kim plays the viola".into());
+    req.edit.entities = Some(vec!["Viola Society".into()]);
+    assert!(e.curate_memory(req).await.is_err());
+    let after = e.get_memory_unit("fe", &fact).unwrap().unwrap();
+    assert_eq!(after.text, before.text);
+    assert_eq!(after.edited_at_ms, None);
+    assert_eq!(e.store.memory_entity_ids(&fact).unwrap(), entities);
+    assert!(e
+        .store
+        .entities_for_bank("fe")
+        .unwrap()
+        .iter()
+        .all(|x| x.name != "Viola Society"));
+
+    // Invalidate needs no provider; restore does, and must not half-apply.
+    invalidate(&e, "fe", &fact).await;
+    let mut req = CurateRequest::new("fe", &fact);
+    req.state = Some(MemoryState::Valid);
+    assert!(e.curate_memory(req).await.is_err());
+    let unit = e.get_memory_unit("fe", &fact).unwrap().unwrap();
+    assert_eq!(unit.state, MemoryState::Invalidated);
+    assert!(e.store.get_memory(&fact).unwrap().is_none());
+}

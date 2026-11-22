@@ -1,3 +1,5 @@
+mod curation;
+
 use crate::vector;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 use rustsight_core::lang::cjk_segment;
@@ -253,6 +255,29 @@ CREATE TABLE IF NOT EXISTS store_flags(
   name TEXT PRIMARY KEY,
   set_at_ms INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS invalidated_memories(
+  id TEXT PRIMARY KEY,
+  bank_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  text TEXT NOT NULL,
+  confidence REAL,
+  occurred_start_ms INTEGER,
+  occurred_end_ms INTEGER,
+  mentioned_at_ms INTEGER NOT NULL,
+  source TEXT,
+  context TEXT,
+  created_at_ms INTEGER NOT NULL,
+  document_id TEXT,
+  tags_json TEXT NOT NULL DEFAULT '[]',
+  metadata_json TEXT,
+  chunk_id TEXT,
+  edited_at_ms INTEGER,
+  invalidation_reason TEXT,
+  invalidated_at_ms INTEGER NOT NULL,
+  entities_json TEXT NOT NULL DEFAULT '[]',
+  causal_edges_json TEXT NOT NULL DEFAULT '[]'
+);
+CREATE INDEX IF NOT EXISTS idx_inv_bank ON invalidated_memories(bank_id, document_id);
 CREATE TABLE IF NOT EXISTS mental_models(
   id TEXT PRIMARY KEY,
   bank_id TEXT NOT NULL,
@@ -401,6 +426,8 @@ impl SqliteStore {
             ("memories", "tags_json", "TEXT NOT NULL DEFAULT '[]'"),
             ("memories", "metadata_json", "TEXT"),
             ("memories", "chunk_id", "TEXT"),
+            // RS-22: stamped by user edits only.
+            ("memories", "edited_at_ms", "INTEGER"),
             ("banks", "config_json", "TEXT"),
             // RS-10d: bank-template fields on mental models.
             ("mental_models", "name", "TEXT"),
@@ -1997,11 +2024,13 @@ impl MemoryStore for SqliteStore {
                 .map_err(store_err)?;
             rows.collect::<rusqlite::Result<_>>().map_err(store_err)?
         };
-        tx.execute(
+        for sql in [
             "DELETE FROM chunks WHERE bank_id = ?1 AND document_id = ?2",
-            params![bank_id, id],
-        )
-        .map_err(store_err)?;
+            // Archived facts follow their document (upstream cascade).
+            "DELETE FROM invalidated_memories WHERE bank_id = ?1 AND document_id = ?2",
+        ] {
+            tx.execute(sql, params![bank_id, id]).map_err(store_err)?;
+        }
         if ids.is_empty() {
             tx.commit().map_err(store_err)?;
             return Ok((0, vec![]));
@@ -2096,6 +2125,41 @@ impl MemoryStore for SqliteStore {
         }
         tx.commit().map_err(store_err)?;
         Ok(())
+    }
+
+    fn get_memory_unit(&self, bank_id: &str, id: &str) -> Result<Option<MemoryUnit>> {
+        self.curation_get_unit(bank_id, id)
+    }
+
+    fn list_memory_units(&self, bank_id: &str, query: &MemoryListQuery) -> Result<Vec<MemoryUnit>> {
+        self.curation_list_units(bank_id, query)
+    }
+
+    fn update_memory(
+        &self,
+        bank_id: &str,
+        id: &str,
+        rewrite: &MemoryRewrite,
+    ) -> Result<CurationEffect> {
+        self.curation_update(bank_id, id, rewrite)
+    }
+
+    fn invalidate_memory(
+        &self,
+        bank_id: &str,
+        id: &str,
+        reason: Option<&str>,
+        at_ms: i64,
+    ) -> Result<CurationEffect> {
+        self.curation_invalidate(bank_id, id, reason, at_ms)
+    }
+
+    fn set_invalidation_reason(&self, bank_id: &str, id: &str, reason: &str) -> Result<bool> {
+        self.curation_set_reason(bank_id, id, reason)
+    }
+
+    fn restore_memory(&self, bank_id: &str, id: &str, embedding: &[f32]) -> Result<CurationEffect> {
+        self.curation_restore(bank_id, id, embedding)
     }
 
     fn put_attachment(&self, a: &rustsight_core::files::Attachment) -> Result<()> {
@@ -2262,6 +2326,7 @@ impl MemoryStore for SqliteStore {
             "DELETE FROM webhook_deliveries WHERE bank_id = ?1",
             "DELETE FROM attachments WHERE bank_id = ?1",
             "DELETE FROM directives WHERE bank_id = ?1",
+            "DELETE FROM invalidated_memories WHERE bank_id = ?1",
         ] {
             tx.execute(sql, params![bank_id]).map_err(store_err)?;
         }
@@ -3418,6 +3483,34 @@ mod tests {
             assert_eq!(models[0].content, "old content");
             assert!(models[0].name.is_none() && models[0].tags.is_empty());
             assert!(models[0].max_tokens.is_none() && models[0].trigger.is_none());
+            // RS-22: `edited_at_ms` added, the archive table created, and an
+            // old row curates like a new one.
+            let unit = s.get_memory_unit("b", "m1").unwrap().unwrap();
+            assert_eq!(unit.edited_at_ms, None);
+            assert_eq!(unit.state, MemoryState::Valid);
+        }
+        {
+            let s = SqliteStore::open(&path).unwrap();
+            s.invalidate_memory("b", "m1", Some("old"), 7).unwrap();
+            let unit = s.get_memory_unit("b", "m1").unwrap().unwrap();
+            assert_eq!(unit.state, MemoryState::Invalidated);
+            assert_eq!(unit.invalidated_at_ms, Some(7));
+            s.restore_memory("b", "m1", &[1.0, 0.0]).unwrap();
+            let rw = MemoryRewrite {
+                kind: MemoryKind::Experience,
+                text: "an edited fact".into(),
+                context: None,
+                occurred_start_ms: None,
+                occurred_end_ms: None,
+                mentioned_at_ms: 5,
+                embedding: vec![0.0, 1.0],
+                entity_links: None,
+                edited_at_ms: 8,
+            };
+            s.update_memory("b", "m1", &rw).unwrap();
+            let unit = s.get_memory_unit("b", "m1").unwrap().unwrap();
+            assert_eq!(unit.edited_at_ms, Some(8));
+            assert_eq!(unit.kind, MemoryKind::Experience);
         }
         let s = SqliteStore::open(&path).unwrap();
         let mut rec = new_mem("a new fact", 9);

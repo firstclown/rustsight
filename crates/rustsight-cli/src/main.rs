@@ -142,6 +142,85 @@ enum Cmd {
         #[arg(long)]
         path: Option<String>,
     },
+    /// Curate single facts (RS-22): show, list, edit, invalidate, restore.
+    Memory {
+        #[command(subcommand)]
+        action: MemoryCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum MemoryCmd {
+    /// Print one memory (live, invalidated, or an observation).
+    Get {
+        #[arg(long)]
+        bank: String,
+        id: String,
+    },
+    /// List memories, newest mention first.
+    List {
+        #[arg(long)]
+        bank: String,
+        /// `valid` (default) or `invalidated` (the archive).
+        #[arg(long)]
+        state: Option<String>,
+        /// world, experience or observation.
+        #[arg(long = "type")]
+        kind: Option<String>,
+        /// Case-insensitive substring over text and context.
+        #[arg(long)]
+        q: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+    },
+    /// Correct a fact's fields. For --context and the dates, '' clears the
+    /// field; omitted flags leave it unchanged.
+    Edit {
+        #[arg(long)]
+        bank: String,
+        id: String,
+        #[arg(long)]
+        text: Option<String>,
+        #[arg(long)]
+        context: Option<String>,
+        /// ISO 8601.
+        #[arg(long)]
+        occurred_start: Option<String>,
+        #[arg(long)]
+        occurred_end: Option<String>,
+        #[arg(long)]
+        mentioned_at: Option<String>,
+        /// world or experience.
+        #[arg(long)]
+        fact_type: Option<String>,
+        /// Replace the entity set (repeatable).
+        #[arg(long = "entity")]
+        entities: Vec<String>,
+        /// Detach every entity.
+        #[arg(long, conflicts_with = "entities")]
+        clear_entities: bool,
+        /// Resolve --entity names with retain's fuzzy matcher instead of
+        /// taking them literally (literal is the CLI default: hand edits
+        /// are corrections, upstream #3479).
+        #[arg(long)]
+        fuzzy_entities: bool,
+    },
+    /// Move a fact to the archive (reversible).
+    Invalidate {
+        #[arg(long)]
+        bank: String,
+        id: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Bring an invalidated fact back.
+    Restore {
+        #[arg(long)]
+        bank: String,
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -170,6 +249,99 @@ enum TenantCmd {
         #[arg(long)]
         bank: String,
     },
+}
+
+async fn run_memory(engine: &Engine, action: MemoryCmd) -> rustsight_core::Result<()> {
+    use rustsight_core::Error;
+    let unit = match action {
+        MemoryCmd::Get { bank, id } => engine
+            .get_memory_unit(&bank, &id)?
+            .ok_or_else(|| Error::NotFound(format!("memory {id}")))?,
+        MemoryCmd::List {
+            bank,
+            state,
+            kind,
+            q,
+            limit,
+            offset,
+        } => {
+            let state = state
+                .map(|s| {
+                    MemoryState::parse(&s)
+                        .ok_or_else(|| Error::BadInput(format!("unknown state {s:?}")))
+                })
+                .transpose()?;
+            let kind = kind
+                .map(|k| {
+                    MemoryKind::parse(&k)
+                        .ok_or_else(|| Error::BadInput(format!("unknown type {k:?}")))
+                })
+                .transpose()?;
+            let (units, total) = engine.list_memory_units(
+                &bank,
+                &MemoryListQuery {
+                    state,
+                    kind,
+                    q,
+                    limit,
+                    offset,
+                    ..Default::default()
+                },
+            )?;
+            print_json(&serde_json::json!({"items": units, "total": total}));
+            return Ok(());
+        }
+        MemoryCmd::Edit {
+            bank,
+            id,
+            text,
+            context,
+            occurred_start,
+            occurred_end,
+            mentioned_at,
+            fact_type,
+            entities,
+            clear_entities,
+            fuzzy_entities,
+        } => {
+            let mut body = serde_json::Map::new();
+            let mut put = |k: &str, v: Option<String>| {
+                if let Some(v) = v {
+                    body.insert(k.into(), serde_json::Value::String(v));
+                }
+            };
+            put("text", text);
+            put("context", context);
+            put("occurred_start", occurred_start);
+            put("occurred_end", occurred_end);
+            put("mentioned_at", mentioned_at);
+            put("fact_type", fact_type);
+            if clear_entities || !entities.is_empty() {
+                body.insert("entities".into(), serde_json::json!(entities));
+            }
+            body.insert("resolve_entities".into(), fuzzy_entities.into());
+            let req = rustsight_server::compat::parse_update_memory(
+                &bank,
+                &id,
+                &serde_json::Value::Object(body),
+            )
+            .map_err(|e| Error::BadInput(e.detail()))?;
+            engine.curate_memory(req).await?
+        }
+        MemoryCmd::Invalidate { bank, id, reason } => {
+            let mut req = CurateRequest::new(bank, id);
+            req.state = Some(MemoryState::Invalidated);
+            req.reason = reason;
+            engine.curate_memory(req).await?
+        }
+        MemoryCmd::Restore { bank, id } => {
+            let mut req = CurateRequest::new(bank, id);
+            req.state = Some(MemoryState::Valid);
+            engine.curate_memory(req).await?
+        }
+    };
+    print_json(&unit);
+    Ok(())
 }
 
 /// `key=value` → (key, JSON value; non-JSON text becomes a string).
@@ -476,6 +648,7 @@ async fn main() {
             }
             Ok(())
         })(),
+        Cmd::Memory { action } => run_memory(&engine, action).await,
         Cmd::Reindex { .. } => unreachable!("handled before the engine is built"),
         Cmd::BankSet {
             bank,

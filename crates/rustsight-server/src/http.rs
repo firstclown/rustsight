@@ -29,6 +29,10 @@ fn native_routes() -> Vec<(&'static str, MethodRouter<Arc<Engine>>)> {
         ("/banks/{bank_id}/reflect", post(reflect)),
         ("/banks/{bank_id}/consolidate", post(consolidate)),
         ("/banks/{bank_id}/memories", get(list_memories)),
+        (
+            "/banks/{bank_id}/memories/{memory_id}",
+            get(get_memory_unit).merge(patch(curate_memory)),
+        ),
         ("/banks/{bank_id}/entities", get(list_entities)),
         ("/banks/{bank_id}/observations", get(list_observations)),
         ("/banks/{bank_id}/opinions", get(list_opinions)),
@@ -425,6 +429,33 @@ async fn list_memories(
         .map_err(http_err)
 }
 
+async fn get_memory_unit(
+    State(engine): State<Arc<Engine>>,
+    Path((bank_id, memory_id)): Path<(String, String)>,
+) -> Result<Json<MemoryUnit>, (StatusCode, String)> {
+    engine
+        .get_memory_unit(&bank_id, &memory_id)
+        .map_err(http_err)?
+        .map(Json)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("not found: memory {memory_id}"),
+            )
+        })
+}
+
+/// Same body as Hindsight's `PATCH /memories/{memory_id}` (RS-22).
+async fn curate_memory(
+    State(engine): State<Arc<Engine>>,
+    Path((bank_id, memory_id)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Result<Json<MemoryUnit>, (StatusCode, String)> {
+    let req = crate::compat::parse_update_memory(&bank_id, &memory_id, &body)
+        .map_err(|e| (e.status(), e.detail()))?;
+    engine.curate_memory(req).await.map(Json).map_err(http_err)
+}
+
 async fn list_entities(
     State(engine): State<Arc<Engine>>,
     Path(bank_id): Path<String>,
@@ -617,6 +648,49 @@ mod tests {
         .await;
         let (_, body) = send(r, "GET", "/banks/b1/config", None).await;
         assert_eq!(body["config"]["chunk_size_tokens"]["source"], "global");
+    }
+
+    #[tokio::test]
+    async fn native_memory_curation_round_trips() {
+        let r = test_router(ApiAuth::None);
+        let (status, _) = send(
+            r.clone(),
+            "POST",
+            "/banks/nc/retain",
+            Some(json!({"content": "Noor bakes bread."})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, list) = send(r.clone(), "GET", "/banks/nc/memories", None).await;
+        let id = list[0]["id"].as_str().unwrap().to_string();
+        let uri = format!("/banks/nc/memories/{id}");
+
+        let (status, unit) = send(
+            r.clone(),
+            "PATCH",
+            &uri,
+            Some(json!({"text": "Noor bakes sourdough.", "state": "invalidated", "reason": "r"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{unit}");
+        assert_eq!(unit["text"], "Noor bakes sourdough.");
+        assert_eq!(unit["state"], "invalidated");
+        assert!(unit["edited_at_ms"].is_i64());
+        let (_, unit) = send(r.clone(), "GET", &uri, None).await;
+        assert_eq!(unit["invalidation_reason"], "r");
+
+        let (status, _) = send(r.clone(), "PATCH", &uri, Some(json!({}))).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let (status, _) = send(r.clone(), "PATCH", &uri, Some(json!({"text": "x"}))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = send(
+            r,
+            "GET",
+            "/banks/nc/memories/00000000-0000-4000-8000-000000000000",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -1021,6 +1095,36 @@ mod tests {
             },
         );
         assert_schema_matches("MemoryRef", &memory_ref);
+        assert_schema_matches(
+            "MemoryUnit",
+            &MemoryUnit {
+                id: "m1".into(),
+                bank_id: "b".into(),
+                kind: MemoryKind::World,
+                text: "t".into(),
+                context: None,
+                occurred_start_ms: None,
+                occurred_end_ms: None,
+                mentioned_at_ms: Some(1),
+                document_id: None,
+                chunk_id: None,
+                tags: vec![],
+                metadata: None,
+                entities: vec![],
+                state: MemoryState::Valid,
+                invalidation_reason: None,
+                invalidated_at_ms: None,
+                edited_at_ms: None,
+                created_at_ms: 1,
+                updated_at_ms: None,
+                source_memory_ids: vec![],
+                proof_count: 1,
+            },
+        );
+        assert_enum_matches(
+            "MemoryState",
+            &[MemoryState::Valid, MemoryState::Invalidated],
+        );
         assert_schema_matches(
             "RetainResponse",
             &RetainResponse {

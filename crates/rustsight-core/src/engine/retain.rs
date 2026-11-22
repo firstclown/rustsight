@@ -346,145 +346,7 @@ async fn retain_screened(e: &Engine, req: RetainRequest) -> Result<RetainRespons
         });
     }
 
-    let mut alias_cache: HashMap<String, Entity> = HashMap::new();
-    let mut bank_entities = e.store.entities_for_bank(&bank.id)?;
-    // Whole-bank co-occurrence snapshot (partner names + per-name degrees),
-    // taken before this batch's links land — the same pre-commit view
-    // upstream's resolution reads; this batch's pairs flush with the links.
-    let co_index = e.store.cooccurrence_index(&bank.id)?;
-    let mut touched: Vec<String> = vec![];
-    // Mentions that failed resolution: (normalized alias key, lowercased
-    // display, extractor type), in mention order; clustered into entities
-    // after the per-mention pass (upstream's in-batch dedup).
-    let mut pending: Vec<(String, String, EntityType)> = vec![];
-    let mut per_fact_entities: Vec<Vec<(Entity, String)>> = vec![vec![]; facts.len()];
-
-    for (fi, fact) in facts.iter().enumerate() {
-        // The extractor's per-fact entity list is the mention's "nearby"
-        // set (upstream `nearby_entities`): same-fact siblings matched by
-        // name against the candidate's co-occurring partners.
-        let fact_names: HashSet<String> = fact
-            .entities
-            .iter()
-            .map(|em| collapse_ws(&em.name).to_lowercase())
-            .collect();
-        let event_ms = fact.occurred_start_ms.unwrap_or(now);
-
-        for em in &fact.entities {
-            let norm = normalize_name(&em.name);
-            if norm.is_empty() {
-                continue;
-            }
-            let mention_lower = collapse_ws(&em.name).to_lowercase();
-            let mut nearby = fact_names.clone();
-            nearby.remove(&mention_lower);
-
-            let hit = if let Some(x) = alias_cache.get(&norm) {
-                Some(x.clone())
-            } else {
-                match e.store.find_by_alias(&bank.id, &norm)? {
-                    Some(x) => Some(x),
-                    None => resolve_fuzzy(
-                        e,
-                        &bank.id,
-                        &norm,
-                        &mention_lower,
-                        &em.etype,
-                        &nearby,
-                        &bank_entities,
-                        &co_index,
-                        event_ms,
-                    )?,
-                }
-            };
-
-            match hit {
-                Some(ent) => {
-                    alias_cache.insert(norm, ent.clone());
-                    if !bank_entities.iter().any(|x| x.id == ent.id) {
-                        bank_entities.push(ent.clone());
-                    }
-                    if !touched.contains(&ent.id) {
-                        touched.push(ent.id.clone());
-                    }
-                    per_fact_entities[fi].push((ent, em.name.clone()));
-                }
-                None => pending.push((norm, mention_lower, em.etype)),
-            }
-        }
-    }
-
-    // Cluster the failed names into canonical spellings and find-or-create
-    // each cluster's entity (upstream `_intrabatch_canonical_map` + the
-    // grouped INSERT's ON CONFLICT semantics: a canonical spelling that
-    // exactly names an existing entity reuses it).
-    if !pending.is_empty() {
-        let display_of = |norm: &str| -> String {
-            facts
-                .iter()
-                .flat_map(|f| f.entities.iter())
-                .map(|em| (normalize_name(&em.name), collapse_ws(&em.name)))
-                .find(|(n, _)| n == norm)
-                .map(|(_, d)| d)
-                .unwrap_or_else(|| norm.to_string())
-        };
-        let names: Vec<(String, usize)> = {
-            let mut counts: HashMap<String, (String, usize)> = HashMap::new();
-            for (norm, _, _) in &pending {
-                let display = display_of(norm);
-                let slot = counts.entry(norm.clone()).or_insert((display, 0));
-                slot.1 += 1;
-            }
-            counts.into_values().collect()
-        };
-        let canonical_by_lower = crate::entity::cluster_new_entity_names(&names, &e.config.entity);
-        for (norm, _lower, etype) in &pending {
-            let display = display_of(norm);
-            let canonical_display = canonical_by_lower.get(&display.to_lowercase()).cloned();
-            let ent = match canonical_display {
-                Some(canonical) if canonical != display => {
-                    // folded into a cluster: find-or-create the canonical
-                    let cnorm = normalize_name(&canonical);
-                    match e.store.find_by_alias(&bank.id, &cnorm)? {
-                        Some(x) => x,
-                        None => e.store.create_entity(&NewEntity {
-                            bank_id: bank.id.clone(),
-                            name: canonical.clone(),
-                            etype: *etype,
-                        })?,
-                    }
-                }
-                _ => match e.store.find_by_alias(&bank.id, norm)? {
-                    Some(x) => x,
-                    None => e.store.create_entity(&NewEntity {
-                        bank_id: bank.id.clone(),
-                        name: display.clone(),
-                        etype: *etype,
-                    })?,
-                },
-            };
-            e.store.add_alias(&bank.id, norm, &ent.id)?;
-            alias_cache.insert(norm.clone(), ent.clone());
-            if !touched.contains(&ent.id) {
-                touched.push(ent.id.clone());
-            }
-        }
-        // Second pass: fill per_fact_entities for the pending mentions.
-        for (fi, fact) in facts.iter().enumerate() {
-            for em in &fact.entities {
-                let norm = normalize_name(&em.name);
-                if norm.is_empty() {
-                    continue;
-                }
-                if let Some(ent) = alias_cache.get(&norm) {
-                    let already = per_fact_entities[fi].iter().any(|(x, _)| x.id == ent.id);
-                    if !already {
-                        per_fact_entities[fi].push((ent.clone(), em.name.clone()));
-                    }
-                }
-            }
-        }
-    }
+    let (per_fact_entities, touched) = resolve_fact_entities(e, &bank.id, &facts, now)?;
 
     let records: Vec<NewMemoryRecord> = facts
         .iter()
@@ -602,6 +464,163 @@ async fn retain_screened(e: &Engine, req: RetainRequest) -> Result<RetainRespons
     })
 }
 
+/// Per fact, its resolved `(entity, mention)` pairs.
+pub(super) type FactEntities = Vec<Vec<(Entity, String)>>;
+
+/// Resolve every fact's extracted entity mentions to bank entities, as
+/// retain does: alias hit, then fuzzy scoring against the bank's entities
+/// and co-occurrence graph, then in-batch clustering of the failures into
+/// new entities. Returns `(entity, mention)` pairs per fact and the
+/// touched entity ids in first-seen order. Creates entities and aliases
+/// as it goes (idempotent find-or-create).
+pub(super) fn resolve_fact_entities(
+    e: &Engine,
+    bank_id: &str,
+    facts: &[ExtractedFact],
+    now: i64,
+) -> Result<(FactEntities, Vec<String>)> {
+    let mut alias_cache: HashMap<String, Entity> = HashMap::new();
+    let mut bank_entities = e.store.entities_for_bank(bank_id)?;
+    // Whole-bank co-occurrence snapshot (partner names + per-name degrees),
+    // taken before this batch's links land — the same pre-commit view
+    // upstream's resolution reads; this batch's pairs flush with the links.
+    let co_index = e.store.cooccurrence_index(bank_id)?;
+    let mut touched: Vec<String> = vec![];
+    // Mentions that failed resolution: (normalized alias key, lowercased
+    // display, extractor type), in mention order; clustered into entities
+    // after the per-mention pass (upstream's in-batch dedup).
+    let mut pending: Vec<(String, String, EntityType)> = vec![];
+    let mut per_fact_entities: Vec<Vec<(Entity, String)>> = vec![vec![]; facts.len()];
+
+    for (fi, fact) in facts.iter().enumerate() {
+        // The extractor's per-fact entity list is the mention's "nearby"
+        // set (upstream `nearby_entities`): same-fact siblings matched by
+        // name against the candidate's co-occurring partners.
+        let fact_names: HashSet<String> = fact
+            .entities
+            .iter()
+            .map(|em| collapse_ws(&em.name).to_lowercase())
+            .collect();
+        let event_ms = fact.occurred_start_ms.unwrap_or(now);
+
+        for em in &fact.entities {
+            let norm = normalize_name(&em.name);
+            if norm.is_empty() {
+                continue;
+            }
+            let mention_lower = collapse_ws(&em.name).to_lowercase();
+            let mut nearby = fact_names.clone();
+            nearby.remove(&mention_lower);
+
+            let hit = if let Some(x) = alias_cache.get(&norm) {
+                Some(x.clone())
+            } else {
+                match e.store.find_by_alias(bank_id, &norm)? {
+                    Some(x) => Some(x),
+                    None => resolve_fuzzy(
+                        e,
+                        bank_id,
+                        &norm,
+                        &mention_lower,
+                        &em.etype,
+                        &nearby,
+                        &bank_entities,
+                        &co_index,
+                        event_ms,
+                    )?,
+                }
+            };
+
+            match hit {
+                Some(ent) => {
+                    alias_cache.insert(norm, ent.clone());
+                    if !bank_entities.iter().any(|x| x.id == ent.id) {
+                        bank_entities.push(ent.clone());
+                    }
+                    if !touched.contains(&ent.id) {
+                        touched.push(ent.id.clone());
+                    }
+                    per_fact_entities[fi].push((ent, em.name.clone()));
+                }
+                None => pending.push((norm, mention_lower, em.etype)),
+            }
+        }
+    }
+
+    // Cluster the failed names into canonical spellings and find-or-create
+    // each cluster's entity (upstream `_intrabatch_canonical_map` + the
+    // grouped INSERT's ON CONFLICT semantics: a canonical spelling that
+    // exactly names an existing entity reuses it).
+    if !pending.is_empty() {
+        let display_of = |norm: &str| -> String {
+            facts
+                .iter()
+                .flat_map(|f| f.entities.iter())
+                .map(|em| (normalize_name(&em.name), collapse_ws(&em.name)))
+                .find(|(n, _)| n == norm)
+                .map(|(_, d)| d)
+                .unwrap_or_else(|| norm.to_string())
+        };
+        let names: Vec<(String, usize)> = {
+            let mut counts: HashMap<String, (String, usize)> = HashMap::new();
+            for (norm, _, _) in &pending {
+                let display = display_of(norm);
+                let slot = counts.entry(norm.clone()).or_insert((display, 0));
+                slot.1 += 1;
+            }
+            counts.into_values().collect()
+        };
+        let canonical_by_lower = crate::entity::cluster_new_entity_names(&names, &e.config.entity);
+        for (norm, _lower, etype) in &pending {
+            let display = display_of(norm);
+            let canonical_display = canonical_by_lower.get(&display.to_lowercase()).cloned();
+            let ent = match canonical_display {
+                Some(canonical) if canonical != display => {
+                    // folded into a cluster: find-or-create the canonical
+                    let cnorm = normalize_name(&canonical);
+                    match e.store.find_by_alias(bank_id, &cnorm)? {
+                        Some(x) => x,
+                        None => e.store.create_entity(&NewEntity {
+                            bank_id: bank_id.to_string(),
+                            name: canonical.clone(),
+                            etype: *etype,
+                        })?,
+                    }
+                }
+                _ => match e.store.find_by_alias(bank_id, norm)? {
+                    Some(x) => x,
+                    None => e.store.create_entity(&NewEntity {
+                        bank_id: bank_id.to_string(),
+                        name: display.clone(),
+                        etype: *etype,
+                    })?,
+                },
+            };
+            e.store.add_alias(bank_id, norm, &ent.id)?;
+            alias_cache.insert(norm.clone(), ent.clone());
+            if !touched.contains(&ent.id) {
+                touched.push(ent.id.clone());
+            }
+        }
+        // Second pass: fill per_fact_entities for the pending mentions.
+        for (fi, fact) in facts.iter().enumerate() {
+            for em in &fact.entities {
+                let norm = normalize_name(&em.name);
+                if norm.is_empty() {
+                    continue;
+                }
+                if let Some(ent) = alias_cache.get(&norm) {
+                    let already = per_fact_entities[fi].iter().any(|(x, _)| x.id == ent.id);
+                    if !already {
+                        per_fact_entities[fi].push((ent.clone(), em.name.clone()));
+                    }
+                }
+            }
+        }
+    }
+    Ok((per_fact_entities, touched))
+}
+
 /// Stable content fingerprint for a document body (FNV-1a 64, hex). Only
 /// ever compared for equality against values this function produced.
 pub(crate) fn content_hash(text: &str) -> String {
@@ -670,7 +689,7 @@ fn build_entity_edges(
 /// memories when their occurrence times are close enough that
 /// `temporal_weight` clears `temporal_edge_min_weight`. `new_ids` keeps
 /// the recent-memory pass from re-linking facts already paired above.
-fn build_temporal_edges(
+pub(super) fn build_temporal_edges(
     cfg: &EngineConfig,
     bank_id: &str,
     stored: &[Memory],
@@ -721,7 +740,7 @@ fn build_temporal_edges(
 }
 
 /// Every memory kind — semantic edges may land on any embedded item.
-const ALL_KINDS: [MemoryKind; 4] = [
+pub(super) const ALL_KINDS: [MemoryKind; 4] = [
     MemoryKind::World,
     MemoryKind::Experience,
     MemoryKind::Observation,
@@ -733,7 +752,7 @@ const ALL_KINDS: [MemoryKind; 4] = [
 /// `semantic_edge_cap` per fact. `candidates[i]` is stored fact `i`'s
 /// nearest pre-existing items, best first, with this batch's new ids
 /// already excluded (no self-matches).
-fn build_semantic_edges(
+pub(super) fn build_semantic_edges(
     cfg: &EngineConfig,
     bank_id: &str,
     stored: &[Memory],

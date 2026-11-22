@@ -1244,6 +1244,179 @@ opinions.
 - [x] Re-ask counter exists and is asserted
       (`retain_reasks_at_half_size_on_parse_failure`).
 
+## RS-22 — Memory curation: edit, invalidate, restore (upstream parity) · P2 · M
+
+### Description
+
+Rustsight can only remove facts a document or a bank at a time
+(`forget_document`, `update_mode: replace`, `delete_bank`); it cannot fix
+or retire a single extracted fact. A desktop harness needs both. Upstream
+has had this since 1.1.0 as one "Curate memory unit" endpoint, and the
+1.2.1 TS client and MCP server expose it. Port it with upstream's wire
+shapes and semantics so a Hindsight client works unchanged. Pinning was
+considered and deferred: upstream has no pin (the nearest equivalent is
+directive `priority`, which RS-10d already ported).
+
+### Need-to-know facts (upstream 1.2.1, read from the installed `hindsight_api`)
+
+- **Endpoint:** `PATCH /v1/default/banks/{bank_id}/memories/{memory_id}`
+  (`api/http.py` `api_update_memory`, operation id `update_memory`). The
+  body is `UpdateMemoryRequest` (`http.py:2886`): `text`, `context`,
+  `occurred_start`, `occurred_end`, `mentioned_at` (ISO 8601; `""` clears
+  a field, omitting it leaves it unchanged; an explicit `null` on a date
+  also clears it), `fact_type` (`world`|`experience`), `entities`
+  (replaces the whole set; `[]` detaches all), `resolve_entities` (default
+  `true` = retain's fuzzy resolution; `false` = literal names, reusing an
+  entity only on a case-insensitive match; recommended for hand
+  corrections, upstream #3479), `state` (`valid`|`invalidated`) and
+  `reason`. At least one field must be set, or the request is a 422
+  (pydantic's model validator — no custom handler maps it to 400).
+  - Returns the updated memory in the `GET /memories/{id}` shape. An
+    unknown id is a 404; a non-UUID id, an observation, or an edit of an
+    invalidated row is a 400.
+- **Only world/experience facts can be curated.** Observations are
+  derived and regenerate from their sources.
+- **Edit** (`memory_engine.py::update_memory_unit`):
+  - Re-embeds the fact (text + dates + entity names feed the embedding),
+    deletes the observations derived from it, drops its temporal/semantic
+    links, re-runs consolidation, and stamps `edited_at` (set only by user
+    edits, unlike `updated_at`).
+  - **Causal edges survive edits** (#2864): nothing could re-derive them.
+  - Edit and invalidate can be combined in one request (the edit applies
+    first, then the move). Edit and revert cannot.
+  - Upstream does all embedding and entity resolution in phase 1, with no
+    write transaction open, then applies the change in one short phase-2
+    transaction. This matches our "provider calls first, destructive
+    store writes last" and lock invariants.
+- **Invalidate (`state: "invalidated"`)** *moves* the row into a sibling
+  archive table, `invalidated_memory_units` (migration `c9a1b2d3e4f5`),
+  instead of flagging it, so recall, consolidation and graph queries need
+  no state predicate.
+  - The archive mirrors the live columns minus the embedding (cold
+    storage), plus `invalidation_reason`, `invalidated_at`, an
+    `entity_ids` snapshot and the causal-edge descriptors.
+  - Links and entity associations are pruned. Every observation citing
+    the fact is **deleted outright, not trimmed**
+    (`retain/fact_storage.py::delete_stale_observations_for_memories`),
+    and the observations' surviving sources are re-queued.
+  - Invalidating an already-archived row with a `reason` only updates the
+    reason.
+- **Revert (`state: "valid"`)** moves the row back, restores entity links
+  for entities that still exist and the causal edges, recomputes the
+  embedding and re-runs consolidation.
+- **Related upstream surface:**
+  - `GET /memories/{memory_id}` adds `state`, `invalidation_reason` and
+    `invalidated_at` to the memory shape.
+  - `GET /memories/list` takes `state=valid|invalidated`, plus `type`,
+    `q`, `document_id`, `entity_id`, tag filters and pagination. The TS
+    client wraps it as `listMemories`.
+  - MCP tools `get_memory`, `list_memories`, `update_memory` and
+    `invalidate_memory` (`memory_id`, `reason`, `restore: bool`) are all
+    registered by default, and `invalidate_memory` is annotated
+    destructive.
+- **No permanent delete for a single memory.** Upstream never exposes
+  one; retiring a fact is always the reversible invalidate.
+- **Archive lifetime:** document deletion cascades to archived rows that
+  carry its `document_id`. Bank deletion and the clear-by-type
+  `DELETE /memories?type=` purge the archive explicitly
+  (`engine_curation.py`).
+
+### Rustsight-side facts
+
+- Memory ids are already UUIDv4 (`sqlite.rs::insert_memories`), so
+  upstream's UUID validation fits.
+- What references a memory today: `memory_entities`, `edges` (`a_id`/
+  `b_id`, kinds entity/temporal/semantic/causal), `texts_fts` (`ref_id`),
+  the vec0 index (`vec_put`/`vec_remove`), observation `evidence_json`,
+  and **opinion `evidence`** (rustsight-only: upstream has no opinions
+  table). `delete_document_memories` (`sqlite.rs`) is the existing
+  cascade to model the move on, but it *trims* observation evidence where
+  upstream deletes; curation follows upstream (see Work 3).
+- **No graph-maintenance sweep exists here.** Upstream relies on its sweep
+  to rebuild temporal/semantic links after an edit or revert. Rustsight
+  must rebuild the touched memory's entity/temporal/semantic edges inline
+  with the retain edge builders (`engine/retain.rs` ~650–760). Record
+  this in DIVERGENCES.md.
+- "Re-queue the sources" maps to marking entities dirty: the curated
+  fact's own entities (before and after an edit) plus the `entity_id` of
+  every deleted observation.
+
+### Work
+
+1. [x] **Schema.**
+   - New table `invalidated_memories`: every `memories` column except
+     `embedding` (including `document_id`, `tags_json`, `metadata_json`,
+     `chunk_id`, `edited_at_ms`), plus `invalidation_reason`,
+     `invalidated_at_ms`, `entities_json` (snapshot of `memory_entities`
+     rows with their `mention`) and `causal_edges_json`.
+   - Additive `memories.edited_at_ms` column in `SqliteStore::migrate`.
+     Because the archive is a new table, `CREATE TABLE IF NOT EXISTS`
+     covers it.
+   - Test opening an old-schema file.
+2. [x] **Store methods** (`MemoryStore`), each a single transaction:
+   - `invalidate_memory(bank, id, reason)`: copy the row into the archive,
+     then delete from `memories`, `texts_fts`, `memory_entities` and
+     `edges` (causal edges snapshotted first), call `vec_remove`, delete
+     the citing observations (with their FTS and vec rows), and trim the
+     id from opinion evidence. Returns the dirty entity set.
+   - `restore_memory(bank, id, embedding)`: the reverse move. Re-link
+     surviving entities, restore causal edges whose other endpoint is
+     still live, write FTS and `vec_put`.
+   - `update_memory(bank, id, edit, embedding, entity_links)`: rewrite the
+     row, stamp `edited_at_ms`, refresh FTS and vec, swap entity links,
+     drop the temporal/semantic/entity edges, delete the citing
+     observations, keep the causal edges.
+   - `get_archived_memory` and an archive-aware `list_memories` filter.
+   - Archive purges in `delete_document_memories` (rows with that
+     `document_id`) and `delete_bank`.
+3. [x] **`Engine::curate_memory`** (new `engine/curate.rs`):
+   - Validate (world/experience only; no edit while archived; at least
+     one field).
+   - Run under `BankGuard` + `until_deleted`.
+   - Phase 1, no lock held: entity resolution (`resolve_entities` true →
+     the retain resolver in `entity.rs`; false → case-insensitive alias
+     match, otherwise create) and the embed, via `with_retry`.
+   - Phase 2: the store call, then rebuild the inline edges, mark entities
+     dirty and wake the consolidation worker.
+   - Observations are deleted whole (upstream), not trimmed.
+4. [x] **Compat API** (`compat.rs`): `PATCH` and `GET
+   /v1/default/banks/{bank_id}/memories/{memory_id}` and `GET
+   /memories/list` (at least `state`, `type`, `q`, `document_id`,
+   `limit`/`offset`, tags), in 1.2.1 shapes. Check them against
+   `api/http.py` and the TS client's generated `updateMemory`/`getMemory`
+   types.
+5. [x] **Native API, MCP and CLI:** `PATCH /banks/{id}/memories/{memory_id}`
+   (same body); MCP tools `get_memory`, `update_memory` and
+   `invalidate_memory` (`restore` flag) in `mcp.rs`; CLI `rustsight
+   memory edit|invalidate|restore`.
+6. [x] **Docs:** `docs/reference.md` (endpoints + compat matrix rows),
+   README overview, DIVERGENCES.md (inline edge rebuild instead of a
+   sweep; opinion-evidence trim).
+
+### Definition of done
+
+- [x] engine_flow: an edit re-embeds (recall finds the new text, not the
+      old), deletes the observations citing the fact, keeps its causal
+      edge, marks its entities dirty, sets `edited_at_ms`, and
+      consolidation then rebuilds an observation from the edited text.
+- [x] engine_flow: invalidate removes the fact from all four recall arms
+      and from reflect's `recall` tool, deletes the citing observations,
+      and leaves no FTS/vec/edge/entity-link rows. `assert_matches_scan`
+      still holds. Restore brings back recall, entity links and the
+      causal edge.
+- [x] engine_flow: `resolve_entities: false` attaches a near-miss name to
+      a new entity, not the fuzzy match. `true` reuses the existing one.
+- [x] engine_flow: deleting the document or the bank purges its archived
+      rows; `update_mode: replace` leaves no orphaned archive rows.
+- [x] engine_flow: curating an observation, editing an archived row, an
+      empty request and a non-UUID id are each refused with the
+      upstream status.
+- [x] A failed embed during edit or restore leaves the row untouched
+      (provider calls first).
+- [x] compat router tests: PATCH/GET/list round trip in 1.2.1 shapes. MCP
+      tools are listed and callable.
+- [x] fmt / clippy / tests green. Docs updated.
+
 ## Appendix — facts referenced by multiple tickets
 
 - Upstream pin: `vectorize-io/hindsight` tag `v1.1.0`, commit `a5a619b5`,

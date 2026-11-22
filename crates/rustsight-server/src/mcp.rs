@@ -1,4 +1,9 @@
-use rustsight_core::types::{RecallRequest, RetainRequest};
+use crate::compat::{
+    curation_error, memory_list_item, memory_unit_json, parse_update_memory, ApiError,
+};
+use rustsight_core::types::{
+    MemoryKind, MemoryListQuery, MemoryState, RecallRequest, RetainRequest, TagFilter,
+};
 use rustsight_core::Engine;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -126,9 +131,86 @@ fn tools_list() -> Value {
                     },
                     "required": ["query"]
                 }
+            },
+            {
+                "name": "get_memory",
+                "description": "Get a specific memory by ID. Returns the full memory unit including content, metadata, timestamps and curation state.",
+                "annotations": {"readOnlyHint": true},
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "bank_id": {"type": "string"},
+                        "memory_id": {"type": "string"}
+                    },
+                    "required": ["memory_id"]
+                }
+            },
+            {
+                "name": "list_memories",
+                "description": "Browse stored memories with optional filtering (no relevance ranking).",
+                "annotations": {"readOnlyHint": true},
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "bank_id": {"type": "string"},
+                        "type": {"type": "string", "description": "world, experience or observation"},
+                        "q": {"type": "string", "description": "Case-insensitive substring filter"},
+                        "state": {"type": "string", "enum": ["valid", "invalidated"]},
+                        "limit": {"type": "integer", "default": 100},
+                        "offset": {"type": "integer", "default": 0},
+                        "tags": {"type": "array", "items": {"type": "string"}},
+                        "tags_match": {"type": "string", "enum": ["any", "all", "any_strict", "all_strict", "exact"], "default": "any"}
+                    }
+                }
+            },
+            {
+                "name": "update_memory",
+                "description": "Edit a memory unit to correct what was extracted. Pass any of text / context / occurred_start / occurred_end / mentioned_at / fact_type / entities. For context and the dates, \"\" clears the field and omitting it leaves it unchanged; entities replaces the fact's entity set ([] detaches all). The memory is re-embedded and its derived observations and links are recomputed. resolve_entities=false takes entity names literally (recommended for deliberate corrections). Only raw world/experience facts can be edited; to retire or restore a fact, use invalidate_memory.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "bank_id": {"type": "string"},
+                        "memory_id": {"type": "string"},
+                        "text": {"type": "string"},
+                        "context": {"type": "string"},
+                        "occurred_start": {"type": "string"},
+                        "occurred_end": {"type": "string"},
+                        "mentioned_at": {"type": "string"},
+                        "fact_type": {"type": "string", "enum": ["world", "experience"]},
+                        "entities": {"type": "array", "items": {"type": "string"}},
+                        "resolve_entities": {"type": "boolean", "default": true}
+                    },
+                    "required": ["memory_id"]
+                }
+            },
+            {
+                "name": "invalidate_memory",
+                "description": "Soft-retire a memory unit (or restore a previously retired one). Invalidating moves the fact out of the active set: it is excluded from recall, consolidation and the knowledge graph, its links are pruned and its derived observations are deleted for recomputation, but it is kept for audit and is fully reversible. Pass restore=true to bring it back. Only raw world/experience facts can be invalidated.",
+                "annotations": {"destructiveHint": true},
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "bank_id": {"type": "string"},
+                        "memory_id": {"type": "string"},
+                        "reason": {"type": "string", "description": "Optional free-text reason recorded when invalidating"},
+                        "restore": {"type": "boolean", "default": false}
+                    },
+                    "required": ["memory_id"]
+                }
             }
         ]
     })
+}
+
+fn api_err(e: ApiError) -> String {
+    e.detail()
+}
+
+fn memory_id_arg(args: &Value) -> Result<String, String> {
+    args.get("memory_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| "memory_id required".to_string())
 }
 
 async fn call_tool(
@@ -218,6 +300,97 @@ async fn call_tool(
                 "citations": r.citations,
                 "rounds": r.rounds
             }))
+        }
+        "get_memory" => {
+            let memory_id = memory_id_arg(&args)?;
+            let unit = engine
+                .get_memory_unit(&bank_id, &memory_id)
+                .map_err(|e| api_err(curation_error(e)))?
+                .ok_or_else(|| format!("Memory '{memory_id}' not found"))?;
+            memory_unit_json(engine, &unit).map_err(api_err)
+        }
+        "list_memories" => {
+            let str_arg = |k: &str| {
+                args.get(k)
+                    .and_then(|v| v.as_str())
+                    .filter(|v| !v.is_empty())
+            };
+            let state = match str_arg("state") {
+                None => None,
+                Some(s) => Some(MemoryState::parse(s).ok_or_else(|| {
+                    format!("Invalid state '{s}': expected 'valid' or 'invalidated'.")
+                })?),
+            };
+            let tags: Vec<String> = args
+                .get("tags")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|t| t.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mode = serde_json::from_value(json!(str_arg("tags_match").unwrap_or("any")))
+                .map_err(|_| "tags_match must be one of any, all, any_strict, all_strict, exact")?;
+            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
+            let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let query = MemoryListQuery {
+                state,
+                kind: str_arg("type").map(|t| MemoryKind::parse(t).unwrap_or(MemoryKind::Opinion)),
+                q: str_arg("q").map(String::from),
+                tags: Some(TagFilter {
+                    tags,
+                    mode,
+                    groups: vec![],
+                }),
+                limit,
+                offset,
+                ..Default::default()
+            };
+            let (units, total) = engine
+                .list_memory_units(&bank_id, &query)
+                .map_err(|e| e.to_string())?;
+            let items: Vec<Value> = units.iter().map(memory_list_item).collect();
+            Ok(json!({"items": items, "total": total, "limit": limit, "offset": offset}))
+        }
+        "update_memory" => {
+            let memory_id = memory_id_arg(&args)?;
+            // The edit tool only edits; retiring goes through
+            // invalidate_memory (as upstream splits them).
+            let mut body = args.clone();
+            if let Some(obj) = body.as_object_mut() {
+                for k in ["bank_id", "memory_id", "state", "reason"] {
+                    obj.remove(k);
+                }
+            }
+            let req = parse_update_memory(&bank_id, &memory_id, &body).map_err(api_err)?;
+            let unit = engine
+                .curate_memory(req)
+                .await
+                .map_err(|e| api_err(curation_error(e)))?;
+            memory_unit_json(engine, &unit).map_err(api_err)
+        }
+        "invalidate_memory" => {
+            let memory_id = memory_id_arg(&args)?;
+            let restore = args
+                .get("restore")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let mut req = rustsight_core::CurateRequest::new(bank_id, memory_id);
+            req.state = Some(if restore {
+                MemoryState::Valid
+            } else {
+                MemoryState::Invalidated
+            });
+            req.reason = args
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let unit = engine
+                .curate_memory(req)
+                .await
+                .map_err(|e| api_err(curation_error(e)))?;
+            memory_unit_json(engine, &unit).map_err(api_err)
         }
         other => Err(format!("unknown tool {other}")),
     }
@@ -439,6 +612,109 @@ mod tests {
             .await;
         let resp = p.next_line().await;
         assert!(resp.contains("\"id\":4"), "got: {resp}");
+        drop(p.write);
+        p.handle.await.unwrap().unwrap();
+    }
+
+    async fn rpc(p: &mut McpPair, id: u64, method: &str, params: Value) -> Value {
+        let req = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        p.send_line(&format!("{req}\n")).await;
+        serde_json::from_str(&p.next_line().await).unwrap()
+    }
+
+    async fn tool(p: &mut McpPair, id: u64, name: &str, args: Value) -> Value {
+        let resp = rpc(
+            p,
+            id,
+            "tools/call",
+            json!({"name": name, "arguments": args}),
+        )
+        .await;
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{name} failed: {resp}"));
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn curation_tools_are_listed_and_callable() {
+        let mut p = spawn_server(MAX_LINE_BYTES).await;
+        let tools = rpc(&mut p, 1, "tools/list", json!({})).await;
+        let names: Vec<&str> = tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        for name in [
+            "get_memory",
+            "list_memories",
+            "update_memory",
+            "invalidate_memory",
+        ] {
+            assert!(names.contains(&name), "{names:?}");
+        }
+        let invalidate = tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "invalidate_memory")
+            .unwrap();
+        assert_eq!(invalidate["annotations"]["destructiveHint"], true);
+
+        tool(
+            &mut p,
+            2,
+            "retain",
+            json!({"content": "Mara repairs clocks."}),
+        )
+        .await;
+        let list = tool(&mut p, 3, "list_memories", json!({"type": "world"})).await;
+        assert_eq!(list["total"], 1, "{list}");
+        let id = list["items"][0]["id"].as_str().unwrap().to_string();
+
+        let got = tool(&mut p, 4, "get_memory", json!({"memory_id": id})).await;
+        assert_eq!(got["state"], "valid");
+        let edited = tool(
+            &mut p,
+            5,
+            "update_memory",
+            json!({"memory_id": id, "text": "Mara repairs watches."}),
+        )
+        .await;
+        assert_eq!(edited["text"], "Mara repairs watches.");
+        let gone = tool(
+            &mut p,
+            6,
+            "invalidate_memory",
+            json!({"memory_id": id, "reason": "wrong"}),
+        )
+        .await;
+        assert_eq!(gone["state"], "invalidated");
+        assert_eq!(gone["invalidation_reason"], "wrong");
+        let archived = tool(&mut p, 7, "list_memories", json!({"state": "invalidated"})).await;
+        assert_eq!(archived["total"], 1);
+        let back = tool(
+            &mut p,
+            8,
+            "invalidate_memory",
+            json!({"memory_id": id, "restore": true}),
+        )
+        .await;
+        assert_eq!(back["state"], "valid");
+
+        // The edit tool never changes state.
+        let resp = rpc(
+            &mut p,
+            9,
+            "tools/call",
+            json!({"name": "update_memory", "arguments": {"memory_id": id, "state": "invalidated"}}),
+        )
+        .await;
+        assert!(resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("at least one field"));
         drop(p.write);
         p.handle.await.unwrap().unwrap();
     }

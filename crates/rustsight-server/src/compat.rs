@@ -14,6 +14,9 @@
 //! - `POST /v1/default/banks/{bank_id}/memories` (retain, sync or async)
 //! - `POST /v1/default/banks/{bank_id}/memories/recall`
 //! - `POST /v1/default/banks/{bank_id}/reflect`
+//! - `GET /v1/default/banks/{bank_id}/memories/list`,
+//!   `GET|PATCH /v1/default/banks/{bank_id}/memories/{memory_id}` (RS-22
+//!   curation: edit / invalidate / revert one fact)
 //! - `GET /v1/default/banks/{bank_id}/documents`,
 //!   `GET|DELETE /v1/default/banks/{bank_id}/documents/{document_id}`
 //! - `GET /v1/default/banks/{bank_id}/operations`,
@@ -119,6 +122,14 @@ pub fn routes() -> Router<Arc<Engine>> {
         .route("/v1/default/banks/{bank_id}/profile", get(bank_profile))
         .route("/v1/default/banks/{bank_id}/memories", post(retain))
         .route("/v1/default/banks/{bank_id}/memories/recall", post(recall))
+        .route(
+            "/v1/default/banks/{bank_id}/memories/list",
+            get(list_memories),
+        )
+        .route(
+            "/v1/default/banks/{bank_id}/memories/{memory_id}",
+            get(get_memory).patch(update_memory),
+        )
         .route("/v1/default/banks/{bank_id}/reflect", post(reflect))
         .route("/v1/default/banks/{bank_id}/documents", get(list_documents))
         .route(
@@ -163,6 +174,17 @@ impl ApiError {
 
     pub(crate) fn not_found(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, msg)
+    }
+
+    pub(crate) fn status(&self) -> StatusCode {
+        self.0
+    }
+
+    /// The wire `detail` as text (MCP tools report errors as strings).
+    pub fn detail(&self) -> String {
+        self.2
+            .as_ref()
+            .map_or_else(|| self.1.clone(), |v| v.to_string())
     }
 }
 
@@ -285,6 +307,8 @@ async fn openapi() -> Json<Value> {
                     "schema": { "$ref": "#/components/schemas/RecallRequest" }
                 } } } }
             },
+            (format!("{bank}/memories/list")): { "get": {} },
+            (format!("{bank}/memories/{{memory_id}}")): { "get": {}, "patch": {} },
             (format!("{bank}/reflect")): { "post": {} },
             (format!("{bank}/documents")): { "get": {} },
             (format!("{bank}/documents/{{document_id}}")): { "get": {}, "delete": {} },
@@ -1910,6 +1934,272 @@ async fn delete_document(
     })))
 }
 
+// ── Memory curation (RS-22) ──────────────────────────────────────────────
+
+/// Engine errors on the curation routes: upstream sends the bare
+/// `ValueError` text as a 400 and `Memory unit '<id>' not found` as a 404.
+pub(crate) fn curation_error(e: Error) -> ApiError {
+    match e {
+        Error::BadInput(m) => ApiError::bad_request(m),
+        Error::NotFound(m) => ApiError::not_found(m),
+        other => other.into(),
+    }
+}
+
+fn opt_iso(ms: Option<i64>) -> Value {
+    ms.and_then(iso).map_or(Value::Null, Value::String)
+}
+
+/// Upstream `event_date`: the occurred start, else the mention time.
+fn unit_date(u: &MemoryUnit) -> String {
+    u.occurred_start_ms
+        .or(u.mentioned_at_ms)
+        .and_then(iso)
+        .unwrap_or_default()
+}
+
+/// `GET /memories/{id}` shape (upstream `get_memory_unit`).
+pub(crate) fn memory_unit_json(engine: &Engine, u: &MemoryUnit) -> Result<Value, ApiError> {
+    let mut out = json!({
+        "id": u.id,
+        "text": u.text,
+        "context": u.context.clone().unwrap_or_default(),
+        "date": unit_date(u),
+        "type": u.kind.as_str(),
+        "mentioned_at": opt_iso(u.mentioned_at_ms),
+        "occurred_start": opt_iso(u.occurred_start_ms),
+        "occurred_end": opt_iso(u.occurred_end_ms),
+        "entities": u.entities,
+        "document_id": u.document_id,
+        "chunk_id": u.chunk_id,
+        "tags": u.tags,
+        "metadata": u.metadata.clone().map_or_else(|| json!({}), |m| json!(m)),
+        "observation_scopes": null,
+        "state": u.state.as_str(),
+        "invalidation_reason": u.invalidation_reason,
+        "invalidated_at": opt_iso(u.invalidated_at_ms),
+        "edited_at": opt_iso(u.edited_at_ms),
+        "consolidated_at": null,
+        "consolidation_failed_at": null,
+    });
+    if u.kind == MemoryKind::Observation {
+        let sources = engine.store.get_refs(&u.bank_id, &u.source_memory_ids)?;
+        out["history"] = json!([]);
+        out["source_memory_ids"] = json!(u.source_memory_ids);
+        out["source_memories"] = sources
+            .iter()
+            .map(|r| {
+                json!({
+                    "id": r.id,
+                    "text": r.text,
+                    "type": r.kind.as_str(),
+                    "context": r.context,
+                    "occurred_start": opt_iso(r.occurred_start_ms),
+                    "mentioned_at": opt_iso(r.mentioned_at_ms),
+                })
+            })
+            .collect();
+    }
+    Ok(out)
+}
+
+/// `GET /memories/list` item shape (upstream `list_memory_units`).
+pub(crate) fn memory_list_item(u: &MemoryUnit) -> Value {
+    json!({
+        "id": u.id,
+        "text": u.text,
+        "context": u.context.clone().unwrap_or_default(),
+        "date": unit_date(u),
+        "fact_type": u.kind.as_str(),
+        "document_id": u.document_id,
+        "mentioned_at": opt_iso(u.mentioned_at_ms),
+        "occurred_start": opt_iso(u.occurred_start_ms),
+        "occurred_end": opt_iso(u.occurred_end_ms),
+        "entities": u.entities.join(", "),
+        "chunk_id": u.chunk_id,
+        "proof_count": u.proof_count,
+        "tags": u.tags,
+        "metadata": u.metadata.clone().map_or_else(|| json!({}), |m| json!(m)),
+        "consolidated_at": null,
+        "consolidation_failed_at": null,
+        "state": u.state.as_str(),
+        "invalidation_reason": u.invalidation_reason,
+        "invalidated_at": opt_iso(u.invalidated_at_ms),
+        "edited_at": opt_iso(u.edited_at_ms),
+        "updated_at": opt_iso(Some(u.updated_at_ms.or(u.edited_at_ms).unwrap_or(u.created_at_ms))),
+        "source_memory_ids": u.source_memory_ids,
+    })
+}
+
+async fn get_memory(
+    State(engine): State<Arc<Engine>>,
+    Path((bank_id, memory_id)): Path<(String, String)>,
+) -> ApiResult {
+    let unit = engine
+        .get_memory_unit(&bank_id, &memory_id)
+        .map_err(curation_error)?
+        .ok_or_else(|| ApiError::not_found(format!("Memory unit '{memory_id}' not found")))?;
+    Ok(Json(memory_unit_json(&engine, &unit)?))
+}
+
+/// A string-or-null body field; anything else is a validation error.
+fn body_str(body: &Map<String, Value>, key: &str) -> Result<Option<String>, ApiError> {
+    match body.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(other) => Err(ApiError::unprocessable(format!(
+            "{key}: Input should be a valid string, got {other}"
+        ))),
+    }
+}
+
+/// A date edit: omitted = unchanged; `""` or an explicit `null` clears it
+/// (upstream treats a sent `null` on a date as `""`); else ISO 8601.
+fn body_date(body: &Map<String, Value>, key: &str) -> Result<Option<Option<i64>>, ApiError> {
+    if !body.contains_key(key) {
+        return Ok(None);
+    }
+    match body_str(body, key)?.as_deref().map(str::trim) {
+        None | Some("") => Ok(Some(None)),
+        Some(raw) => parse_iso(raw)
+            .map(|ms| Some(Some(ms)))
+            .ok_or_else(|| ApiError::bad_request(format!("Invalid isoformat string: '{raw}'"))),
+    }
+}
+
+/// Parse an `UpdateMemoryRequest` body (hindsight-api 1.2.1). Shared by
+/// the compat and native routes, the MCP `update_memory` tool and the CLI.
+pub fn parse_update_memory(
+    bank_id: &str,
+    memory_id: &str,
+    body: &Value,
+) -> Result<CurateRequest, ApiError> {
+    let body = body
+        .as_object()
+        .ok_or_else(|| ApiError::unprocessable("Input should be a valid dictionary"))?;
+    let mut req = CurateRequest::new(bank_id, memory_id);
+    req.edit.text = body_str(body, "text")?;
+    req.edit.context = body_str(body, "context")?.map(|c| Some(c).filter(|c| !c.is_empty()));
+    req.edit.occurred_start_ms = body_date(body, "occurred_start")?;
+    req.edit.occurred_end_ms = body_date(body, "occurred_end")?;
+    req.edit.mentioned_at_ms = body_date(body, "mentioned_at")?;
+    req.edit.kind = match body_str(body, "fact_type")?.as_deref() {
+        None => None,
+        Some("world") => Some(MemoryKind::World),
+        Some("experience") => Some(MemoryKind::Experience),
+        Some(_) => {
+            return Err(ApiError::unprocessable(
+                "Value error, fact_type must be 'world' or 'experience'.",
+            ))
+        }
+    };
+    req.edit.entities = match body.get("entities") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(string_list(v, "entities")?),
+    };
+    req.resolve_entities = match body.get("resolve_entities") {
+        None | Some(Value::Null) => true,
+        Some(Value::Bool(b)) => *b,
+        Some(other) => {
+            return Err(ApiError::unprocessable(format!(
+                "resolve_entities: Input should be a valid boolean, got {other}"
+            )))
+        }
+    };
+    req.state = match body_str(body, "state")?.as_deref() {
+        None => None,
+        Some(s) => Some(MemoryState::parse(s).ok_or_else(|| {
+            ApiError::unprocessable("Value error, state must be 'valid' or 'invalidated'.")
+        })?),
+    };
+    req.reason = body_str(body, "reason")?;
+    // Upstream's model validator: a sent field must change something
+    // (`reason` alone does not).
+    if req.edit.is_empty() && req.state.is_none() {
+        return Err(ApiError::unprocessable(
+            "Value error, Provide at least one field to update.",
+        ));
+    }
+    Ok(req)
+}
+
+async fn update_memory(
+    State(engine): State<Arc<Engine>>,
+    Path((bank_id, memory_id)): Path<(String, String)>,
+    body: Result<Json<Value>, JsonRejection>,
+) -> ApiResult {
+    let Json(body) = body?;
+    let req = parse_update_memory(&bank_id, &memory_id, &body)?;
+    let unit = engine.curate_memory(req).await.map_err(curation_error)?;
+    Ok(Json(memory_unit_json(&engine, &unit)?))
+}
+
+async fn list_memories(
+    State(engine): State<Arc<Engine>>,
+    Path(bank_id): Path<String>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> ApiResult {
+    if engine.store.get_bank(&bank_id)?.is_none() {
+        return Err(ApiError::not_found(format!("Bank '{bank_id}' not found")));
+    }
+    let one = |key: &str| {
+        params
+            .iter()
+            .rev()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+            .filter(|v| !v.is_empty())
+    };
+    let count = |key: &str, default: usize| -> Result<usize, ApiError> {
+        one(key).map_or(Ok(default), |v| {
+            v.parse().map_err(|_| {
+                ApiError::unprocessable(format!(
+                    "{key}: Input should be a valid integer, unable to parse string as an integer"
+                ))
+            })
+        })
+    };
+    let state = match one("state") {
+        None => None,
+        Some(s) => Some(MemoryState::parse(s).ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "Invalid state '{s}': expected 'valid' or 'invalidated'."
+            ))
+        })?),
+    };
+    let tags: Vec<String> = params
+        .iter()
+        .filter(|(k, _)| k == "tags")
+        .map(|(_, v)| v.clone())
+        .collect();
+    let limit = count("limit", 100)?;
+    let offset = count("offset", 0)?;
+    let query = MemoryListQuery {
+        state,
+        // An unknown type matches nothing (upstream filters on equality);
+        // opinions are rustsight-native, and the engine never lists them.
+        kind: one("type").map(|t| MemoryKind::parse(t).unwrap_or(MemoryKind::Opinion)),
+        q: one("q").map(str::to_string),
+        document_id: one("document_id").map(str::to_string),
+        entity_id: one("entity_id").map(str::to_string),
+        tags: Some(TagFilter {
+            tags,
+            mode: parse_tags_match(one("tags_match"), TagsMatch::Any)?,
+            groups: vec![],
+        }),
+        limit,
+        offset,
+    };
+    let (units, total) = engine.list_memory_units(&bank_id, &query)?;
+    let items: Vec<Value> = units.iter().map(memory_list_item).collect();
+    Ok(Json(json!({
+        "items": items,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2934,5 +3224,239 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(schema["title"], "BankTemplateManifest");
         assert_eq!(schema["required"], json!(["version"]));
+    }
+
+    #[tokio::test]
+    async fn memory_curation_patch_get_and_list_round_trip() {
+        let engine = engine();
+        let app = app(&engine);
+        retain_one(
+            &app,
+            "cur",
+            json!({
+                "content": "Alice joined Google. Alice works on search infrastructure.",
+                "document_id": "d1",
+                "tags": ["t"],
+            }),
+        )
+        .await;
+        let base = "/v1/default/banks/cur/memories";
+
+        // Observations: readable, listable, never curatable.
+        engine.consolidate_once("cur", 10).await.unwrap();
+        let obs = call(
+            &app,
+            Method::GET,
+            &format!("{base}/list?type=observation"),
+            None,
+        )
+        .await
+        .1;
+        assert!(obs["total"].as_u64().unwrap() >= 1, "{obs}");
+        let obs_id = obs["items"][0]["id"].as_str().unwrap().to_string();
+        assert!(!obs["items"][0]["source_memory_ids"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let (status, got) = call(&app, Method::GET, &format!("{base}/{obs_id}"), None).await;
+        assert_eq!(status, StatusCode::OK, "{got}");
+        assert_eq!(got["type"], "observation");
+        assert!(!got["source_memories"].as_array().unwrap().is_empty());
+        let (status, body) = call(
+            &app,
+            Method::PATCH,
+            &format!("{base}/{obs_id}"),
+            Some(json!({"state": "invalidated"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body["detail"].as_str().unwrap().contains("observation"));
+
+        let (status, list) = call(&app, Method::GET, &format!("{base}/list"), None).await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        // Two facts plus the observation built over them.
+        assert_eq!(list["total"], 3, "{list}");
+        assert_eq!(list["limit"], 100);
+        let item = list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["text"].as_str().unwrap().contains("infrastructure"))
+            .unwrap()
+            .clone();
+        assert_eq!(item["fact_type"], "world");
+        assert_eq!(item["state"], "valid");
+        assert_eq!(item["document_id"], "d1");
+        assert!(item["entities"].as_str().unwrap().contains("Alice"));
+        let id = item["id"].as_str().unwrap().to_string();
+        let uri = format!("{base}/{id}");
+
+        let (status, got) = call(&app, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{got}");
+        assert_eq!(got["type"], "world");
+        assert_eq!(got["state"], "valid");
+        assert_eq!(got["edited_at"], Value::Null);
+        assert_eq!(got["tags"], json!(["t"]));
+        assert!(got["entities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("Alice")));
+
+        // Edit: text, a date, and clearing the context.
+        let (status, edited) = call(
+            &app,
+            Method::PATCH,
+            &uri,
+            Some(json!({
+                "text": "Alice works on ads ranking",
+                "occurred_start": "2024-01-15",
+                "context": "",
+                "entities": ["Alice Cooper"],
+                "resolve_entities": false,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{edited}");
+        assert_eq!(edited["text"], "Alice works on ads ranking");
+        assert_eq!(edited["occurred_start"], "2024-01-15T00:00:00+00:00");
+        assert_eq!(edited["date"], "2024-01-15T00:00:00+00:00");
+        assert_eq!(edited["context"], "");
+        assert_eq!(edited["entities"], json!(["Alice Cooper"]));
+        assert!(edited["edited_at"].is_string());
+        // An explicit null on a date clears it.
+        let (_, cleared) = call(
+            &app,
+            Method::PATCH,
+            &uri,
+            Some(json!({"occurred_start": null})),
+        )
+        .await;
+        assert_eq!(cleared["occurred_start"], Value::Null);
+
+        let q = call(&app, Method::GET, &format!("{base}/list?q=RANKING"), None)
+            .await
+            .1;
+        assert_eq!(q["total"], 1, "{q}");
+        let scoped = call(
+            &app,
+            Method::GET,
+            &format!("{base}/list?tags=t&tags_match=any_strict&document_id=d1&type=world"),
+            None,
+        )
+        .await
+        .1;
+        assert_eq!(scoped["total"], 2, "{scoped}");
+        let none = call(
+            &app,
+            Method::GET,
+            &format!("{base}/list?type=experience"),
+            None,
+        )
+        .await
+        .1;
+        assert_eq!(none["total"], 0);
+        let paged = call(
+            &app,
+            Method::GET,
+            &format!("{base}/list?limit=1&offset=1"),
+            None,
+        )
+        .await
+        .1;
+        assert_eq!(paged["items"].as_array().unwrap().len(), 1);
+        assert_eq!(paged["total"], 2);
+
+        // Invalidate, then the archive view.
+        let (status, inv) = call(
+            &app,
+            Method::PATCH,
+            &uri,
+            Some(json!({"state": "invalidated", "reason": "superseded"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{inv}");
+        assert_eq!(inv["state"], "invalidated");
+        assert_eq!(inv["invalidation_reason"], "superseded");
+        assert!(inv["invalidated_at"].is_string());
+        assert_eq!(inv["entities"], json!([]));
+        let live = call(&app, Method::GET, &format!("{base}/list"), None)
+            .await
+            .1;
+        assert_eq!(live["total"], 1);
+        let arch = call(
+            &app,
+            Method::GET,
+            &format!("{base}/list?state=invalidated"),
+            None,
+        )
+        .await
+        .1;
+        assert_eq!(arch["total"], 1);
+        assert_eq!(arch["items"][0]["id"], id);
+        assert_eq!(arch["items"][0]["state"], "invalidated");
+        assert_eq!(
+            call(&app, Method::GET, &uri, None).await.1["state"],
+            "invalidated"
+        );
+
+        // Errors, upstream statuses.
+        let (status, body) = call(&app, Method::PATCH, &uri, Some(json!({"text": "x"}))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["detail"].as_str().unwrap().contains("revert"),
+            "{body}"
+        );
+        for empty in [json!({}), json!({"reason": "only a reason"})] {
+            let (status, _) = call(&app, Method::PATCH, &uri, Some(empty)).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        let (status, _) = call(&app, Method::PATCH, &uri, Some(json!({"state": "deleted"}))).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let (status, body) = call(
+            &app,
+            Method::PATCH,
+            &format!("{base}/not-a-uuid"),
+            Some(json!({"state": "invalidated"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["detail"],
+            "Invalid memory_id: 'not-a-uuid' is not a valid UUID"
+        );
+        let missing = "00000000-0000-4000-8000-000000000000";
+        let (status, body) = call(
+            &app,
+            Method::PATCH,
+            &format!("{base}/{missing}"),
+            Some(json!({"state": "invalidated"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["detail"], format!("Memory unit '{missing}' not found"));
+        let (status, _) = call(&app, Method::GET, &format!("{base}/{missing}"), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = call(
+            &app,
+            Method::GET,
+            &format!("{base}/list?state=archived"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = call(
+            &app,
+            Method::GET,
+            "/v1/default/banks/nobody/memories/list",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Revert.
+        let (status, back) = call(&app, Method::PATCH, &uri, Some(json!({"state": "valid"}))).await;
+        assert_eq!(status, StatusCode::OK, "{back}");
+        assert_eq!(back["state"], "valid");
+        assert_eq!(back["entities"], json!(["Alice Cooper"]));
     }
 }

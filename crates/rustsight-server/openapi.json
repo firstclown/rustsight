@@ -219,6 +219,49 @@
         }
       }
     },
+    "/banks/{bank_id}/memories/{memory_id}": {
+      "parameters": [
+        { "$ref": "#/components/parameters/BankId" },
+        { "$ref": "#/components/parameters/MemoryId" }
+      ],
+      "get": {
+        "tags": ["inspect"],
+        "operationId": "getMemoryUnit",
+        "summary": "Get one memory in the curation view",
+        "description": "A live or invalidated (archived) raw fact, or an observation (RS-22).",
+        "responses": {
+          "200": {
+            "description": "The memory.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MemoryUnit" } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      },
+      "patch": {
+        "tags": ["memory"],
+        "operationId": "curateMemory",
+        "summary": "Edit, invalidate or restore one raw fact",
+        "description": "Hindsight's `PATCH /memories/{memory_id}` body and semantics (RS-22). Only world/experience facts can be curated. An edit re-embeds the fact, deletes the observations citing it and rebuilds its links (causal edges survive); `state: invalidated` moves it to the archive (out of recall and consolidation); `state: valid` restores it.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MemoryCurationRequest" } } }
+        },
+        "responses": {
+          "200": {
+            "description": "The memory as it now stands.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MemoryUnit" } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "422": { "$ref": "#/components/responses/InvalidBody" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
     "/banks/{bank_id}/entities": {
       "parameters": [{ "$ref": "#/components/parameters/BankId" }],
       "get": {
@@ -441,6 +484,13 @@
         "required": true,
         "description": "Tenant id (a named config layer).",
         "schema": { "type": "string" }
+      },
+      "MemoryId": {
+        "name": "memory_id",
+        "in": "path",
+        "required": true,
+        "description": "Memory id (a UUID).",
+        "schema": { "type": "string" }
       }
     },
     "responses": {
@@ -499,6 +549,26 @@
         "properties": {
           "tenant_id": { "type": "string" },
           "config": { "type": "object", "description": "The tenant's stored overrides.", "additionalProperties": true }
+        }
+      },
+      "MemoryState": {
+        "type": "string",
+        "enum": ["valid", "invalidated"]
+      },
+      "MemoryCurationRequest": {
+        "type": "object",
+        "description": "At least one field besides `resolve_entities`/`reason` must be set (422 otherwise).",
+        "properties": {
+          "text": { "type": ["string", "null"], "description": "New fact text." },
+          "context": { "type": ["string", "null"], "description": "'' clears it; omit to leave unchanged." },
+          "occurred_start": { "type": ["string", "null"], "description": "ISO 8601; '' or null clears it; omit to leave unchanged." },
+          "occurred_end": { "type": ["string", "null"], "description": "ISO 8601; '' or null clears it; omit to leave unchanged." },
+          "mentioned_at": { "type": ["string", "null"], "description": "ISO 8601; '' or null resets it to the ingest time; omit to leave unchanged." },
+          "fact_type": { "type": ["string", "null"], "enum": ["world", "experience", null] },
+          "entities": { "type": ["array", "null"], "items": { "type": "string" }, "description": "Replaces the entity set; [] detaches all." },
+          "resolve_entities": { "type": "boolean", "default": true, "description": "false: reuse an entity only on a case-insensitive name match." },
+          "state": { "type": ["string", "null"], "enum": ["valid", "invalidated", null] },
+          "reason": { "type": ["string", "null"], "description": "Recorded when invalidating." }
         }
       },
       "MemoryKind": {
@@ -718,6 +788,33 @@
           "document_id": { "type": ["string", "null"] },
           "tags": { "type": "array", "items": { "type": "string" } },
           "metadata": { "$ref": "#/components/schemas/Metadata" }
+        }
+      },
+      "MemoryUnit": {
+        "type": "object",
+        "required": ["id", "bank_id", "kind", "text", "context", "occurred_start_ms", "occurred_end_ms", "mentioned_at_ms", "document_id", "chunk_id", "tags", "metadata", "entities", "state", "invalidation_reason", "invalidated_at_ms", "edited_at_ms", "created_at_ms", "updated_at_ms", "source_memory_ids", "proof_count"],
+        "properties": {
+          "id": { "type": "string" },
+          "bank_id": { "type": "string" },
+          "kind": { "$ref": "#/components/schemas/MemoryKind" },
+          "text": { "type": "string" },
+          "context": { "type": ["string", "null"] },
+          "occurred_start_ms": { "type": ["integer", "null"], "format": "int64" },
+          "occurred_end_ms": { "type": ["integer", "null"], "format": "int64" },
+          "mentioned_at_ms": { "type": ["integer", "null"], "format": "int64", "description": "null for observations." },
+          "document_id": { "type": ["string", "null"] },
+          "chunk_id": { "type": ["string", "null"] },
+          "tags": { "type": "array", "items": { "type": "string" } },
+          "metadata": { "$ref": "#/components/schemas/Metadata" },
+          "entities": { "type": "array", "items": { "type": "string" }, "description": "Linked entity names, sorted; empty while invalidated." },
+          "state": { "$ref": "#/components/schemas/MemoryState" },
+          "invalidation_reason": { "type": ["string", "null"] },
+          "invalidated_at_ms": { "type": ["integer", "null"], "format": "int64" },
+          "edited_at_ms": { "type": ["integer", "null"], "format": "int64", "description": "Last user edit." },
+          "created_at_ms": { "type": "integer", "format": "int64" },
+          "updated_at_ms": { "type": ["integer", "null"], "format": "int64" },
+          "source_memory_ids": { "type": "array", "items": { "type": "string" }, "description": "An observation's evidence facts." },
+          "proof_count": { "type": "integer" }
         }
       },
       "Entity": {

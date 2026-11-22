@@ -196,9 +196,49 @@ pub trait MemoryStore: Send + Sync {
     /// observation evidence (an observation left with no evidence is
     /// removed). Returns the number of memories deleted and the entity ids
     /// whose facts or observations changed — the caller re-queues those for
-    /// consolidation. The document row itself is untouched.
+    /// consolidation. Archived (invalidated) facts filed under the document
+    /// are purged too. The document row itself is untouched.
     fn delete_document_memories(&self, bank_id: &str, id: &str) -> Result<(usize, Vec<String>)>;
     fn delete_document(&self, bank_id: &str, id: &str) -> Result<()>;
+
+    // ── Curation (RS-22) ────────────────────────────────────────────────
+
+    /// A raw fact by id, live or archived (live wins), in the curation
+    /// view. Observations and opinions are not raw facts: `None`.
+    fn get_memory_unit(&self, bank_id: &str, id: &str) -> Result<Option<MemoryUnit>>;
+    /// Raw facts (world/experience) matching the query's state, kind,
+    /// document, entity and `q` filters — every match, newest mention
+    /// first; the engine applies tags and paging.
+    fn list_memory_units(&self, bank_id: &str, query: &MemoryListQuery) -> Result<Vec<MemoryUnit>>;
+    /// Rewrite a live fact in one transaction: stamp `edited_at_ms`,
+    /// refresh FTS and the vector mirror, swap entity links when given,
+    /// drop its entity/temporal/semantic edges (causal edges survive) and
+    /// delete every observation citing it. `Error::NotFound` when the fact
+    /// is not live.
+    fn update_memory(
+        &self,
+        bank_id: &str,
+        id: &str,
+        rewrite: &MemoryRewrite,
+    ) -> Result<CurationEffect>;
+    /// Move a live fact into the archive: snapshot its entity links and
+    /// causal edges, remove it from FTS, the vector mirror, links and
+    /// edges, delete the observations citing it and trim it from opinion
+    /// evidence, stamping `invalidated_at_ms = at_ms`. `Error::NotFound`
+    /// when the fact is not live.
+    fn invalidate_memory(
+        &self,
+        bank_id: &str,
+        id: &str,
+        reason: Option<&str>,
+        at_ms: i64,
+    ) -> Result<CurationEffect>;
+    /// Update an archived fact's recorded reason; false when not archived.
+    fn set_invalidation_reason(&self, bank_id: &str, id: &str, reason: &str) -> Result<bool>;
+    /// Move an archived fact back: re-link the entities that still exist,
+    /// restore causal edges whose other end is live, write FTS and the
+    /// vector mirror with `embedding`. `Error::NotFound` when not archived.
+    fn restore_memory(&self, bank_id: &str, id: &str, embedding: &[f32]) -> Result<CurationEffect>;
 
     /// Store source chunks (insert or replace by bank + id).
     fn insert_chunks(&self, chunks: &[Chunk]) -> Result<()>;

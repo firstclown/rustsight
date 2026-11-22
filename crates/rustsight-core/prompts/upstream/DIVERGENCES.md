@@ -246,6 +246,32 @@ the *engine* intentionally deviates from upstream, and what was not ported.
      stores none).
    - Not produced: `usage`, reflect `trace`, `scores.reranker` /
      `semantic` / `keyword` (only `scores.final`).
+   - **Memory curation (RS-22)**: `PATCH /memories/{id}` follows
+     `memory_engine.py::update_memory_unit` (edit / invalidate-by-move /
+     revert, causal edges preserved per #2864, citing observations deleted
+     whole). Declared differences:
+     - **Inline edge rebuild instead of a sweep.** Upstream drops an
+       edited or restored fact's temporal/semantic links and lets its
+       graph-maintenance sweep rebuild them later; rustsight has no sweep,
+       so `engine/curate.rs` rebuilds that fact's entity, temporal and
+       semantic edges right after the store write with retain's builders.
+       Edges *from other facts* to it are not re-derived (they were
+       outgoing edges of those facts at their retain).
+     - **Opinion-evidence trim.** Invalidation strips the fact from opinion
+       evidence (rustsight-only table; upstream has none). Opinions keep
+       their remaining evidence. Edits leave opinion evidence alone.
+     - **Embedded text.** An edit or restore re-embeds the fact text alone,
+       as rustsight's retain does; upstream folds dates and entity names
+       into the embedded text (`_reembed_memory_text`).
+     - **`mentioned_at` is never null.** Clearing it resets it to the
+       fact's ingest time.
+     - **Entity type of new entities** from an edit is `concept`
+       (upstream passes `CONCEPT` too); `resolve_entities: false` claims the
+       normalized alias key only when no entity already holds it.
+     - **Archived rows show no entities** (as upstream: the archive holds
+       links only as a snapshot). Listing filters `consolidation_state` and
+       `time_field` windows are accepted and ignored; tag filters on the
+       list run in memory over the bank's matching rows.
 
 ### Multilingual handling (RS-10e)
 
